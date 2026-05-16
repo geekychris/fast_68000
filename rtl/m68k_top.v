@@ -20,11 +20,12 @@ module m68k_top #(
     input  wire [31:0] fb_peek_addr,
     output wire [31:0] fb_peek_data
 );
-    // Two ports per core (I-cache + D-cache) plus one each for the blitter
-    // and Copper masters.
-    localparam N_PORTS  = 2 * N_CORES + 2;
+    // Two ports per core (I-cache + D-cache) plus one each for the blitter,
+    // Copper, and Denise masters.
+    localparam N_PORTS  = 2 * N_CORES + 3;
     localparam BLT_PORT = 2 * N_CORES;       // blitter master
     localparam COP_PORT = 2 * N_CORES + 1;   // Copper master
+    localparam DEN_PORT = 2 * N_CORES + 2;   // Denise master
     localparam PID_BITS = $clog2(N_PORTS > 1 ? N_PORTS : 2);
 
     // Per-core cache <-> bus.
@@ -58,6 +59,14 @@ module m68k_top #(
     wire [3:0]  cop_slv_be;
     wire [31:0] cop_slv_wdata;
     wire [31:0] cop_slv_rdata;
+
+    // Denise slave wires.
+    wire        den_slv_req;
+    wire        den_slv_we;
+    wire [7:0]  den_slv_addr;
+    wire [3:0]  den_slv_be;
+    wire [31:0] den_slv_wdata;
+    wire [31:0] den_slv_rdata;
 
     // Blitter busy signal exposed to the Copper (for WAIT).
     wire        blt_busy;
@@ -95,7 +104,13 @@ module m68k_top #(
         .cop_slv_addr(cop_slv_addr),
         .cop_slv_be  (cop_slv_be),
         .cop_slv_wdata(cop_slv_wdata),
-        .cop_slv_rdata(cop_slv_rdata)
+        .cop_slv_rdata(cop_slv_rdata),
+        .den_slv_req (den_slv_req),
+        .den_slv_we  (den_slv_we),
+        .den_slv_addr(den_slv_addr),
+        .den_slv_be  (den_slv_be),
+        .den_slv_wdata(den_slv_wdata),
+        .den_slv_rdata(den_slv_rdata)
     );
 
     // Blitter instance.  Its master port plugs into the bus at index
@@ -175,6 +190,42 @@ module m68k_top #(
     assign p_be   [4*COP_PORT  +: 4]          = cop_mst_be;
     assign cop_mst_ack   = p_resp_valid[COP_PORT];
     assign cop_mst_rdata = p_resp_data;
+
+    // Denise master wires.
+    wire        den_mst_req;
+    wire        den_mst_we;
+    wire [31:0] den_mst_addr;
+    wire [31:0] den_mst_wdata;
+    wire [3:0]  den_mst_be;
+    wire        den_mst_ack;
+    wire [31:0] den_mst_rdata;
+
+    m68k_denise u_den (
+        .clk        (clk),
+        .rst_n      (rst_n),
+        .slv_req    (den_slv_req),
+        .slv_we     (den_slv_we),
+        .slv_addr   (den_slv_addr),
+        .slv_be     (den_slv_be),
+        .slv_wdata  (den_slv_wdata),
+        .slv_rdata  (den_slv_rdata),
+        .mst_req    (den_mst_req),
+        .mst_we     (den_mst_we),
+        .mst_addr   (den_mst_addr),
+        .mst_wdata  (den_mst_wdata),
+        .mst_be     (den_mst_be),
+        .mst_ack    (den_mst_ack),
+        .mst_rdata  (den_mst_rdata)
+    );
+
+    assign p_req  [DEN_PORT]                  = den_mst_req;
+    assign p_we   [DEN_PORT]                  = den_mst_we;
+    assign p_lock [DEN_PORT]                  = 1'b0;
+    assign p_addr [32*DEN_PORT +: 32]         = den_mst_addr;
+    assign p_wdata[32*DEN_PORT +: 32]         = den_mst_wdata;
+    assign p_be   [4*DEN_PORT  +: 4]          = den_mst_be;
+    assign den_mst_ack   = p_resp_valid[DEN_PORT];
+    assign den_mst_rdata = p_resp_data;
 
     genvar gi;
     generate

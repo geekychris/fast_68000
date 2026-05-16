@@ -48,7 +48,9 @@ clean-room blitter (copy / logic / Bresenham line modes, four channels,
 [BLITTER.md](BLITTER.md) — line-drawing demo via `make demo-blt`.
 For the Amiga-inspired Copper coprocessor (memory-resident display lists
 driving the blitter autonomously), see [COPPER.md](COPPER.md) — demo via
-`make demo-cop`.
+`make demo-cop`. For Denise — the bitplane rasterizer with HAM6 / EHB /
+dual-playfield / indexed display modes — see [DENISE.md](DENISE.md);
+demo via `make demo-den`.
 
 ## Headline numbers
 

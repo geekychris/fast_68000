@@ -23,6 +23,7 @@ RTL_SRCS := $(RTL_DIR)/m68k_alu.v \
             $(RTL_DIR)/m68k_bus.v \
             $(RTL_DIR)/m68k_blitter.v \
             $(RTL_DIR)/m68k_copper.v \
+            $(RTL_DIR)/m68k_denise.v \
             $(RTL_DIR)/m68k_core.v \
             $(RTL_DIR)/m68k_top.v
 
@@ -30,10 +31,10 @@ TESTS  := $(wildcard $(TESTS_DIR)/*.s)
 BENCHES:= $(wildcard $(BENCH_DIR)/*.s)
 
 N_CORES   ?= 2
-MEM_WORDS ?= 16384
+MEM_WORDS ?= 65536
 BUILD     ?= build
 
-.PHONY: all build test bench clean demo demo-fb demo-os demo-blt demo-cop
+.PHONY: all build test bench clean demo demo-fb demo-os demo-blt demo-cop demo-den
 
 all: test
 
@@ -62,7 +63,7 @@ test:
 	for t in $(TESTS); do \
 	    name=$$(basename $$t .s); \
 	    $(PYTHON) $(TB_DIR)/asm68k.py $$t build/program.hex; \
-	    (cd build && ./Vm68k_top 200000) > build/$$name.log 2>&1; \
+	    (cd build && ./Vm68k_top 5000000) > build/$$name.log 2>&1; \
 	    rc=$$?; \
 	    if [ $$rc -eq 0 ]; then \
 	        echo "PASS $$name"; pass=$$((pass+1)); \
@@ -114,6 +115,17 @@ demo-os:
 	@echo
 	@echo "Launching OS demo. Press ESC or close the window to quit."
 	@(cd build_demo && ./Vm68k_top 200000000 --graphics)
+
+demo-den:
+	@if [ "$(HAVE_SDL2)" != "1" ]; then \
+	    echo "SDL2 not detected (sdl2-config returned no libs). brew install sdl2"; \
+	    exit 1; \
+	fi
+	@$(MAKE) --no-print-directory build BUILD=build_demo N_CORES=1 USE_CACHE=1 MEM_WORDS=131072 WITH_SDL2=1
+	$(PYTHON) $(TB_DIR)/asm68k.py $(DEMO_DIR)/den_demo.s build_demo/program.hex
+	@echo
+	@echo "Launching Denise demo (4-plane indexed image rendered to chunky FB)."
+	@(cd build_demo && ./Vm68k_top 2000000000 --graphics)
 
 demo-cop:
 	@if [ "$(HAVE_SDL2)" != "1" ]; then \
