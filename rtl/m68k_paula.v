@@ -53,6 +53,7 @@ module m68k_paula (
     reg [15:0] aud_len  [0:3];
     reg [15:0] aud_per  [0:3];
     reg [6:0]  aud_vol  [0:3];
+    reg        aud_oneshot [0:3];      // AUDxLEN bit 31: don't auto-loop
 
     // --------------- Per-channel state ---------------
     reg [31:0] ch_cur_addr   [0:3];    // running fetch address
@@ -132,6 +133,7 @@ module m68k_paula (
                 aud_len[i] <= 16'd0;
                 aud_per[i] <= 16'd1;
                 aud_vol[i] <= 7'd0;
+                aud_oneshot[i] <= 1'b0;
                 ch_cur_addr[i]   <= 32'd0;
                 ch_words_left[i] <= 16'd0;
                 ch_word_q[i]     <= 16'd0;
@@ -152,19 +154,19 @@ module m68k_paula (
                 case (slv_addr[7:0])
                     8'h00: audena <= slv_wdata[3:0];
                     8'h10: aud_lc[0]  <= slv_wdata;
-                    8'h14: aud_len[0] <= slv_wdata[15:0];
+                    8'h14: begin aud_len[0] <= slv_wdata[15:0]; aud_oneshot[0] <= slv_wdata[31]; end
                     8'h18: aud_per[0] <= slv_wdata[15:0];
                     8'h1C: aud_vol[0] <= slv_wdata[6:0];
                     8'h20: aud_lc[1]  <= slv_wdata;
-                    8'h24: aud_len[1] <= slv_wdata[15:0];
+                    8'h24: begin aud_len[1] <= slv_wdata[15:0]; aud_oneshot[1] <= slv_wdata[31]; end
                     8'h28: aud_per[1] <= slv_wdata[15:0];
                     8'h2C: aud_vol[1] <= slv_wdata[6:0];
                     8'h30: aud_lc[2]  <= slv_wdata;
-                    8'h34: aud_len[2] <= slv_wdata[15:0];
+                    8'h34: begin aud_len[2] <= slv_wdata[15:0]; aud_oneshot[2] <= slv_wdata[31]; end
                     8'h38: aud_per[2] <= slv_wdata[15:0];
                     8'h3C: aud_vol[2] <= slv_wdata[6:0];
                     8'h40: aud_lc[3]  <= slv_wdata;
-                    8'h44: aud_len[3] <= slv_wdata[15:0];
+                    8'h44: begin aud_len[3] <= slv_wdata[15:0]; aud_oneshot[3] <= slv_wdata[31]; end
                     8'h48: aud_per[3] <= slv_wdata[15:0];
                     8'h4C: aud_vol[3] <= slv_wdata[6:0];
                     default: ;
@@ -213,11 +215,17 @@ module m68k_paula (
                     ? mst_rdata[15:0]
                     : mst_rdata[31:16];
                 ch_word_valid[fetch_ch] <= 1'b1;
-                // Advance address; reload at end of buffer.
+                // Advance address; reload at end of buffer unless this
+                // channel is in one-shot mode.
                 if (ch_words_left[fetch_ch] == 16'd1) begin
-                    // last word: reload
-                    ch_cur_addr[fetch_ch]   <= aud_lc[fetch_ch];
-                    ch_words_left[fetch_ch] <= aud_len[fetch_ch];
+                    if (aud_oneshot[fetch_ch]) begin
+                        // One-shot: disable this channel cleanly.
+                        audena[fetch_ch] <= 1'b0;
+                    end else begin
+                        // Loop: reload pointer + length.
+                        ch_cur_addr[fetch_ch]   <= aud_lc[fetch_ch];
+                        ch_words_left[fetch_ch] <= aud_len[fetch_ch];
+                    end
                 end else begin
                     ch_cur_addr[fetch_ch]   <= ch_cur_addr[fetch_ch] + 32'd2;
                     ch_words_left[fetch_ch] <= ch_words_left[fetch_ch] - 16'd1;

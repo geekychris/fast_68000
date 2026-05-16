@@ -21,6 +21,8 @@
 //   Special target values:
 //       $FFFF_FFFF : HALT - stop the Copper, COP_BUSY <- 0.
 //       $FFFF_FFFE : WAIT - block until blitter goes busy and then idle.
+//       $FFFF_FFFD : SKIP-IF-BLITTER-BUSY - skip the next instruction
+//                    (8 bytes) if the blitter is currently busy.
 //       (everything else) : MOVE - write long 1 to the target address.
 //
 //   MOVE writes are 32-bit-wide bus transactions with BE = 4'b1111.
@@ -161,6 +163,10 @@ module m68k_copper (
                         state <= S_HALT;
                     end else if (target_q == 32'hFFFF_FFFE) begin
                         state <= S_WAIT_RISE;
+                    end else if (target_q == 32'hFFFF_FFFD) begin
+                        // SKIP-IF-BLITTER-BUSY: if busy, skip next 8 bytes.
+                        if (blt_busy_i) pc <= pc + 32'd8;
+                        state <= S_FETCH_T;
                     end else begin
                         state <= S_WRITE;
                     end

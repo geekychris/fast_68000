@@ -66,6 +66,12 @@ module m68k_denise #(
     // EHB is the implicit fall-through when nplanes=6 and neither HAM nor DPF.
     wire       ehb_en  = (nplanes == 3'd6) && !ham_en && !dpf_en;
 
+    // BPLCON1 decode: horizontal scroll per playfield (4 bits each).
+    //   PF1H = BPLCON1[3:0] (applied to planes 0, 2, 4 - "odd" 1-indexed)
+    //   PF2H = BPLCON1[7:4] (applied to planes 1, 3, 5 - "even" 1-indexed)
+    wire [3:0] pf1h = bplcon1[3:0];
+    wire [3:0] pf2h = bplcon1[7:4];
+
     // BPLCON2: PF2 priority over PF1 when bit 6 is set.
     wire       pf2_pri = bplcon2[6];
 
@@ -125,6 +131,7 @@ module m68k_denise #(
     reg [4:0]  wg_idx;              // 0..(FB_W/16 - 1)
     reg [2:0]  pi_idx;              // current plane being fetched (0..5)
     reg [15:0] plane_word [0:5];    // latched 16-bit word per plane
+    reg [15:0] plane_prev [0:5];    // previous word per plane (for scroll)
 
     // Per-pixel state.
     reg [3:0]  px_idx;              // 0..15 within the word-group
@@ -171,16 +178,38 @@ module m68k_denise #(
         end
     endfunction
 
-    // Compose the 6-bit pixel value from the latched plane words.
+    // Apply horizontal scroll to the current plane word, taking high
+    // bits from the previous word.  scroll=0 means no shift.  The
+    // bitmap visually moves RIGHT by `scroll` pixels.
+    function [15:0] scrolled_word;
+        input [15:0] prev_w;
+        input [15:0] cur_w;
+        input [3:0]  scroll;
+        reg [31:0] joined;
+        begin
+            joined = {prev_w, cur_w};
+            // result = bits [15+scroll : scroll]
+            scrolled_word = joined[15+scroll -: 16];
+        end
+    endfunction
+
+    // Compose the 6-bit pixel value from the latched plane words, with
+    // per-playfield horizontal scroll applied.  PF1 (odd planes 0,2,4)
+    // uses PF1H; PF2 (even planes 1,3,5) uses PF2H.
     function [5:0] pixel_value;
         input [3:0] pix;
         integer pli;
         reg [5:0] v;
+        reg [15:0] scrolled;
+        reg [3:0] sh;
         begin
             v = 6'd0;
             for (pli = 0; pli < 6; pli = pli + 1) begin
-                if (pli < nplanes)
-                    v[pli] = bit_at(plane_word[pli], pix);
+                if (pli < nplanes) begin
+                    sh = (pli[0]) ? pf2h : pf1h;
+                    scrolled = scrolled_word(plane_prev[pli], plane_word[pli], sh);
+                    v[pli] = scrolled[4'd15 - pix];
+                end
             end
             pixel_value = v;
         end
@@ -217,6 +246,7 @@ module m68k_denise #(
             wg_idx  <= 5'd0;
             pi_idx  <= 3'd0;
             for (i = 0; i < 6; i = i + 1) plane_word[i] <= 16'd0;
+            for (i = 0; i < 6; i = i + 1) plane_prev[i] <= 16'd0;
             px_idx <= 4'd0;
             pixel_buf <= 128'd0;
             wr_long_idx <= 2'd0;
@@ -271,8 +301,14 @@ module m68k_denise #(
                 end
 
                 S_ROW_INIT: begin
-                    // Reset HAM prev color at the start of each row.
+                    // Reset HAM prev color and per-plane scroll-prev at row start.
                     row_prev_color <= colors[0][11:0];
+                    plane_prev[0] <= 16'd0;
+                    plane_prev[1] <= 16'd0;
+                    plane_prev[2] <= 16'd0;
+                    plane_prev[3] <= 16'd0;
+                    plane_prev[4] <= 16'd0;
+                    plane_prev[5] <= 16'd0;
                     state <= S_WG_INIT;
                 end
 
@@ -415,6 +451,14 @@ module m68k_denise #(
                     if (wg_idx == 5'd15) begin
                         state <= S_ROW_END;
                     end else begin
+                        // The word we just consumed becomes the "prev" word
+                        // for the next WG's scroll calculation.
+                        plane_prev[0] <= plane_word[0];
+                        plane_prev[1] <= plane_word[1];
+                        plane_prev[2] <= plane_word[2];
+                        plane_prev[3] <= plane_word[3];
+                        plane_prev[4] <= plane_word[4];
+                        plane_prev[5] <= plane_word[5];
                         wg_idx <= wg_idx + 5'd1;
                         pi_idx <= 3'd0;
                         px_idx <= 4'd0;

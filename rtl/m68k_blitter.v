@@ -103,6 +103,10 @@ module m68k_blitter (
     wire [7:0]  lf       = bltcon[31:24];
     wire [3:0]  ash      = bltcon[23:20];
     wire [3:0]  bsh      = bltcon[19:16];
+    wire        desc     = bltcon[15];       // descending mode
+    wire        ife      = bltcon[14];       // inclusive fill enable
+    wire        efe      = bltcon[13];       // exclusive fill enable
+    wire        fci      = bltcon[12];       // fill carry-in (per-row reset value)
     wire        line     = bltcon[11];
     wire        sud      = bltcon[10];
     wire        sul      = bltcon[9];
@@ -236,10 +240,52 @@ module m68k_blitter (
         end
     endfunction
 
+    // Apply Amiga-style fill across a 16-bit word, returning {new_fill_carry,
+    // filled_word}.  Processes bits LSB-first (bit 0 first) for ascending
+    // mode, MSB-first for descending. Amiga fill direction matches the
+    // overall scan direction: ascending = right-to-left within a row, but
+    // here we just consume bits in the natural order for our DESC convention.
+    //
+    //   IFE (inclusive): out = in OR carry; carry ^= in
+    //   EFE (exclusive): out = carry;       carry ^= in
+    function [16:0] apply_fill;
+        input [15:0] din;
+        input        fc_in;
+        input        do_ife;
+        input        do_efe;
+        input        do_desc;
+        integer i, bi;
+        reg [15:0] dout;
+        reg        fc;
+        reg        bit_in;
+        begin
+            fc = fc_in;
+            dout = 16'd0;
+            // Process bits in scan order: bit 0 first (LSB) for ascending,
+            // bit 15 first (MSB) for descending.
+            for (i = 0; i < 16; i = i + 1) begin
+                bi = do_desc ? (15 - i) : i;
+                bit_in = din[bi];
+                if (do_efe) begin
+                    dout[bi] = fc;
+                end else if (do_ife) begin
+                    dout[bi] = bit_in | fc;
+                end else begin
+                    dout[bi] = bit_in;
+                end
+                fc = fc ^ bit_in;
+            end
+            apply_fill = {fc, dout};
+        end
+    endfunction
+
     // Line mode bit-position tracking.  Initial value = ASH at start of blit;
     // updated each pixel based on octant.
     reg [3:0]  line_pos;          // 0..15, bit index within the current word
     reg [15:0] line_pattern_pos;  // rotating B pattern shift (0..15)
+
+    // Fill mode per-row state.  Initialised to FCI at the start of each row.
+    reg        fill_carry;
 
     // Slave write commits.
     always @(posedge clk or negedge rst_n) begin
@@ -272,6 +318,7 @@ module m68k_blitter (
             c_cur_word_q   <= 16'd0;
             line_pos       <= 4'd0;
             line_pattern_pos <= 16'd0;
+            fill_carry     <= 1'b0;
 
             mst_req_r <= 1'b0;
             mst_we    <= 1'b0;
@@ -314,6 +361,8 @@ module m68k_blitter (
                             // (start_x mod 16); initial bit index = 15 - ASH.
                             line_pos    <= 4'd15 - bltcon[23:20];
                             line_pattern_pos <= 16'd0;
+                            // Fill mode starts each row with carry = FCI.
+                            fill_carry  <= bltcon[12];
                             state <= bltcon[11] ? S_LRDC : (bltcon[3] ? S_RDA :
                                                             bltcon[2] ? S_RDB :
                                                             bltcon[1] ? S_RDC : S_WRD);
@@ -385,25 +434,32 @@ module m68k_blitter (
                         state <= S_WRD;
                     end
                 end
-                S_WRD: begin
+                S_WRD: begin : wrd_block
+                    reg [15:0] combined_w;
+                    reg [16:0] filled;          // {new_fill_carry, filled_word}
+                    reg [15:0] final_w;
+
+                    combined_w = combine(lf,
+                                         shift_a(a_prev_word, a_cur_word_q, ash),
+                                         shift_b(b_prev_word, b_cur_word_q, bsh),
+                                         c_cur_word_q);
+                    filled  = apply_fill(combined_w, fill_carry, ife, efe, desc);
+                    final_w = filled[15:0];
+
                     if (use_d) begin
                         mst_req_r <= 1'b1;
                         mst_we    <= 1'b1;
                         mst_addr  <= bltdpt;
                         mst_be    <= half_be(bltdpt[1]);
-                        mst_wdata <= put_half(
-                            combine(lf,
-                                    shift_a(a_prev_word, a_cur_word_q, ash),
-                                    shift_b(b_prev_word, b_cur_word_q, bsh),
-                                    c_cur_word_q),
-                            bltdpt[1]);
+                        mst_wdata <= put_half(final_w, bltdpt[1]);
                         if (mst_ack) begin
                             mst_req_r <= 1'b0;
                             // Latch previous-word state for next iteration's shift.
                             a_prev_word <= a_cur_word_q;
                             b_prev_word <= b_cur_word_q;
+                            // Update fill carry from this word's processing.
+                            fill_carry  <= filled[16];
                             bltdpt <= bltdpt + 32'd2;
-                            // End of word: advance counters.
                             if (cur_word == (blt_width - 16'd1)) begin
                                 cur_word <= 16'd0;
                                 a_prev_word <= 16'd0;
@@ -417,9 +473,9 @@ module m68k_blitter (
                             end
                         end
                     end else begin
-                        // No D channel: just advance.
                         a_prev_word <= a_cur_word_q;
                         b_prev_word <= b_cur_word_q;
+                        fill_carry  <= filled[16];
                         if (cur_word == (blt_width - 16'd1)) begin
                             cur_word <= 16'd0;
                             a_prev_word <= 16'd0;
@@ -439,6 +495,8 @@ module m68k_blitter (
                     if (use_b) bltbpt <= bltbpt + bltbmod;
                     if (use_c) bltcpt <= bltcpt + bltcmod;
                     if (use_d) bltdpt <= bltdpt + bltdmod;
+                    // Reset the fill carry for the next row.
+                    fill_carry <= fci;
                     if (cur_row == (blt_height - 16'd1)) begin
                         state    <= S_DONE;
                     end else begin
