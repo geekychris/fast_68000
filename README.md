@@ -46,6 +46,9 @@ see [OS.md](OS.md) — runnable via `make demo`. For the Amiga-inspired
 clean-room blitter (copy / logic / Bresenham line modes, four channels,
 8-bit minterm Logic Function, barrel shifts), see
 [BLITTER.md](BLITTER.md) — line-drawing demo via `make demo-blt`.
+For the Amiga-inspired Copper coprocessor (memory-resident display lists
+driving the blitter autonomously), see [COPPER.md](COPPER.md) — demo via
+`make demo-cop`.
 
 ## Headline numbers
 

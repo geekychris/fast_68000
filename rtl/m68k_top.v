@@ -20,9 +20,11 @@ module m68k_top #(
     input  wire [31:0] fb_peek_addr,
     output wire [31:0] fb_peek_data
 );
-    // Two ports per core (I-cache + D-cache) plus one for the blitter master.
-    localparam N_PORTS = 2 * N_CORES + 1;
-    localparam BLT_PORT = 2 * N_CORES;       // index of the blitter master port
+    // Two ports per core (I-cache + D-cache) plus one each for the blitter
+    // and Copper masters.
+    localparam N_PORTS  = 2 * N_CORES + 2;
+    localparam BLT_PORT = 2 * N_CORES;       // blitter master
+    localparam COP_PORT = 2 * N_CORES + 1;   // Copper master
     localparam PID_BITS = $clog2(N_PORTS > 1 ? N_PORTS : 2);
 
     // Per-core cache <-> bus.
@@ -48,6 +50,17 @@ module m68k_top #(
     wire [3:0]  blt_slv_be;
     wire [31:0] blt_slv_wdata;
     wire [31:0] blt_slv_rdata;
+
+    // Copper slave wires.
+    wire        cop_slv_req;
+    wire        cop_slv_we;
+    wire [5:0]  cop_slv_addr;
+    wire [3:0]  cop_slv_be;
+    wire [31:0] cop_slv_wdata;
+    wire [31:0] cop_slv_rdata;
+
+    // Blitter busy signal exposed to the Copper (for WAIT).
+    wire        blt_busy;
 
     m68k_bus #(
         .N_PORTS    (N_PORTS),
@@ -76,7 +89,13 @@ module m68k_top #(
         .blt_slv_addr(blt_slv_addr),
         .blt_slv_be  (blt_slv_be),
         .blt_slv_wdata(blt_slv_wdata),
-        .blt_slv_rdata(blt_slv_rdata)
+        .blt_slv_rdata(blt_slv_rdata),
+        .cop_slv_req (cop_slv_req),
+        .cop_slv_we  (cop_slv_we),
+        .cop_slv_addr(cop_slv_addr),
+        .cop_slv_be  (cop_slv_be),
+        .cop_slv_wdata(cop_slv_wdata),
+        .cop_slv_rdata(cop_slv_rdata)
     );
 
     // Blitter instance.  Its master port plugs into the bus at index
@@ -105,7 +124,8 @@ module m68k_top #(
         .mst_wdata    (blt_mst_wdata),
         .mst_be       (blt_mst_be),
         .mst_ack      (blt_mst_ack),
-        .mst_rdata    (blt_mst_rdata)
+        .mst_rdata    (blt_mst_rdata),
+        .busy_o       (blt_busy)
     );
 
     // Wire the blitter master into the arbiter at BLT_PORT.
@@ -117,6 +137,44 @@ module m68k_top #(
     assign p_be   [4*BLT_PORT  +: 4]          = blt_mst_be;
     assign blt_mst_ack   = p_resp_valid[BLT_PORT];
     assign blt_mst_rdata = p_resp_data;
+
+    // Copper master wires.
+    wire        cop_mst_req;
+    wire        cop_mst_we;
+    wire [31:0] cop_mst_addr;
+    wire [31:0] cop_mst_wdata;
+    wire [3:0]  cop_mst_be;
+    wire        cop_mst_ack;
+    wire [31:0] cop_mst_rdata;
+
+    m68k_copper u_cop (
+        .clk        (clk),
+        .rst_n      (rst_n),
+        .slv_req    (cop_slv_req),
+        .slv_we     (cop_slv_we),
+        .slv_addr   (cop_slv_addr),
+        .slv_be     (cop_slv_be),
+        .slv_wdata  (cop_slv_wdata),
+        .slv_rdata  (cop_slv_rdata),
+        .mst_req    (cop_mst_req),
+        .mst_we     (cop_mst_we),
+        .mst_addr   (cop_mst_addr),
+        .mst_wdata  (cop_mst_wdata),
+        .mst_be     (cop_mst_be),
+        .mst_ack    (cop_mst_ack),
+        .mst_rdata  (cop_mst_rdata),
+        .blt_busy_i (blt_busy)
+    );
+
+    // Wire the Copper master into the arbiter at COP_PORT.
+    assign p_req  [COP_PORT]                  = cop_mst_req;
+    assign p_we   [COP_PORT]                  = cop_mst_we;
+    assign p_lock [COP_PORT]                  = 1'b0;
+    assign p_addr [32*COP_PORT +: 32]         = cop_mst_addr;
+    assign p_wdata[32*COP_PORT +: 32]         = cop_mst_wdata;
+    assign p_be   [4*COP_PORT  +: 4]          = cop_mst_be;
+    assign cop_mst_ack   = p_resp_valid[COP_PORT];
+    assign cop_mst_rdata = p_resp_data;
 
     genvar gi;
     generate

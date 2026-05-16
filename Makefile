@@ -21,6 +21,8 @@ RTL_SRCS := $(RTL_DIR)/m68k_alu.v \
             $(RTL_DIR)/m68k_cache.v \
             $(RTL_DIR)/m68k_passthrough.v \
             $(RTL_DIR)/m68k_bus.v \
+            $(RTL_DIR)/m68k_blitter.v \
+            $(RTL_DIR)/m68k_copper.v \
             $(RTL_DIR)/m68k_core.v \
             $(RTL_DIR)/m68k_top.v
 
@@ -31,7 +33,7 @@ N_CORES   ?= 2
 MEM_WORDS ?= 16384
 BUILD     ?= build
 
-.PHONY: all build test bench clean demo demo-fb demo-os demo-blt
+.PHONY: all build test bench clean demo demo-fb demo-os demo-blt demo-cop
 
 all: test
 
@@ -111,6 +113,17 @@ demo-os:
 	$(PYTHON) $(TB_DIR)/asm68k.py $(DEMO_DIR)/os_demo.s build_demo/program.hex
 	@echo
 	@echo "Launching OS demo. Press ESC or close the window to quit."
+	@(cd build_demo && ./Vm68k_top 200000000 --graphics)
+
+demo-cop:
+	@if [ "$(HAVE_SDL2)" != "1" ]; then \
+	    echo "SDL2 not detected (sdl2-config returned no libs). brew install sdl2"; \
+	    exit 1; \
+	fi
+	@$(MAKE) --no-print-directory build BUILD=build_demo N_CORES=1 USE_CACHE=1 MEM_WORDS=65536 WITH_SDL2=1
+	$(PYTHON) $(TB_DIR)/asm68k.py $(DEMO_DIR)/cop_demo.s build_demo/program.hex
+	@echo
+	@echo "Launching Copper demo (Copper drives blitter, cross drawn on bitplane)."
 	@(cd build_demo && ./Vm68k_top 200000000 --graphics)
 
 demo-blt:

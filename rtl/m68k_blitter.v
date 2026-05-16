@@ -72,7 +72,10 @@ module m68k_blitter (
     output reg  [31:0] mst_wdata,
     output reg  [3:0]  mst_be,
     input  wire        mst_ack,
-    input  wire [31:0] mst_rdata
+    input  wire [31:0] mst_rdata,
+
+    // Live busy flag for the Copper (or any other consumer) to sample.
+    output wire        busy_o
 );
     reg mst_req_r;
     assign mst_req = mst_req_r && !mst_ack;
@@ -94,6 +97,7 @@ module m68k_blitter (
     reg [15:0] blt_width;       // words per row (after BLTSIZE decode)
     reg [15:0] blt_height;      // rows
     reg        blt_busy;
+    assign busy_o = blt_busy;
 
     // Decoded BLTCON fields.
     wire [7:0]  lf       = bltcon[31:24];
