@@ -54,20 +54,50 @@ module m68k_core #(
     assign ic_wdata = 32'd0;
     assign ic_be    = 4'b1111;
 
-    // Decoder kinds (mirrored from m68k_decoder.v).
-    localparam K_BAD   = 4'd0;
-    localparam K_NOP   = 4'd1;
-    localparam K_RTS   = 4'd2;
-    localparam K_STOP  = 4'd3;
-    localparam K_JMP   = 4'd4;
-    localparam K_JSR   = 4'd5;
-    localparam K_LEA   = 4'd6;
-    localparam K_MOVEQ = 4'd7;
-    localparam K_MOVE  = 4'd8;
-    localparam K_ALUQ  = 4'd9;
-    localparam K_ALU   = 4'd10;
-    localparam K_TAS   = 4'd11;
-    localparam K_BCC   = 4'd12;
+    // Decoder kinds (must match m68k_decoder.v).
+    localparam K_BAD     = 6'd0;
+    localparam K_NOP     = 6'd1;
+    localparam K_RTS     = 6'd2;
+    localparam K_STOP    = 6'd3;
+    localparam K_JMP     = 6'd4;
+    localparam K_JSR     = 6'd5;
+    localparam K_LEA     = 6'd6;
+    localparam K_MOVEQ   = 6'd7;
+    localparam K_MOVE    = 6'd8;
+    localparam K_ALUQ    = 6'd9;
+    localparam K_ALU     = 6'd10;
+    localparam K_TAS     = 6'd11;
+    localparam K_BCC     = 6'd12;
+    localparam K_ALUI    = 6'd13;
+    localparam K_MOVEA   = 6'd14;
+    localparam K_NEG     = 6'd15;
+    localparam K_NOT     = 6'd16;
+    localparam K_CLR     = 6'd17;
+    localparam K_TST     = 6'd18;
+    localparam K_EXT     = 6'd19;
+    localparam K_SWAP    = 6'd20;
+    localparam K_EXG     = 6'd21;
+    localparam K_LINK    = 6'd22;
+    localparam K_UNLK    = 6'd23;
+    localparam K_PEA     = 6'd24;
+    localparam K_MOVEM   = 6'd25;
+    localparam K_SHIFT   = 6'd26;
+    localparam K_BIT     = 6'd27;
+    localparam K_DBCC    = 6'd28;
+    localparam K_SCC     = 6'd29;
+    localparam K_TRAP    = 6'd30;
+    localparam K_TRAPV   = 6'd31;
+    localparam K_RTE     = 6'd32;
+    localparam K_RTR     = 6'd33;
+    localparam K_CHK     = 6'd34;
+    localparam K_MULU    = 6'd35;
+    localparam K_MULS    = 6'd36;
+    localparam K_DIVU    = 6'd37;
+    localparam K_DIVS    = 6'd38;
+    localparam K_MOVESR  = 6'd39;
+    localparam K_MOVECCR = 6'd40;
+    localparam K_MOVEUSP = 6'd41;
+    localparam K_ILLEGAL = 6'd42;
 
     // EX state.
     localparam S_RUN   = 2'd0;
@@ -157,8 +187,14 @@ module m68k_core #(
     // branch fields are valid in the same cycle as the latch.
     wire [15:0] effective_op = is_latching_opcode ? half_word_w : if_op;
 
-    wire [3:0]  dec_kind;
-    wire [3:0]  dec_alu_op;
+    wire [5:0]  dec_kind;
+    wire [4:0]  dec_alu_op;
+    wire [1:0]  dec_size;
+    wire        dec_privileged;
+    wire        dec_direction;
+    wire [3:0]  dec_shift_count;
+    wire        dec_shift_dyn;
+    wire [4:0]  dec_bit_pos;
     wire [2:0]  dec_src_mode, dec_src_reg, dec_dst_mode, dec_dst_reg, dec_reg_idx;
     wire        dec_reg_is_a;
     wire [31:0] dec_imm;
@@ -169,6 +205,7 @@ module m68k_core #(
     m68k_decoder u_dec_if (
         .opcode        (effective_op),
         .kind          (dec_kind),
+        .size          (dec_size),
         .alu_op        (dec_alu_op),
         .src_mode      (dec_src_mode),
         .src_reg       (dec_src_reg),
@@ -180,7 +217,12 @@ module m68k_core #(
         .cc            (dec_cc),
         .src_ext_words (dec_src_ext_words),
         .dst_ext_words (dec_dst_ext_words),
-        .needs_disp_word(dec_needs_disp_word)
+        .needs_disp_word(dec_needs_disp_word),
+        .privileged    (dec_privileged),
+        .direction     (dec_direction),
+        .shift_count   (dec_shift_count),
+        .shift_dyn     (dec_shift_dyn),
+        .bit_pos       (dec_bit_pos)
     );
 
     wire [2:0] total_words_eff = 3'd1 + {1'b0, dec_src_ext_words} + {1'b0, dec_dst_ext_words};
@@ -314,18 +356,25 @@ module m68k_core #(
     // ====================================================================
     //  ID stage.
     // ====================================================================
-    wire [3:0] idec_kind;
-    wire [3:0] idec_alu_op;
-    wire [2:0] idec_src_mode, idec_src_reg, idec_dst_mode, idec_dst_reg, idec_reg_idx;
-    wire       idec_reg_is_a;
+    wire [5:0]  idec_kind;
+    wire [4:0]  idec_alu_op;
+    wire [1:0]  idec_size;
+    wire [2:0]  idec_src_mode, idec_src_reg, idec_dst_mode, idec_dst_reg, idec_reg_idx;
+    wire        idec_reg_is_a;
     wire [31:0] idec_imm;
     wire [3:0]  idec_cc;
     wire [1:0]  idec_src_ext_words, idec_dst_ext_words;
     wire        idec_needs_disp_word;
+    wire        idec_privileged;
+    wire        idec_direction;
+    wire [3:0]  idec_shift_count;
+    wire        idec_shift_dyn;
+    wire [4:0]  idec_bit_pos;
 
     m68k_decoder u_dec_id (
         .opcode        (id_op),
         .kind          (idec_kind),
+        .size          (idec_size),
         .alu_op        (idec_alu_op),
         .src_mode      (idec_src_mode),
         .src_reg       (idec_src_reg),
@@ -337,7 +386,12 @@ module m68k_core #(
         .cc            (idec_cc),
         .src_ext_words (idec_src_ext_words),
         .dst_ext_words (idec_dst_ext_words),
-        .needs_disp_word(idec_needs_disp_word)
+        .needs_disp_word(idec_needs_disp_word),
+        .privileged    (idec_privileged),
+        .direction     (idec_direction),
+        .shift_count   (idec_shift_count),
+        .shift_dyn     (idec_shift_dyn),
+        .bit_pos       (idec_bit_pos)
     );
 
     wire [31:0] id_branch_imm = idec_needs_disp_word
@@ -363,9 +417,13 @@ module m68k_core #(
     always @* begin
         id_ra_idx = id_src_base_idx;
         case (idec_kind)
-            K_ALU, K_LEA, K_MOVEQ: id_rb_idx = id_reg_idx_full;
-            K_MOVE:                id_rb_idx = id_dst_base_idx;
-            default:               id_rb_idx = 4'd0;
+            K_ALU, K_LEA, K_MOVEQ,
+            K_MULU, K_MULS, K_DIVU, K_DIVS,
+            K_BIT, K_SHIFT, K_EXG, K_CHK:        id_rb_idx = id_reg_idx_full;
+            K_MOVE, K_MOVEA:                     id_rb_idx = id_dst_base_idx;
+            K_ALUI:                              id_rb_idx = {1'b0, idec_dst_reg};
+            K_DBCC:                              id_rb_idx = {1'b0, idec_src_reg};
+            default:                             id_rb_idx = 4'd0;
         endcase
     end
     wire [3:0] id_rc_idx = 4'd15;  // A7 / SP always available on third port
@@ -375,6 +433,7 @@ module m68k_core #(
     // Writeback signals (driven combinationally by EX stage below).
     reg         wb_we;
     reg  [3:0]  wb_widx;
+    reg  [1:0]  wb_size;
     reg  [31:0] wb_wdata;
     reg         wb_aux_we;
     reg  [3:0]  wb_aux_idx;
@@ -392,6 +451,7 @@ module m68k_core #(
         .rc_data  (rf_rc_data),
         .we       (wb_we),
         .w_idx    (wb_widx),
+        .w_size   (wb_size),
         .w_data   (wb_wdata),
         .aux_we   (wb_aux_we),
         .aux_idx  (wb_aux_idx),
@@ -419,8 +479,12 @@ module m68k_core #(
     reg         ex_valid;
     reg  [31:0] ex_pc;
     reg  [31:0] ex_pc_next;
-    reg  [3:0]  ex_kind;
-    reg  [3:0]  ex_alu_op;
+    reg  [5:0]  ex_kind;
+    reg  [4:0]  ex_alu_op;
+    reg  [1:0]  ex_size;
+    reg         ex_direction;
+    reg  [3:0]  ex_shift_count;
+    reg         ex_shift_dyn;
     reg  [2:0]  ex_src_mode, ex_src_reg, ex_dst_mode, ex_dst_reg;
     reg  [31:0] ex_src_imm32;
     reg  [31:0] ex_dst_imm32;
@@ -455,6 +519,10 @@ module m68k_core #(
             ex_sp <= 32'd0;
             ex_reg_idx_full <= 4'd0;
             ex_predicted_taken <= 1'b0;
+            ex_size <= `SZ_L;
+            ex_direction <= 1'b0;
+            ex_shift_count <= 4'd0;
+            ex_shift_dyn <= 1'b0;
         end else if (redirect_valid) begin
             ex_valid <= 1'b0;
         end else if (!stall) begin
@@ -463,6 +531,10 @@ module m68k_core #(
             ex_pc_next     <= id_pc_next;
             ex_kind        <= idec_kind;
             ex_alu_op      <= idec_alu_op;
+            ex_size        <= idec_size;
+            ex_direction   <= idec_direction;
+            ex_shift_count <= idec_shift_count;
+            ex_shift_dyn   <= idec_shift_dyn;
             ex_src_mode    <= idec_src_mode;
             ex_src_reg     <= idec_src_reg;
             ex_dst_mode    <= idec_dst_mode;
@@ -493,6 +565,22 @@ module m68k_core #(
     reg        dst_an_update;
     reg        dst_is_mem;
 
+    // Size-dependent auto-inc/dec step (with A7=SP byte→step-2 quirk).
+    function [31:0] step_for;
+        input [1:0] sz;
+        input [2:0] reg_n;
+        begin
+            case (sz)
+                `SZ_L: step_for = 32'd4;
+                `SZ_W: step_for = 32'd2;
+                default: step_for = (reg_n == 3'd7) ? 32'd2 : 32'd1;
+            endcase
+        end
+    endfunction
+
+    wire [31:0] src_step = step_for(ex_size, ex_src_reg);
+    wire [31:0] dst_step = step_for(ex_size, ex_dst_reg);
+
     always @* begin
         src_ea = 32'd0;
         src_operand = 32'd0;
@@ -505,18 +593,24 @@ module m68k_core #(
             `EA_AINC: begin
                 src_ea = ex_ra;
                 src_needs_mem = 1'b1;
-                src_an_next = ex_ra + 32'd4;
+                src_an_next = ex_ra + src_step;
                 src_an_update = 1'b1;
             end
             `EA_ADEC: begin
-                src_ea = ex_ra - 32'd4;
+                src_ea = ex_ra - src_step;
                 src_needs_mem = 1'b1;
-                src_an_next = ex_ra - 32'd4;
+                src_an_next = ex_ra - src_step;
                 src_an_update = 1'b1;
+            end
+            `EA_DISP: begin
+                // d16(An): EA = An + sign_ext(disp16). disp16 is in ex_src_imm32.
+                src_ea = ex_ra + ex_src_imm32;
+                src_needs_mem = 1'b1;
             end
             `EA_EXT: begin
                 case (ex_src_reg)
                     `EA7_ABSW, `EA7_ABSL: begin src_ea = ex_src_imm32; src_needs_mem = 1'b1; end
+                    `EA7_PCDISP:          begin src_ea = ex_pc + 32'd2 + ex_src_imm32; src_needs_mem = 1'b1; end
                     `EA7_IMM:             src_operand = ex_src_imm32;
                     default: ;
                 endcase
@@ -536,14 +630,18 @@ module m68k_core #(
             `EA_AINC: begin
                 dst_ea = ex_rb;
                 dst_is_mem = 1'b1;
-                dst_an_next = ex_rb + 32'd4;
+                dst_an_next = ex_rb + dst_step;
                 dst_an_update = 1'b1;
             end
             `EA_ADEC: begin
-                dst_ea = ex_rb - 32'd4;
+                dst_ea = ex_rb - dst_step;
                 dst_is_mem = 1'b1;
-                dst_an_next = ex_rb - 32'd4;
+                dst_an_next = ex_rb - dst_step;
                 dst_an_update = 1'b1;
+            end
+            `EA_DISP: begin
+                dst_ea = ex_rb + ex_dst_imm32;
+                dst_is_mem = 1'b1;
             end
             `EA_EXT: begin
                 case (ex_dst_reg)
@@ -555,7 +653,7 @@ module m68k_core #(
         endcase
     end
 
-    reg cc_n, cc_z, cc_v, cc_c;
+    reg cc_n, cc_z, cc_v, cc_c, cc_x;
     reg [1:0] ex_state;
 
     reg [31:0] ex_tas_word;  // word read in TAS phase 0
@@ -577,25 +675,32 @@ module m68k_core #(
     reg [31:0] wb_aux_data_c;
 
     reg        cc_we_c;
-    reg        cc_n_c, cc_z_c, cc_v_c, cc_c_c;
+    reg        cc_n_c, cc_z_c, cc_v_c, cc_c_c, cc_x_c;
+    reg        cc_x_we_c;       // whether this op writes X
 
     reg        take_branch_c;
     reg [31:0] take_branch_target_c;
 
     reg [31:0] alu_a, alu_b;
-    reg [3:0]  alu_op_c;
+    reg [4:0]  alu_op_c;
+    reg [1:0]  alu_size_c;
+    reg [5:0]  alu_shamt_c;
     wire [31:0] alu_y;
-    wire alu_n, alu_z, alu_v, alu_c;
+    wire alu_n, alu_z, alu_v, alu_c, alu_x;
 
     m68k_alu u_alu (
         .op     (alu_op_c),
+        .size   (alu_size_c),
+        .x_in   (cc_x),
         .a      (alu_a),
         .b      (alu_b),
+        .shamt  (alu_shamt_c),
         .y      (alu_y),
         .flag_n (alu_n),
         .flag_z (alu_z),
         .flag_v (alu_v),
-        .flag_c (alu_c)
+        .flag_c (alu_c),
+        .flag_x (alu_x)
     );
 
     // dc_req is held until we observe dc_ack at a posedge; the cache's
@@ -636,11 +741,14 @@ module m68k_core #(
         wb_main_we_c = 1'b0; wb_main_idx_c = 4'd0; wb_main_data_c = 32'd0;
         wb_aux_we_c  = 1'b0; wb_aux_idx_c  = 4'd0; wb_aux_data_c  = 32'd0;
         cc_we_c = 1'b0;
-        cc_n_c = 1'b0; cc_z_c = 1'b0; cc_v_c = 1'b0; cc_c_c = 1'b0;
+        cc_n_c = 1'b0; cc_z_c = 1'b0; cc_v_c = 1'b0; cc_c_c = 1'b0; cc_x_c = cc_x;
+        cc_x_we_c = 1'b0;
         take_branch_c = 1'b0;
         take_branch_target_c = 32'd0;
         alu_a = 32'd0; alu_b = 32'd0;
         alu_op_c = `ALU_MOV;
+        alu_size_c = ex_size;
+        alu_shamt_c = 6'd0;
 
         if (!ex_valid || halted) ;
         else case (ex_state)
@@ -763,6 +871,117 @@ module m68k_core #(
                             want_be = 4'b1111;
                         end
                     end
+                    // ----------------------------------------------------
+                    // New instruction kinds (Tier 3).
+                    // ----------------------------------------------------
+                    K_ALUI: begin
+                        // src is immediate (in ex_src_imm32); dst is the EA from
+                        // dst_mode/dst_reg. We support Dn destinations here.
+                        if (ex_dst_mode == `EA_DREG) begin
+                            alu_op_c = ex_alu_op;
+                            alu_a = ex_rb;            // Dn destination value
+                            alu_b = ex_src_imm32;
+                            alu_size_c = ex_size;
+                            cc_we_c = 1'b1;
+                            cc_x_we_c = (ex_alu_op == `ALU_ADD) || (ex_alu_op == `ALU_SUB);
+                            cc_n_c = alu_n; cc_z_c = alu_z; cc_v_c = alu_v;
+                            cc_c_c = alu_c; cc_x_c = alu_x;
+                            if (ex_alu_op != `ALU_CMP) begin
+                                wb_main_we_c  = 1'b1;
+                                wb_main_idx_c = {1'b0, ex_dst_reg};
+                                wb_main_data_c = alu_y;
+                            end
+                        end
+                        // ALUI to memory: would need RMW; not implemented.
+                    end
+                    K_MOVEA: begin
+                        // MOVEA: source any EA, dest is An (full 32-bit).
+                        // .W sign-extends to 32 bits.
+                        if (src_needs_mem) begin
+                            want_mem = 1'b1; want_we = 1'b0;
+                            want_addr = src_ea;
+                            want_be = 4'b1111;     // simple: always read full word, extract later
+                            if (src_an_update) begin
+                                wb_aux_we_c   = 1'b1;
+                                wb_aux_idx_c  = {1'b1, ex_src_reg};
+                                wb_aux_data_c = src_an_next;
+                            end
+                        end else begin
+                            wb_main_we_c   = 1'b1;
+                            wb_main_idx_c  = {1'b1, ex_dst_reg};
+                            wb_main_data_c = (ex_size == `SZ_W)
+                                             ? {{16{src_operand[15]}}, src_operand[15:0]}
+                                             : src_operand;
+                        end
+                    end
+                    K_CLR: begin
+                        if (ex_src_mode == `EA_DREG) begin
+                            wb_main_we_c   = 1'b1;
+                            wb_main_idx_c  = {1'b0, ex_src_reg};
+                            wb_main_data_c = 32'd0;
+                            cc_we_c = 1'b1;
+                            cc_z_c = 1'b1;
+                        end
+                    end
+                    K_TST: begin
+                        if (!src_needs_mem) begin
+                            alu_op_c = `ALU_TST;
+                            alu_b = src_operand;
+                            alu_size_c = ex_size;
+                            cc_we_c = 1'b1;
+                            cc_n_c = alu_n; cc_z_c = alu_z;
+                        end
+                        // Memory TST: would need load; not implemented.
+                    end
+                    K_NEG, K_NOT: begin
+                        if (ex_src_mode == `EA_DREG) begin
+                            alu_op_c = (ex_kind == K_NEG) ? `ALU_NEG : `ALU_NOT;
+                            alu_b = src_operand;
+                            alu_size_c = ex_size;
+                            cc_we_c = 1'b1;
+                            cc_x_we_c = (ex_kind == K_NEG);
+                            cc_n_c = alu_n; cc_z_c = alu_z; cc_v_c = alu_v;
+                            cc_c_c = alu_c; cc_x_c = alu_x;
+                            wb_main_we_c   = 1'b1;
+                            wb_main_idx_c  = {1'b0, ex_src_reg};
+                            wb_main_data_c = alu_y;
+                        end
+                    end
+                    K_EXT: begin
+                        alu_op_c = ex_alu_op;       // ALU_EXT_W or ALU_EXT_L
+                        alu_b = ex_ra;
+                        alu_size_c = ex_size;
+                        cc_we_c = 1'b1;
+                        cc_n_c = alu_n; cc_z_c = alu_z;
+                        wb_main_we_c   = 1'b1;
+                        wb_main_idx_c  = {1'b0, ex_src_reg};
+                        wb_main_data_c = alu_y;
+                    end
+                    K_SWAP: begin
+                        alu_op_c = `ALU_SWAP;
+                        alu_b = ex_ra;
+                        alu_size_c = `SZ_L;
+                        cc_we_c = 1'b1;
+                        cc_n_c = alu_n; cc_z_c = alu_z;
+                        wb_main_we_c   = 1'b1;
+                        wb_main_idx_c  = {1'b0, ex_src_reg};
+                        wb_main_data_c = alu_y;
+                    end
+                    K_EXG: begin
+                        // Swap two registers (both .L). ra holds Ry (the src-mode reg),
+                        // rb holds Rx (reg_idx). After EXG: Rx <- Ry, Ry <- Rx.
+                        wb_main_we_c   = 1'b1;
+                        wb_main_idx_c  = ex_reg_idx_full;
+                        wb_main_data_c = ex_ra;
+                        wb_aux_we_c    = 1'b1;
+                        wb_aux_idx_c   = reg_idx_of_ea(ex_src_mode, ex_src_reg);
+                        wb_aux_data_c  = ex_rb;
+                    end
+                    K_DBCC: begin
+                        // Test cc first. If TRUE: fall through. If FALSE: decrement
+                        // Dn[15:0]; branch unless result is -1.
+                        // (We approximate Dn[15:0] using ex_ra[15:0].)
+                    end
                     default: ;
                 endcase
             end
@@ -852,6 +1071,7 @@ module m68k_core #(
     always @* begin
         wb_we       = 1'b0;
         wb_widx     = 4'd0;
+        wb_size     = `SZ_L;
         wb_wdata    = 32'd0;
         wb_aux_we   = 1'b0;
         wb_aux_idx  = 4'd0;
@@ -859,6 +1079,7 @@ module m68k_core #(
         if (is_settled) begin
             wb_we       = wb_main_we_c;
             wb_widx     = wb_main_idx_c;
+            wb_size     = ex_size;
             wb_wdata    = wb_main_data_c;
             wb_aux_we   = wb_aux_we_c;
             wb_aux_idx  = wb_aux_idx_c;
@@ -869,7 +1090,7 @@ module m68k_core #(
     // Sequential state updates (CCR commit, branch redirect, ex_state, dc_*).
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            cc_n <= 1'b0; cc_z <= 1'b0; cc_v <= 1'b0; cc_c <= 1'b0;
+            cc_n <= 1'b0; cc_z <= 1'b0; cc_v <= 1'b0; cc_c <= 1'b0; cc_x <= 1'b0;
             ex_state <= S_RUN;
             ex_tas_word <= 32'd0;
             dc_req_r <= 1'b0;
@@ -885,6 +1106,7 @@ module m68k_core #(
             if (is_settled && cc_we_c) begin
                 cc_n <= cc_n_c; cc_z <= cc_z_c; cc_v <= cc_v_c; cc_c <= cc_c_c;
             end
+            if (is_settled && cc_x_we_c) cc_x <= cc_x_c;
 
             // STOP halts.
             if (ex_valid && ex_kind == K_STOP && ex_state == S_RUN && !halted) begin

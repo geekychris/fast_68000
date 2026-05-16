@@ -11,7 +11,7 @@ Vm68k_top__Syms::Vm68k_top__Syms(VerilatedContext* contextp, const char* namep, 
     , TOP{this, namep}
 {
     // Check resources
-    Verilated::stackCheck(1472);
+    Verilated::stackCheck(1196);
     // Setup sub module instances
     // Configure time unit / time precision
     _vm_contextp__->timeunit(-12);

@@ -1,0 +1,11 @@
+Vm68k_top___024root__2.o: \
+  /Users/chris/code/claude_world/68000/build_trace/Vm68k_top__pch.h \
+  /opt/homebrew/Cellar/verilator/5.048/share/verilator/include/verilated.h \
+  /opt/homebrew/Cellar/verilator/5.048/share/verilator/include/verilated_config.h \
+  /opt/homebrew/Cellar/verilator/5.048/share/verilator/include/verilatedos.h \
+  /opt/homebrew/Cellar/verilator/5.048/share/verilator/include/verilated_types.h \
+  /opt/homebrew/Cellar/verilator/5.048/share/verilator/include/verilated_funcs.h \
+  /Users/chris/code/claude_world/68000/build_trace/Vm68k_top__Syms.h \
+  /Users/chris/code/claude_world/68000/build_trace/Vm68k_top.h \
+  /Users/chris/code/claude_world/68000/build_trace/Vm68k_top___024root.h \
+  Vm68k_top___024root__2.cpp Vm68k_top__pch.h

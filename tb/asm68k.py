@@ -229,6 +229,45 @@ class Asm:
             op = (0b0100_1010 << 8) | (0b11 << 6) | (ea[0] << 3) | ea[1]
             self.emit(op)
             self.emit_ea_ext(ea)
+        elif mnem in ('clr.b', 'clr.w', 'clr.l',
+                       'neg.b', 'neg.w', 'neg.l',
+                       'not.b', 'not.w', 'not.l',
+                       'tst.b', 'tst.w', 'tst.l'):
+            op_family, _, sz_str = mnem.partition('.')
+            ss = {'b': 0b00, 'w': 0b01, 'l': 0b10}[sz_str]
+            mid = {'clr': 0b0010, 'neg': 0b0100, 'not': 0b0110, 'tst': 0b1010}[op_family]
+            ea = self.parse_ea(operands[0])
+            op = (0b0100 << 12) | (mid << 8) | (ss << 6) | (ea[0] << 3) | ea[1]
+            self.emit(op)
+            self.emit_ea_ext(ea)
+        elif mnem in ('ext.w', 'ext.l'):
+            dn = self.reg(operands[0], 'D')
+            ss = 0b10 if mnem == 'ext.w' else 0b11   # 10 = ext byte→word, 11 = ext word→long
+            op = (0b0100_1000 << 8) | (ss << 6) | dn
+            self.emit(op)
+        elif mnem == 'swap':
+            dn = self.reg(operands[0], 'D')
+            op = (0b0100_1000_0100_0 << 3) | dn
+            self.emit(op)
+        elif mnem in ('addi.b', 'addi.w', 'addi.l',
+                       'subi.b', 'subi.w', 'subi.l',
+                       'andi.b', 'andi.w', 'andi.l',
+                       'ori.b',  'ori.w',  'ori.l',
+                       'eori.b', 'eori.w', 'eori.l',
+                       'cmpi.b', 'cmpi.w', 'cmpi.l'):
+            family, _, sz_str = mnem.partition('.')
+            ss = {'b': 0b00, 'w': 0b01, 'l': 0b10}[sz_str]
+            fam = {'ori':0b0000,'andi':0b0010,'subi':0b0100,'addi':0b0110,'eori':0b1010,'cmpi':0b1100}[family]
+            imm = self.parse_int(operands[0])
+            ea = self.parse_ea(operands[1])
+            op = (0b0000 << 12) | (fam << 8) | (ss << 6) | (ea[0] << 3) | ea[1]
+            self.emit(op)
+            if sz_str == 'l':
+                self.emit((imm >> 16) & 0xFFFF)
+                self.emit(imm & 0xFFFF)
+            else:
+                self.emit(imm & 0xFFFF)
+            self.emit_ea_ext(ea)
         elif mnem == 'bra' or mnem == 'bsr' or (mnem.startswith('b') and mnem[1:] in self.CC):
             if mnem == 'bra': cc = self.CC['t']
             elif mnem == 'bsr': cc = self.CC['f']
