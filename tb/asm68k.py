@@ -134,6 +134,19 @@ class Asm:
             else:
                 self.emit(w)
 
+    def emit_ea_ext_sized(self, ea, size_char):
+        # Like emit_ea_ext but for sized MOVE: an immediate source emits 1 word
+        # for .b/.w (the low halfword of the value) and 2 words for .l.
+        mode, reg, words = ea
+        is_imm = (mode == self.EA_EXT and reg == self.EA7_IMM)
+        if is_imm and size_char in ('b', 'w'):
+            if len(words) == 2 and isinstance(words[0], tuple):
+                raise SyntaxError("label as .b/.w immediate not supported")
+            lo = words[1] if len(words) == 2 else words[0]
+            self.emit(lo)
+            return
+        self.emit_ea_ext(ea)
+
     def parse_operands(self, line):
         # Split on commas not inside parens.
         parts = []
@@ -294,15 +307,18 @@ class Asm:
             dn = self.reg(operands[1], 'D')
             op = (0b0111 << 12) | (dn << 9) | (imm & 0xFF)
             self.emit(op)
-        elif mnem == 'move.l':
+        elif mnem in ('move.l', 'move.w', 'move.b'):
             src = self.parse_ea(operands[0])
             dst = self.parse_ea(operands[1])
-            # Size field = 10 (long), but encoded in bits 13:12 as 10 -> "00_10"
-            # opcode = 00_10 DDDmmm MMMrrr
-            op = (0b00 << 14) | (0b10 << 12) | (dst[1] << 9) | (dst[0] << 6) | (src[0] << 3) | src[1]
+            # MOVE size field in bits 13:12: 01 = byte, 11 = word, 10 = long.
+            size_bits = {'move.b': 0b01, 'move.w': 0b11, 'move.l': 0b10}[mnem]
+            op = (0b00 << 14) | (size_bits << 12) | (dst[1] << 9) | (dst[0] << 6) | (src[0] << 3) | src[1]
             self.emit(op)
-            self.emit_ea_ext(src)
-            self.emit_ea_ext(dst)
+            # Size-aware emission of source extension words.  parse_ea always
+            # generates two halfwords for an immediate (.L view); for .B/.W we
+            # need just one (the low half).
+            self.emit_ea_ext_sized(src, mnem[-1])
+            self.emit_ea_ext_sized(dst, mnem[-1])
         elif mnem in ('add.l', 'sub.l', 'and.l', 'or.l', 'cmp.l'):
             src = self.parse_ea(operands[0])
             dn = self.reg(operands[1], 'D')
@@ -310,6 +326,19 @@ class Asm:
             op = (tab[mnem] << 12) | (dn << 9) | (0b010 << 6) | (src[0] << 3) | src[1]
             self.emit(op)
             self.emit_ea_ext(src)
+        elif mnem in ('adda.l', 'suba.l', 'cmpa.l', 'adda.w', 'suba.w', 'cmpa.w'):
+            # ADDA/SUBA/CMPA Dn-like-source -> An.  Encoding:
+            #   ADDA.W = 1101 ddd 011 mmm rrr ; ADDA.L = 1101 ddd 111 mmm rrr
+            #   SUBA.W = 1001 ddd 011 mmm rrr ; SUBA.L = 1001 ddd 111 mmm rrr
+            #   CMPA.W = 1011 ddd 011 mmm rrr ; CMPA.L = 1011 ddd 111 mmm rrr
+            src = self.parse_ea(operands[0])
+            an  = self.reg(operands[1], 'A')
+            family, _, sz = mnem.partition('.')
+            top4 = {'adda': 0b1101, 'suba': 0b1001, 'cmpa': 0b1011}[family]
+            opm  = 0b111 if sz == 'l' else 0b011
+            op = (top4 << 12) | (an << 9) | (opm << 6) | (src[0] << 3) | src[1]
+            self.emit(op)
+            self.emit_ea_ext_sized(src, sz)
         elif mnem == 'eor.l':
             # EOR Dn,Dm only — opmode 110
             dn = self.reg(operands[0], 'D')

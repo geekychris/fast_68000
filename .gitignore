@@ -1,4 +1,5 @@
 build/
+build_demo/
 build_fast/
 build_slow/
 build_trace/

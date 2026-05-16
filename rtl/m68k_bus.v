@@ -38,7 +38,14 @@ module m68k_bus #(
     // $FFFC.W with the 68000's sign-extension of absolute-short addresses)
     // latch the low 3 bits of wdata into irq_level (sticky; clear by
     // writing 0).
-    output reg  [2:0]                     irq_level
+    output reg  [2:0]                     irq_level,
+
+    // Framebuffer peek port. Combinational read-only access to the memory
+    // array. Used by the simulator harness to render a window without
+    // intruding on CPU bus traffic. In synthesis you would tie fb_peek_addr
+    // off and ignore fb_peek_data, or remove this port entirely.
+    input  wire [31:0]                    fb_peek_addr,
+    output wire [31:0]                    fb_peek_data
 );
     localparam [31:0] IRQ_REG_ADDR = 32'hFFFF_FFFC;
     localparam PID_BITS = $clog2(N_PORTS);
@@ -46,6 +53,9 @@ module m68k_bus #(
 
     // Memory.
     reg [31:0] mem [0:MEM_WORDS-1];
+
+    // Framebuffer peek (word index = fb_peek_addr[AIDX_BITS+1:2]).
+    assign fb_peek_data = mem[fb_peek_addr[AIDX_BITS+1:2]];
     integer mi;
     initial begin
         for (mi = 0; mi < MEM_WORDS; mi = mi + 1) mem[mi] = 32'd0;

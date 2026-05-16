@@ -3,10 +3,17 @@
 VERILATOR ?= verilator
 PYTHON    ?= python3
 
-RTL_DIR   := rtl
-TB_DIR    := tb
-TESTS_DIR := tests
-BENCH_DIR := bench
+RTL_DIR    := rtl
+TB_DIR     := tb
+TESTS_DIR  := tests
+BENCH_DIR  := bench
+DEMO_DIR   := demos
+
+# SDL2 detection for the graphics demo. If sdl2-config is on PATH and pkg-config
+# can locate SDL2, the demo target compiles in framebuffer-window support.
+SDL2_CFLAGS := $(shell sdl2-config --cflags 2>/dev/null)
+SDL2_LIBS   := $(shell sdl2-config --libs 2>/dev/null)
+HAVE_SDL2   := $(if $(SDL2_LIBS),1,0)
 
 RTL_SRCS := $(RTL_DIR)/m68k_alu.v \
             $(RTL_DIR)/m68k_regfile.v \
@@ -20,22 +27,25 @@ RTL_SRCS := $(RTL_DIR)/m68k_alu.v \
 TESTS  := $(wildcard $(TESTS_DIR)/*.s)
 BENCHES:= $(wildcard $(BENCH_DIR)/*.s)
 
-N_CORES ?= 2
-BUILD ?= build
+N_CORES   ?= 2
+MEM_WORDS ?= 16384
+BUILD     ?= build
 
-.PHONY: all build test bench clean
+.PHONY: all build test bench clean demo demo-fb demo-os
 
 all: test
 
 build: $(BUILD)/Vm68k_top
 
-# Generic build rule: BUILD, N_CORES and USE_CACHE control the output.
+# Generic build rule: BUILD, N_CORES, USE_CACHE, MEM_WORDS, WITH_SDL2 control the output.
 $(BUILD)/Vm68k_top: $(RTL_SRCS) $(TB_DIR)/sim_main.cpp
 	@mkdir -p $(BUILD)
 	$(VERILATOR) -Wno-fatal --cc --exe --build \
-	    -CFLAGS "-DNUM_CORES=$(N_CORES) -std=c++17 -O1" \
+	    -CFLAGS "-DNUM_CORES=$(N_CORES) -std=c++17 -O1 $(if $(WITH_SDL2),-DHAVE_SDL2 $(SDL2_CFLAGS),)" \
+	    $(if $(WITH_SDL2),-LDFLAGS "$(SDL2_LIBS)",) \
 	    -GN_CORES=$(N_CORES) \
 	    -GUSE_CACHE=$(if $(USE_CACHE),$(USE_CACHE),1) \
+	    -GMEM_WORDS=$(MEM_WORDS) \
 	    -I$(RTL_DIR) \
 	    --top-module m68k_top \
 	    -Mdir $(BUILD) \
@@ -70,5 +80,40 @@ bench:
 	@$(MAKE) --no-print-directory build BUILD=build_slow N_CORES=1 USE_CACHE=0 >build_slow.log 2>&1
 	@$(PYTHON) $(TB_DIR)/bench_report.py build_fast build_slow
 
+# --- Graphics demos -------------------------------------------------------
+#
+# Both demos build with N_CORES=1, a roomy 128 KB memory (32K words) so the
+# 48 KB framebuffer + code + stacks all fit, and SDL2 linked in. They each
+# produce a Verilator binary in their own build dir so they don't stomp
+# on the regression build.
+
+# Framebuffer-only demo: no OS. A single asm program animates a moving
+# gradient and dot. Shows the framebuffer plumbing works end-to-end.
+demo-fb:
+	@if [ "$(HAVE_SDL2)" != "1" ]; then \
+	    echo "SDL2 not detected (sdl2-config returned no libs). brew install sdl2"; \
+	    exit 1; \
+	fi
+	@$(MAKE) --no-print-directory build BUILD=build_demo N_CORES=1 USE_CACHE=1 MEM_WORDS=32768 WITH_SDL2=1
+	$(PYTHON) $(TB_DIR)/asm68k.py $(DEMO_DIR)/fb_demo.s build_demo/program.hex
+	@echo
+	@echo "Launching framebuffer demo. Press ESC or close the window to quit."
+	@(cd build_demo && ./Vm68k_top 200000000 --graphics)
+
+# OS demo: cooperative kernel running multiple tasks that each animate a
+# region of the framebuffer.
+demo-os:
+	@if [ "$(HAVE_SDL2)" != "1" ]; then \
+	    echo "SDL2 not detected (sdl2-config returned no libs). brew install sdl2"; \
+	    exit 1; \
+	fi
+	@$(MAKE) --no-print-directory build BUILD=build_demo N_CORES=1 USE_CACHE=1 MEM_WORDS=32768 WITH_SDL2=1
+	$(PYTHON) $(TB_DIR)/asm68k.py $(DEMO_DIR)/os_demo.s build_demo/program.hex
+	@echo
+	@echo "Launching OS demo. Press ESC or close the window to quit."
+	@(cd build_demo && ./Vm68k_top 200000000 --graphics)
+
+demo: demo-os
+
 clean:
-	rm -rf build build_fast build_slow build_fast.log build_slow.log
+	rm -rf build build_fast build_slow build_demo build_fast.log build_slow.log

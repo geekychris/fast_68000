@@ -13,7 +13,12 @@ module m68k_top #(
     input  wire rst_n,
     output wire [N_CORES-1:0]    halted,
     output wire [16*N_CORES-1:0] halt_code_flat,
-    output wire [32*N_CORES-1:0] retired_flat
+    output wire [32*N_CORES-1:0] retired_flat,
+
+    // Framebuffer peek for the simulator harness. Drive fb_peek_addr with a
+    // word-aligned byte address; fb_peek_data returns the 32-bit word.
+    input  wire [31:0] fb_peek_addr,
+    output wire [31:0] fb_peek_data
 );
     localparam N_PORTS = 2 * N_CORES;
     localparam PID_BITS = $clog2(N_PORTS > 1 ? N_PORTS : 2);
@@ -53,7 +58,9 @@ module m68k_top #(
         .snoop_valid (snoop_valid),
         .snoop_addr  (snoop_addr),
         .snoop_src_id(snoop_src_id),
-        .irq_level   (irq_level)
+        .irq_level   (irq_level),
+        .fb_peek_addr(fb_peek_addr),
+        .fb_peek_data(fb_peek_data)
     );
 
     genvar gi;

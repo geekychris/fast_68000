@@ -40,7 +40,9 @@ bus arbiter, hardware-integration notes, and a workload-by-workload
 performance breakdown — see [DESIGN.md](DESIGN.md). For the ISA encoding
 reference, see [ISA.md](ISA.md). For a tutorial on writing programs that
 exploit the multi-core capability (with assembly and illustrative C
-examples), see [MULTICORE.md](MULTICORE.md).
+examples), see [MULTICORE.md](MULTICORE.md). For the framebuffer,
+SDL-based macOS window, and tiny cooperative-multitasking kernel demo,
+see [OS.md](OS.md) — runnable via `make demo`.
 
 ## Headline numbers
 
