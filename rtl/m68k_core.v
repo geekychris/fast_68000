@@ -1642,10 +1642,28 @@ module m68k_core #(
                         wb_main_we_c = 1'b1;
                         wb_main_idx_c = (ex_dst_mode == `EA_AREG) ? {1'b1, ex_dst_reg}
                                                                   : {1'b0, ex_dst_reg};
-                        wb_main_data_c = dc_rdata;
+                        // Size-aware extraction: pick the right byte/word
+                        // from dc_rdata so the sized writeback sees the
+                        // proper value in its low bits.  CCR likewise.
+                        case (ex_size)
+                            `SZ_B: begin
+                                wb_main_data_c = {24'd0, byte_at(dc_rdata, dc_addr[1:0])};
+                                cc_n_c = byte_at(dc_rdata, dc_addr[1:0])[7];
+                                cc_z_c = (byte_at(dc_rdata, dc_addr[1:0]) == 8'd0);
+                            end
+                            `SZ_W: begin
+                                wb_main_data_c = {16'd0, dc_addr[1] ? dc_rdata[15:0] : dc_rdata[31:16]};
+                                cc_n_c = dc_addr[1] ? dc_rdata[15] : dc_rdata[31];
+                                cc_z_c = dc_addr[1] ? (dc_rdata[15:0] == 16'd0)
+                                                    : (dc_rdata[31:16] == 16'd0);
+                            end
+                            default: begin
+                                wb_main_data_c = dc_rdata;
+                                cc_n_c = dc_rdata[31];
+                                cc_z_c = (dc_rdata == 32'd0);
+                            end
+                        endcase
                         cc_we_c = (ex_dst_mode == `EA_DREG);
-                        cc_n_c = dc_rdata[31];
-                        cc_z_c = (dc_rdata == 32'd0);
                         if (src_an_update) begin
                             wb_aux_we_c = 1'b1;
                             wb_aux_idx_c = {1'b1, ex_src_reg};

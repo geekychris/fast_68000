@@ -70,6 +70,7 @@ module m68k_cache #(
     reg state;
 
     reg                 saved_we;
+    reg                 saved_io;
     reg [IDX_BITS-1:0]  saved_idx;
     reg [TAG_BITS-1:0]  saved_tag;
 
@@ -80,10 +81,19 @@ module m68k_cache #(
     reg bus_req_r;
     assign bus_req = bus_req_r && !bus_resp_valid;
 
+    // I/O region: any address with [31:24] >= 8'hF0 is treated as
+    // uncached (memory-mapped device registers).  This covers the IRQ
+    // register at $FFFF_FFFC and the blitter registers at $00FE_0000-
+    // $00FE_003F. Note the blitter address uses bits [23:16]=$FE while
+    // [31:24]=$00, so we add an explicit check for that range too.
+    wire is_io = (cpu_addr[31:24] >= 8'hF0) ||
+                 (cpu_addr[31:16] == 16'h00FE);
+
     // Combinational read-hit response (no state change).
     // Locked reads (TAS phase 0) always go to the bus so the arbiter sees
-    // the lock and serialises against other cores.
-    wire comb_read_hit = (state == S_IDLE) && cpu_req && !cpu_we && !cpu_lock && hit;
+    // the lock and serialises against other cores.  I/O reads are also
+    // forced to the bus so device-register changes are visible.
+    wire comb_read_hit = (state == S_IDLE) && cpu_req && !cpu_we && !cpu_lock && !is_io && hit;
 
     // Combinational response while we're holding the BUS_WAIT state and the
     // bus has just returned. The state machine transitions back to S_IDLE on
@@ -116,6 +126,7 @@ module m68k_cache #(
             bus_wdata <= 32'd0;
             bus_be <= 4'b0;
             saved_we <= 1'b0;
+            saved_io <= 1'b0;
             saved_idx <= {IDX_BITS{1'b0}};
             saved_tag <= {TAG_BITS{1'b0}};
             for (i = 0; i < NUM_LINES; i = i + 1) begin
@@ -130,7 +141,10 @@ module m68k_cache #(
             case (state)
                 S_IDLE: begin
                     if (cpu_req && cpu_we && WRITABLE) begin
-                        if (hit)
+                        // Writes to I/O regions also bypass cache fills
+                        // (we update existing cached lines on hit, but
+                        // never allocate for I/O addresses).
+                        if (hit && !is_io)
                             data[idx] <= merge_be(data[idx], cpu_wdata, cpu_be);
                         bus_req_r <= 1'b1;
                         bus_we  <= 1'b1;
@@ -139,12 +153,14 @@ module m68k_cache #(
                         bus_wdata <= cpu_wdata;
                         bus_be <= cpu_be;
                         saved_we <= 1'b1;
+                        saved_io <= 1'b0;
                         saved_idx <= idx;
                         saved_tag <= tag_in;
                         state <= S_BUS_WAIT;
-                    end else if (cpu_req && !cpu_we && (!hit || cpu_lock)) begin
-                        // Miss, or locked read (locked always bypasses cache
-                        // so the bus arbiter can serialise it).
+                    end else if (cpu_req && !cpu_we && (!hit || cpu_lock || is_io)) begin
+                        // Miss, locked read, or I/O read.  I/O reads always
+                        // go to the bus and never fill the cache so that the
+                        // CPU sees current device-register state.
                         bus_req_r <= 1'b1;
                         bus_we  <= 1'b0;
                         bus_lock <= cpu_lock;
@@ -153,13 +169,16 @@ module m68k_cache #(
                         saved_we <= 1'b0;
                         saved_idx <= idx;
                         saved_tag <= tag_in;
+                        // Suppress fill for I/O reads by remembering it was
+                        // an I/O access; bypass storing the result on resp.
+                        saved_io <= is_io;
                         state <= S_BUS_WAIT;
                     end
                 end
 
                 S_BUS_WAIT: begin
                     if (bus_resp_valid) begin
-                        if (!saved_we) begin
+                        if (!saved_we && !saved_io) begin
                             tags[saved_idx]   <= saved_tag;
                             valids[saved_idx] <= 1'b1;
                             data[saved_idx]   <= bus_resp_data;

@@ -42,7 +42,10 @@ reference, see [ISA.md](ISA.md). For a tutorial on writing programs that
 exploit the multi-core capability (with assembly and illustrative C
 examples), see [MULTICORE.md](MULTICORE.md). For the framebuffer,
 SDL-based macOS window, and tiny cooperative-multitasking kernel demo,
-see [OS.md](OS.md) — runnable via `make demo`.
+see [OS.md](OS.md) — runnable via `make demo`. For the Amiga-inspired
+clean-room blitter (copy / logic / Bresenham line modes, four channels,
+8-bit minterm Logic Function, barrel shifts), see
+[BLITTER.md](BLITTER.md) — line-drawing demo via `make demo-blt`.
 
 ## Headline numbers
 

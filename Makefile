@@ -31,7 +31,7 @@ N_CORES   ?= 2
 MEM_WORDS ?= 16384
 BUILD     ?= build
 
-.PHONY: all build test bench clean demo demo-fb demo-os
+.PHONY: all build test bench clean demo demo-fb demo-os demo-blt
 
 all: test
 
@@ -94,7 +94,7 @@ demo-fb:
 	    echo "SDL2 not detected (sdl2-config returned no libs). brew install sdl2"; \
 	    exit 1; \
 	fi
-	@$(MAKE) --no-print-directory build BUILD=build_demo N_CORES=1 USE_CACHE=1 MEM_WORDS=32768 WITH_SDL2=1
+	@$(MAKE) --no-print-directory build BUILD=build_demo N_CORES=1 USE_CACHE=1 MEM_WORDS=65536 WITH_SDL2=1
 	$(PYTHON) $(TB_DIR)/asm68k.py $(DEMO_DIR)/fb_demo.s build_demo/program.hex
 	@echo
 	@echo "Launching framebuffer demo. Press ESC or close the window to quit."
@@ -107,10 +107,21 @@ demo-os:
 	    echo "SDL2 not detected (sdl2-config returned no libs). brew install sdl2"; \
 	    exit 1; \
 	fi
-	@$(MAKE) --no-print-directory build BUILD=build_demo N_CORES=1 USE_CACHE=1 MEM_WORDS=32768 WITH_SDL2=1
+	@$(MAKE) --no-print-directory build BUILD=build_demo N_CORES=1 USE_CACHE=1 MEM_WORDS=65536 WITH_SDL2=1
 	$(PYTHON) $(TB_DIR)/asm68k.py $(DEMO_DIR)/os_demo.s build_demo/program.hex
 	@echo
 	@echo "Launching OS demo. Press ESC or close the window to quit."
+	@(cd build_demo && ./Vm68k_top 200000000 --graphics)
+
+demo-blt:
+	@if [ "$(HAVE_SDL2)" != "1" ]; then \
+	    echo "SDL2 not detected (sdl2-config returned no libs). brew install sdl2"; \
+	    exit 1; \
+	fi
+	@$(MAKE) --no-print-directory build BUILD=build_demo N_CORES=1 USE_CACHE=1 MEM_WORDS=65536 WITH_SDL2=1
+	$(PYTHON) $(TB_DIR)/asm68k.py $(DEMO_DIR)/blt_demo.s build_demo/program.hex
+	@echo
+	@echo "Launching blitter line demo. Press ESC or close the window to quit."
 	@(cd build_demo && ./Vm68k_top 200000000 --graphics)
 
 demo: demo-os

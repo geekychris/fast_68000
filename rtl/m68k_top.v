@@ -20,7 +20,9 @@ module m68k_top #(
     input  wire [31:0] fb_peek_addr,
     output wire [31:0] fb_peek_data
 );
-    localparam N_PORTS = 2 * N_CORES;
+    // Two ports per core (I-cache + D-cache) plus one for the blitter master.
+    localparam N_PORTS = 2 * N_CORES + 1;
+    localparam BLT_PORT = 2 * N_CORES;       // index of the blitter master port
     localparam PID_BITS = $clog2(N_PORTS > 1 ? N_PORTS : 2);
 
     // Per-core cache <-> bus.
@@ -38,6 +40,14 @@ module m68k_top #(
     wire [31:0]           snoop_addr;
     wire [PID_BITS-1:0]   snoop_src_id;
     wire [2:0]            irq_level;
+
+    // Blitter slave wires.
+    wire        blt_slv_req;
+    wire        blt_slv_we;
+    wire [5:0]  blt_slv_addr;
+    wire [3:0]  blt_slv_be;
+    wire [31:0] blt_slv_wdata;
+    wire [31:0] blt_slv_rdata;
 
     m68k_bus #(
         .N_PORTS    (N_PORTS),
@@ -60,8 +70,53 @@ module m68k_top #(
         .snoop_src_id(snoop_src_id),
         .irq_level   (irq_level),
         .fb_peek_addr(fb_peek_addr),
-        .fb_peek_data(fb_peek_data)
+        .fb_peek_data(fb_peek_data),
+        .blt_slv_req (blt_slv_req),
+        .blt_slv_we  (blt_slv_we),
+        .blt_slv_addr(blt_slv_addr),
+        .blt_slv_be  (blt_slv_be),
+        .blt_slv_wdata(blt_slv_wdata),
+        .blt_slv_rdata(blt_slv_rdata)
     );
+
+    // Blitter instance.  Its master port plugs into the bus at index
+    // BLT_PORT (the slot past all CPU I/D ports).
+    wire        blt_mst_req;
+    wire        blt_mst_we;
+    wire [31:0] blt_mst_addr;
+    wire [31:0] blt_mst_wdata;
+    wire [3:0]  blt_mst_be;
+    wire        blt_mst_ack;
+    wire [31:0] blt_mst_rdata;
+
+    m68k_blitter u_blt (
+        .clk          (clk),
+        .rst_n        (rst_n),
+        .slv_req      (blt_slv_req),
+        .slv_we       (blt_slv_we),
+        .slv_addr     (blt_slv_addr),
+        .slv_be       (blt_slv_be),
+        .slv_wdata    (blt_slv_wdata),
+        .slv_rdata    (blt_slv_rdata),
+        .slv_ack      (),               // unused: bus handles ack timing
+        .mst_req      (blt_mst_req),
+        .mst_we       (blt_mst_we),
+        .mst_addr     (blt_mst_addr),
+        .mst_wdata    (blt_mst_wdata),
+        .mst_be       (blt_mst_be),
+        .mst_ack      (blt_mst_ack),
+        .mst_rdata    (blt_mst_rdata)
+    );
+
+    // Wire the blitter master into the arbiter at BLT_PORT.
+    assign p_req  [BLT_PORT]                  = blt_mst_req;
+    assign p_we   [BLT_PORT]                  = blt_mst_we;
+    assign p_lock [BLT_PORT]                  = 1'b0;
+    assign p_addr [32*BLT_PORT +: 32]         = blt_mst_addr;
+    assign p_wdata[32*BLT_PORT +: 32]         = blt_mst_wdata;
+    assign p_be   [4*BLT_PORT  +: 4]          = blt_mst_be;
+    assign blt_mst_ack   = p_resp_valid[BLT_PORT];
+    assign blt_mst_rdata = p_resp_data;
 
     genvar gi;
     generate

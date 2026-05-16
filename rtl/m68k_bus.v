@@ -45,9 +45,22 @@ module m68k_bus #(
     // intruding on CPU bus traffic. In synthesis you would tie fb_peek_addr
     // off and ignore fb_peek_data, or remove this port entirely.
     input  wire [31:0]                    fb_peek_addr,
-    output wire [31:0]                    fb_peek_data
+    output wire [31:0]                    fb_peek_data,
+
+    // Blitter slave interface.  Writes/reads from BLT_BASE..BLT_BASE+0x3F
+    // are diverted to this port instead of main memory.  The blitter module
+    // sits on a separate master port (the highest port index) for its own
+    // memory R/W; the slave port is purely the CPU programming interface.
+    output reg                            blt_slv_req,
+    output reg                            blt_slv_we,
+    output reg  [5:0]                     blt_slv_addr,
+    output reg  [3:0]                     blt_slv_be,
+    output reg  [31:0]                    blt_slv_wdata,
+    input  wire [31:0]                    blt_slv_rdata
 );
-    localparam [31:0] IRQ_REG_ADDR = 32'hFFFF_FFFC;
+    localparam [31:0] IRQ_REG_ADDR  = 32'hFFFF_FFFC;
+    localparam [31:0] BLT_BASE      = 32'h00FE_0000;
+    localparam [31:0] BLT_END       = 32'h00FE_003F;
     localparam PID_BITS = $clog2(N_PORTS);
     localparam AIDX_BITS = $clog2(MEM_WORDS);
 
@@ -125,9 +138,25 @@ module m68k_bus #(
     reg [AIDX_BITS-1:0] granted_idx_q;
     reg [31:0]          granted_addr_q;
     reg                 granted_is_irq_q;
+    reg                 granted_is_blt_q;
+    reg                 granted_blt_we_q;
+    reg [31:0]          granted_blt_rdata_q;
 
     wire [AIDX_BITS-1:0] mem_idx = addr[winner][AIDX_BITS+1:2];
     wire is_irq_reg = (addr[winner] == IRQ_REG_ADDR);
+    wire is_blt_reg = (addr[winner] >= BLT_BASE) && (addr[winner] <= BLT_END);
+
+    // Combinational slave port to the blitter.  When the winning bus access
+    // hits the blitter register space, we route the request to blt_slv_*
+    // and prevent the memory write.  Reads return blt_slv_rdata via the
+    // delayed-response path.
+    always @* begin
+        blt_slv_req   = winner_valid && is_blt_reg;
+        blt_slv_we    = winner_valid && is_blt_reg && we[winner];
+        blt_slv_addr  = addr[winner][5:0];
+        blt_slv_be    = be[winner];
+        blt_slv_wdata = wdata[winner];
+    end
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -140,12 +169,19 @@ module m68k_bus #(
             granted_idx_q   <= {AIDX_BITS{1'b0}};
             granted_addr_q  <= 32'd0;
             granted_is_irq_q <= 1'b0;
+            granted_is_blt_q <= 1'b0;
+            granted_blt_we_q <= 1'b0;
+            granted_blt_rdata_q <= 32'd0;
             irq_level <= 3'd0;
         end else begin
             // Writes to the IRQ register update irq_level (sticky) and do NOT
-            // commit to main memory. Writes anywhere else update memory.
+            // commit to main memory. Writes to the blitter register region
+            // are handled by the combinational slave port (no memory write).
+            // Writes anywhere else update memory.
             if (winner_valid && we[winner] && is_irq_reg) begin
                 if (be[winner][0]) irq_level <= wdata[winner][2:0];
+            end else if (winner_valid && we[winner] && is_blt_reg) begin
+                // Handled via blt_slv_we combinationally; nothing to do here.
             end else if (winner_valid && we[winner]) begin
                 if (be[winner][3]) mem[mem_idx][31:24] <= wdata[winner][31:24];
                 if (be[winner][2]) mem[mem_idx][23:16] <= wdata[winner][23:16];
@@ -160,6 +196,12 @@ module m68k_bus #(
             granted_idx_q   <= mem_idx;
             granted_addr_q  <= addr[winner];
             granted_is_irq_q <= winner_valid && is_irq_reg;
+            granted_is_blt_q <= winner_valid && is_blt_reg;
+            granted_blt_we_q <= winner_valid && is_blt_reg && we[winner];
+            // Latch the blitter's combinational read result on the grant
+            // cycle so the delayed response sees stable data.
+            if (winner_valid && is_blt_reg && !we[winner])
+                granted_blt_rdata_q <= blt_slv_rdata;
 
             // Round-robin advance.
             if (winner_valid && !lock_pending) begin
@@ -183,16 +225,20 @@ module m68k_bus #(
     end
 
     // Output response (1 cycle after grant). Reads of the IRQ register return
-    // {29'b0, irq_level}; everything else reads from main memory.
+    // {29'b0, irq_level}; reads of the blitter region return blt_slv_rdata;
+    // everything else reads from main memory.
     always @* begin
         resp_valid = {N_PORTS{1'b0}};
-        resp_data  = granted_is_irq_q ? {29'd0, irq_level} : mem[granted_idx_q];
+        resp_data  = granted_is_irq_q ? {29'd0, irq_level}
+                   : granted_is_blt_q ? granted_blt_rdata_q
+                   : mem[granted_idx_q];
         if (granted_valid_q) resp_valid[granted_port_q] = 1'b1;
     end
 
     // Snoop broadcast: every successful write goes out 1 cycle later.
+    // (Suppress for blitter-register writes since those don't touch memory.)
     always @* begin
-        snoop_valid  = granted_valid_q && granted_we_q;
+        snoop_valid  = granted_valid_q && granted_we_q && !granted_blt_we_q;
         snoop_addr   = granted_addr_q;
         snoop_src_id = granted_port_q;
     end

@@ -30,7 +30,7 @@
 #endif
 
 #ifndef FB_BASE
-#define FB_BASE 0x00010000u   // byte address of the framebuffer
+#define FB_BASE 0x00010000u   // byte address of the chunky 8 bpp framebuffer
 #endif
 #ifndef FB_W
 #define FB_W 256
@@ -44,6 +44,15 @@
 #ifndef WALL_FRAME_MS
 #define WALL_FRAME_MS 33    // ~30 FPS render cap
 #endif
+
+// 1bpp bitplane overlay used by the blitter demos.  256x192 bits packed
+// 16 bits per word, big-endian (bit 15 of word 0 = pixel (0,0)).  Set bits
+// render as white over the chunky framebuffer below.  Total size = 6144
+// bytes = 1536 longs.
+#ifndef BP_BASE
+#define BP_BASE 0x00020000u
+#endif
+#define BP_BYTES (FB_W * FB_H / 8)
 
 static uint32_t read_fb_byte(Vm68k_top* top, uint32_t byte_addr) {
     // Word-aligned peek; pick the byte inside the 32-bit word.  Big-endian:
@@ -226,12 +235,28 @@ static int run_graphics(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
         if (now < next_render) continue;
         next_render = now + std::chrono::milliseconds(WALL_FRAME_MS);
 
-        // Sample the framebuffer.
+        // Sample the chunky 8 bpp framebuffer.
         for (int y = 0; y < FB_H; y++) {
             for (int x = 0; x < FB_W; x++) {
                 uint32_t byte_addr = FB_BASE + uint32_t(y) * FB_W + uint32_t(x);
                 uint8_t p = uint8_t(read_fb_byte(top, byte_addr));
                 pixel_buf[y * FB_W + x] = palette[p];
+            }
+        }
+        // Overlay the 1bpp bitplane (set bits paint as white).  16 pixels
+        // per 16-bit word, MSB = leftmost pixel of the word.
+        for (int y = 0; y < FB_H; y++) {
+            for (int wx = 0; wx < FB_W / 16; wx++) {
+                uint32_t byte_addr = BP_BASE + uint32_t(y) * (FB_W / 8) + uint32_t(wx) * 2;
+                uint8_t hi = uint8_t(read_fb_byte(top, byte_addr));
+                uint8_t lo = uint8_t(read_fb_byte(top, byte_addr + 1));
+                uint16_t w = (uint16_t(hi) << 8) | lo;
+                for (int b = 0; b < 16; b++) {
+                    if ((w >> (15 - b)) & 1u) {
+                        int x = wx * 16 + b;
+                        pixel_buf[y * FB_W + x] = 0xFFFFFFFFu;
+                    }
+                }
             }
         }
         // Restore fb_peek_addr to a neutral value (any read is allowed; we
@@ -249,12 +274,26 @@ static int run_graphics(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
     // max_cycles), leave the last frame on screen until the user closes the
     // window. This is the convenient behavior for a long-running demo.
     if (!quit) {
-        // Final render of the halt state.
+        // Final render of the halt state (chunky FB + bitplane overlay).
         for (int y = 0; y < FB_H; y++) {
             for (int x = 0; x < FB_W; x++) {
                 uint32_t byte_addr = FB_BASE + uint32_t(y) * FB_W + uint32_t(x);
                 uint8_t p = uint8_t(read_fb_byte(top, byte_addr));
                 pixel_buf[y * FB_W + x] = palette[p];
+            }
+        }
+        for (int y = 0; y < FB_H; y++) {
+            for (int wx = 0; wx < FB_W / 16; wx++) {
+                uint32_t byte_addr = BP_BASE + uint32_t(y) * (FB_W / 8) + uint32_t(wx) * 2;
+                uint8_t hi = uint8_t(read_fb_byte(top, byte_addr));
+                uint8_t lo = uint8_t(read_fb_byte(top, byte_addr + 1));
+                uint16_t w = (uint16_t(hi) << 8) | lo;
+                for (int b = 0; b < 16; b++) {
+                    if ((w >> (15 - b)) & 1u) {
+                        int x = wx * 16 + b;
+                        pixel_buf[y * FB_W + x] = 0xFFFFFFFFu;
+                    }
+                }
             }
         }
         SDL_UpdateTexture(tex, nullptr, pixel_buf, FB_W * 4);
