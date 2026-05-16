@@ -35,7 +35,7 @@ N_CORES   ?= 2
 MEM_WORDS ?= 65536
 BUILD     ?= build
 
-.PHONY: all build test bench clean demo demo-fb demo-os demo-blt demo-cop demo-den demo-pau demo-poly
+.PHONY: all build test bench clean demo demo-fb demo-os demo-blt demo-cop demo-den demo-pau demo-poly demo-spr
 
 all: test
 
@@ -148,6 +148,17 @@ demo-den:
 	$(PYTHON) $(TB_DIR)/asm68k.py $(DEMO_DIR)/den_demo.s build_demo/program.hex
 	@echo
 	@echo "Launching Denise demo (4-plane indexed image rendered to chunky FB)."
+	@(cd build_demo && ./Vm68k_top 2000000000 --graphics)
+
+demo-spr:
+	@if [ "$(HAVE_SDL2)" != "1" ]; then \
+	    echo "SDL2 not detected (sdl2-config returned no libs). brew install sdl2"; \
+	    exit 1; \
+	fi
+	@$(MAKE) --no-print-directory build BUILD=build_demo N_CORES=1 USE_CACHE=1 MEM_WORDS=131072 WITH_SDL2=1
+	$(PYTHON) $(TB_DIR)/asm68k.py $(DEMO_DIR)/spr_demo.s build_demo/program.hex
+	@echo
+	@echo "Launching sprite demo (8 hardware sprites bouncing on a bitplane background)."
 	@(cd build_demo && ./Vm68k_top 2000000000 --graphics)
 
 demo-cop:

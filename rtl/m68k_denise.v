@@ -13,8 +13,21 @@
 //   * DPF       - dual playfield: odd planes form PF1, even form PF2.
 //                 Priority controlled by BPLCON2[6] (PF2 in front when set).
 //
-// Sprites, hardware scroll, hires, HAM8, and genlock are not implemented
-// in this phase (see DENISE.md for the deferred list).
+// Hardware scroll (BPLCON1) and 1bpp sprites are implemented.  Hires,
+// HAM8, and genlock are not implemented (see DENISE.md).
+//
+// Sprites: 8 hardware sprites, 16 pixels wide, monochrome (1 bit per
+// pixel), with one palette index per sprite.  Per sprite:
+//   SPRxPT   ($30+8i)  32-bit byte pointer to sprite data (one 16-bit
+//                       word per scanline, packed two-per-long).
+//   SPRxCTL  ($34+8i)  {YPOS[31:24], XPOS[23:16], HEIGHT[15:8],
+//                       reserved[7:5], COLOR_IDX[4:0]}
+//                       YPOS/XPOS: 8-bit screen coordinates (0..255)
+//                       HEIGHT:    8-bit row count
+//                       COLOR_IDX: palette[0..31] index for opaque bits
+// Global enable: SPRENA ($70), bit i = enable for sprite i.
+// Priority: lower sprite number wins.  Sprites composite OVER the
+// bitplane image (sprite bit=1 means opaque, bit=0 means transparent).
 //
 // Pixels: leftmost pixel of a word = bit 15 (Amiga convention). Plane i's
 // bit contributes the i-th bit of the pixel value (plane 0 = LSB).
@@ -57,6 +70,9 @@ module m68k_denise #(
     reg [31:0] bpl_pt   [0:5];
     reg [31:0] bpl_mod  [0:1];   // BPL1MOD (odd-plane stride bonus), BPL2MOD (even)
     reg [31:0] colors   [0:31];
+    reg [31:0] spr_pt   [0:7];
+    reg [31:0] spr_ctl  [0:7];
+    reg [7:0]  sprena;
     reg        den_busy;
 
     // BPLCON0 decode.
@@ -95,8 +111,26 @@ module m68k_denise #(
             8'h24: slv_rdata = bpl_pt[5];
             8'h28: slv_rdata = bpl_mod[0];
             8'h2C: slv_rdata = bpl_mod[1];
+            // Sprite register file at $30..$6F.
+            8'h30: slv_rdata = spr_pt[0];
+            8'h34: slv_rdata = spr_ctl[0];
+            8'h38: slv_rdata = spr_pt[1];
+            8'h3C: slv_rdata = spr_ctl[1];
             8'h40: slv_rdata = 32'd0;                 // DENRUN write-only
             8'h44: slv_rdata = {31'd0, den_busy};     // DENSTAT
+            8'h48: slv_rdata = spr_pt[2];
+            8'h4C: slv_rdata = spr_ctl[2];
+            8'h50: slv_rdata = spr_pt[3];
+            8'h54: slv_rdata = spr_ctl[3];
+            8'h58: slv_rdata = spr_pt[4];
+            8'h5C: slv_rdata = spr_ctl[4];
+            8'h60: slv_rdata = spr_pt[5];
+            8'h64: slv_rdata = spr_ctl[5];
+            8'h68: slv_rdata = spr_pt[6];
+            8'h6C: slv_rdata = spr_ctl[6];
+            8'h70: slv_rdata = {24'd0, sprena};
+            8'h78: slv_rdata = spr_pt[7];
+            8'h7C: slv_rdata = spr_ctl[7];
             default: begin
                 if (slv_addr[7] == 1'b1) begin
                     // $80..$FF = COLOR00..COLOR1F (32 entries x 4 bytes).
@@ -110,15 +144,17 @@ module m68k_denise #(
     // Per row we have FB_W/16 = 16 word-groups.  For each word-group we
     // read up to 6 bitplane words from memory, then sequentially process
     // 16 pixels, then write 4 longs (16 chunky bytes) to the framebuffer.
-    localparam S_IDLE     = 5'd0;
-    localparam S_ROW_INIT = 5'd1;
-    localparam S_WG_INIT  = 5'd2;
-    localparam S_FETCH_P  = 5'd3;
-    localparam S_PROC     = 5'd4;
-    localparam S_WRITE    = 5'd5;
-    localparam S_NEXT_WG  = 5'd6;
-    localparam S_ROW_END  = 5'd7;
-    localparam S_DONE     = 5'd8;
+    localparam S_IDLE      = 5'd0;
+    localparam S_ROW_INIT  = 5'd1;
+    localparam S_WG_INIT   = 5'd2;
+    localparam S_FETCH_P   = 5'd3;
+    localparam S_PROC      = 5'd4;
+    localparam S_WRITE     = 5'd5;
+    localparam S_NEXT_WG   = 5'd6;
+    localparam S_ROW_END   = 5'd7;
+    localparam S_DONE      = 5'd8;
+    localparam S_SPR_PREP  = 5'd9;
+    localparam S_SPR_FETCH = 5'd10;
 
     reg [4:0]  state;
 
@@ -132,6 +168,12 @@ module m68k_denise #(
     reg [2:0]  pi_idx;              // current plane being fetched (0..5)
     reg [15:0] plane_word [0:5];    // latched 16-bit word per plane
     reg [15:0] plane_prev [0:5];    // previous word per plane (for scroll)
+
+    // Per-sprite running state.
+    reg [31:0] spr_row_pt [0:7];    // running fetch pointer per sprite
+    reg [15:0] spr_word   [0:7];    // current row's sprite pixel word
+    reg [7:0]  spr_active;          // bitmask: sprite i visible this row
+    reg [3:0]  spr_idx;             // sprite walker during S_SPR_FETCH (0..8)
 
     // Per-pixel state.
     reg [3:0]  px_idx;              // 0..15 within the word-group
@@ -193,6 +235,35 @@ module m68k_denise #(
         end
     endfunction
 
+    // Sprite compositing.  Returns 6'b{hit, color_idx[4:0]}; hit=1 means a
+    // sprite is opaque at the given screen X.  Sprite 0 has highest
+    // priority.  Inactive sprites contribute nothing.
+    function [5:0] sprite_pixel;
+        input [7:0] screen_x;
+        integer si;
+        reg done;
+        reg [7:0] sx;
+        reg [3:0] bp;
+        reg [4:0] cidx;
+        begin
+            sprite_pixel = 6'd0;
+            done = 1'b0;
+            for (si = 0; si < 8; si = si + 1) begin
+                if (!done && spr_active[si]) begin
+                    sx = spr_ctl[si][23:16];
+                    if (screen_x >= sx && screen_x < (sx + 8'd16)) begin
+                        bp   = 4'd15 - (screen_x - sx);
+                        cidx = spr_ctl[si][4:0];
+                        if (spr_word[si][bp]) begin
+                            sprite_pixel = {1'b1, cidx};
+                            done = 1'b1;
+                        end
+                    end
+                end
+            end
+        end
+    endfunction
+
     // Compose the 6-bit pixel value from the latched plane words, with
     // per-playfield horizontal scroll applied.  PF1 (odd planes 0,2,4)
     // uses PF1H; PF2 (even planes 1,3,5) uses PF2H.
@@ -231,6 +302,15 @@ module m68k_denise #(
             bpl_mod[0] <= 32'd0;
             bpl_mod[1] <= 32'd0;
             for (i = 0; i < 32; i = i + 1) colors[i] <= 32'd0;
+            for (i = 0; i < 8;  i = i + 1) begin
+                spr_pt[i]    <= 32'd0;
+                spr_ctl[i]   <= 32'd0;
+                spr_row_pt[i] <= 32'd0;
+                spr_word[i]  <= 16'd0;
+            end
+            sprena      <= 8'd0;
+            spr_active  <= 8'd0;
+            spr_idx     <= 4'd0;
             den_busy <= 1'b0;
 
             state <= S_IDLE;
@@ -272,6 +352,10 @@ module m68k_denise #(
                     8'h24: bpl_pt[5] <= slv_wdata;
                     8'h28: bpl_mod[0] <= slv_wdata;
                     8'h2C: bpl_mod[1] <= slv_wdata;
+                    8'h30: spr_pt[0]  <= slv_wdata;
+                    8'h34: spr_ctl[0] <= slv_wdata;
+                    8'h38: spr_pt[1]  <= slv_wdata;
+                    8'h3C: spr_ctl[1] <= slv_wdata;
                     8'h40: begin
                         // DENRUN: kick rasterization.
                         if (!den_busy) begin
@@ -284,9 +368,31 @@ module m68k_denise #(
                             row_bpl_pt[3] <= bpl_pt[3];
                             row_bpl_pt[4] <= bpl_pt[4];
                             row_bpl_pt[5] <= bpl_pt[5];
+                            // Initialise sprite running pointers.
+                            spr_row_pt[0] <= spr_pt[0];
+                            spr_row_pt[1] <= spr_pt[1];
+                            spr_row_pt[2] <= spr_pt[2];
+                            spr_row_pt[3] <= spr_pt[3];
+                            spr_row_pt[4] <= spr_pt[4];
+                            spr_row_pt[5] <= spr_pt[5];
+                            spr_row_pt[6] <= spr_pt[6];
+                            spr_row_pt[7] <= spr_pt[7];
                             fb_write_ptr  <= FB_BASE;
                         end
                     end
+                    8'h48: spr_pt[2]  <= slv_wdata;
+                    8'h4C: spr_ctl[2] <= slv_wdata;
+                    8'h50: spr_pt[3]  <= slv_wdata;
+                    8'h54: spr_ctl[3] <= slv_wdata;
+                    8'h58: spr_pt[4]  <= slv_wdata;
+                    8'h5C: spr_ctl[4] <= slv_wdata;
+                    8'h60: spr_pt[5]  <= slv_wdata;
+                    8'h64: spr_ctl[5] <= slv_wdata;
+                    8'h68: spr_pt[6]  <= slv_wdata;
+                    8'h6C: spr_ctl[6] <= slv_wdata;
+                    8'h70: sprena     <= slv_wdata[7:0];
+                    8'h78: spr_pt[7]  <= slv_wdata;
+                    8'h7C: spr_ctl[7] <= slv_wdata;
                     default: begin
                         if (slv_addr[7] == 1'b1)
                             colors[slv_addr[6:2]] <= slv_wdata;
@@ -309,7 +415,57 @@ module m68k_denise #(
                     plane_prev[3] <= 16'd0;
                     plane_prev[4] <= 16'd0;
                     plane_prev[5] <= 16'd0;
-                    state <= S_WG_INIT;
+                    state <= S_SPR_PREP;
+                end
+
+                S_SPR_PREP: begin : spr_prep_block
+                    // Decide which sprites overlap this row.  An enabled
+                    // sprite is active when YPOS <= row < YPOS+HEIGHT and
+                    // HEIGHT > 0.  All comparisons are 16-bit unsigned.
+                    integer s;
+                    reg [15:0] yp, hh, yend;
+                    reg [7:0]  mask;
+                    mask = 8'd0;
+                    for (s = 0; s < 8; s = s + 1) begin
+                        yp   = {8'd0, spr_ctl[s][31:24]};
+                        hh   = {8'd0, spr_ctl[s][15:8]};
+                        yend = yp + hh;
+                        if (sprena[s] && (hh != 16'd0) &&
+                            (row_idx >= yp) && (row_idx < yend)) begin
+                            mask[s] = 1'b1;
+                        end
+                        // Clear stale sprite data so inactive slots don't
+                        // bleed last row's pixels into the compositor.
+                        if (!mask[s]) spr_word[s] <= 16'd0;
+                    end
+                    spr_active <= mask;
+                    spr_idx    <= 4'd0;
+                    state      <= S_SPR_FETCH;
+                end
+
+                S_SPR_FETCH: begin
+                    // Walk through sprites 0..7. For each active one, fetch
+                    // its current row word.  After all eight, jump to bitplane
+                    // processing.
+                    if (spr_idx == 4'd8) begin
+                        mst_req_r <= 1'b0;
+                        state     <= S_WG_INIT;
+                    end else if (!spr_active[spr_idx[2:0]]) begin
+                        spr_idx <= spr_idx + 4'd1;
+                    end else begin
+                        mst_req_r <= 1'b1;
+                        mst_we    <= 1'b0;
+                        mst_addr  <= spr_row_pt[spr_idx[2:0]];
+                        mst_be    <= 4'b1111;
+                        if (mst_ack) begin
+                            mst_req_r <= 1'b0;
+                            spr_word[spr_idx[2:0]] <= spr_row_pt[spr_idx[2:0]][1]
+                                ? mst_rdata[15:0]
+                                : mst_rdata[31:16];
+                            spr_row_pt[spr_idx[2:0]] <= spr_row_pt[spr_idx[2:0]] + 32'd2;
+                            spr_idx <= spr_idx + 4'd1;
+                        end
+                    end
                 end
 
                 S_WG_INIT: begin
@@ -354,8 +510,12 @@ module m68k_denise #(
                     reg [4:0]  palette_idx;
                     reg [11:0] palette_color;
                     reg [7:0]  rgb332;
+                    reg [5:0]  spr_hit;     // {hit, color_idx[4:0]}
+                    reg [7:0]  screen_x;
 
                     pv = pixel_value(px_idx);
+                    screen_x = {wg_idx[3:0], px_idx};
+                    spr_hit  = sprite_pixel(screen_x);
 
                     if (ham_en && (nplanes == 3'd6)) begin
                         ham_ctrl = pv[5:4];
@@ -396,6 +556,11 @@ module m68k_denise #(
                         if (nplanes >= 3'd5) palette_idx[4] = pv[4];
                         cur_color = colors[palette_idx][11:0];
                     end
+
+                    // Sprite overlay: opaque sprite bits replace the bitplane
+                    // color before the RGB332 conversion.  Sprites always win
+                    // over bitplane (no playfield-vs-sprite priority logic).
+                    if (spr_hit[5]) cur_color = colors[spr_hit[4:0]][11:0];
 
                     rgb332 = color12_to_rgb332(cur_color);
                     // Pack into pixel_buf at slot px_idx (leftmost = slot 0).

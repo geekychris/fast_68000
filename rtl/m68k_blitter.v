@@ -11,8 +11,10 @@
 //   - Registers are 32-bit (Amiga has 16-bit register pairs PTH/PTL etc.).
 //   - Word stride is still 2 bytes (we still operate on 16-bit words).
 //   - Pointers are full 32-bit byte addresses (Amiga is 21-bit).
-//   - Fill mode (inclusive/exclusive) is NOT implemented in v1.
-//   - Descending mode (DESC) is NOT implemented in v1.
+//   - Fill mode (inclusive/exclusive) is implemented.
+//   - Descending mode (DESC) is implemented: pointers decrement, modulos
+//     subtract, and the A/B barrel shifts read {cur, prev} >> ASH so the
+//     bit alignment matches a right-to-left row traversal.
 //
 // Slave interface: CPU writes/reads of the register region get routed here
 // by the bus arbiter (slv_we / slv_addr / slv_wdata / slv_rdata).  See
@@ -201,17 +203,28 @@ module m68k_blitter (
         end
     endfunction
 
-    // Apply ASH-bit right shift across (a_prev_word, a_cur).
+    // Apply ASH-bit barrel shift.
+    //   Ascending : joined = {prev, cur}; out = joined[15+sh -: 16]
+    //               = (prev << 16 | cur) >> sh, low 16.
+    //               -> right shift; vacated MSBs filled from prev's LSBs.
+    //   Descending: joined = {cur, prev}; out = joined[31-sh -: 16]
+    //               = (cur << sh) | (prev >> (16-sh)).
+    //               -> left shift;  vacated LSBs filled from prev's MSBs.
+    //   In both cases prev_w is the word read in the PREVIOUS iteration.
     function [15:0] shift_a;
         input [15:0] prev_w;
         input [15:0] cur_w;
         input [3:0]  sh;
+        input        do_desc;
         reg   [31:0] joined;
         begin
-            joined = {prev_w, cur_w};
-            shift_a = joined[15+sh -: 16];
-            // joined[15+sh] is the MSB of the 16-bit slice; selecting
-            // [15+sh -: 16] gives bits [15+sh .. sh].
+            if (do_desc) begin
+                joined  = {cur_w, prev_w};
+                shift_a = joined[31-sh -: 16];
+            end else begin
+                joined  = {prev_w, cur_w};
+                shift_a = joined[15+sh -: 16];
+            end
         end
     endfunction
 
@@ -219,10 +232,16 @@ module m68k_blitter (
         input [15:0] prev_w;
         input [15:0] cur_w;
         input [3:0]  sh;
+        input        do_desc;
         reg   [31:0] joined;
         begin
-            joined = {prev_w, cur_w};
-            shift_b = joined[15+sh -: 16];
+            if (do_desc) begin
+                joined  = {cur_w, prev_w};
+                shift_b = joined[31-sh -: 16];
+            end else begin
+                joined  = {prev_w, cur_w};
+                shift_b = joined[15+sh -: 16];
+            end
         end
     endfunction
 
@@ -392,7 +411,7 @@ module m68k_blitter (
                                 pick_half(mst_rdata, bltapt[1]),
                                 cur_word == 16'd0,
                                 cur_word == (blt_width - 16'd1));
-                            bltapt <= bltapt + 32'd2;
+                            bltapt <= bltapt + (desc ? -32'sd2 : 32'sd2);
                             state  <= use_b ? S_RDB : (use_c ? S_RDC : S_WRD);
                         end
                     end else begin
@@ -409,7 +428,7 @@ module m68k_blitter (
                         if (mst_ack) begin
                             mst_req_r <= 1'b0;
                             b_cur_word_q <= pick_half(mst_rdata, bltbpt[1]);
-                            bltbpt <= bltbpt + 32'd2;
+                            bltbpt <= bltbpt + (desc ? -32'sd2 : 32'sd2);
                             state  <= use_c ? S_RDC : S_WRD;
                         end
                     end else begin
@@ -426,7 +445,7 @@ module m68k_blitter (
                         if (mst_ack) begin
                             mst_req_r <= 1'b0;
                             c_cur_word_q <= pick_half(mst_rdata, bltcpt[1]);
-                            bltcpt <= bltcpt + 32'd2;
+                            bltcpt <= bltcpt + (desc ? -32'sd2 : 32'sd2);
                             state  <= S_WRD;
                         end
                     end else begin
@@ -440,8 +459,8 @@ module m68k_blitter (
                     reg [15:0] final_w;
 
                     combined_w = combine(lf,
-                                         shift_a(a_prev_word, a_cur_word_q, ash),
-                                         shift_b(b_prev_word, b_cur_word_q, bsh),
+                                         shift_a(a_prev_word, a_cur_word_q, ash, desc),
+                                         shift_b(b_prev_word, b_cur_word_q, bsh, desc),
                                          c_cur_word_q);
                     filled  = apply_fill(combined_w, fill_carry, ife, efe, desc);
                     final_w = filled[15:0];
@@ -459,7 +478,7 @@ module m68k_blitter (
                             b_prev_word <= b_cur_word_q;
                             // Update fill carry from this word's processing.
                             fill_carry  <= filled[16];
-                            bltdpt <= bltdpt + 32'd2;
+                            bltdpt <= bltdpt + (desc ? -32'sd2 : 32'sd2);
                             if (cur_word == (blt_width - 16'd1)) begin
                                 cur_word <= 16'd0;
                                 a_prev_word <= 16'd0;
@@ -490,11 +509,13 @@ module m68k_blitter (
                     end
                 end
                 S_ROW: begin
-                    // Apply per-channel modulo at end of row.
-                    if (use_a) bltapt <= bltapt + bltamod;
-                    if (use_b) bltbpt <= bltbpt + bltbmod;
-                    if (use_c) bltcpt <= bltcpt + bltcmod;
-                    if (use_d) bltdpt <= bltdpt + bltdmod;
+                    // Apply per-channel modulo at end of row.  Descending
+                    // mode subtracts the modulo (so the pointer continues
+                    // walking down-and-left through memory).
+                    if (use_a) bltapt <= bltapt + (desc ? -bltamod : bltamod);
+                    if (use_b) bltbpt <= bltbpt + (desc ? -bltbmod : bltbmod);
+                    if (use_c) bltcpt <= bltcpt + (desc ? -bltcmod : bltcmod);
+                    if (use_d) bltdpt <= bltdpt + (desc ? -bltdmod : bltdmod);
                     // Reset the fill carry for the next row.
                     fill_carry <= fci;
                     if (cur_row == (blt_height - 16'd1)) begin
