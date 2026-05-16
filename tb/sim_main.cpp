@@ -54,6 +54,19 @@
 #endif
 #define BP_BYTES (FB_W * FB_H / 8)
 
+// Audio:  SDL_audio output rate.  Paula's audio_l/r are sampled at this
+// rate by the harness's main loop.  Cycles-per-audio-sample = how many
+// simulator cycles to run between audio captures.
+#ifndef AUDIO_RATE
+#define AUDIO_RATE 44100
+#endif
+#ifndef AUDIO_BUF_SAMPLES
+#define AUDIO_BUF_SAMPLES 2048
+#endif
+#ifndef CYCLES_PER_AUDIO
+#define CYCLES_PER_AUDIO 100   // approx. simulator cycles between samples
+#endif
+
 static uint32_t read_fb_byte(Vm68k_top* top, uint32_t byte_addr) {
     // Word-aligned peek; pick the byte inside the 32-bit word.  Big-endian:
     // byte address A & 3 == 0 -> [31:24], 1 -> [23:16], 2 -> [15:8], 3 -> [7:0].
@@ -90,6 +103,9 @@ int main(int argc, char** argv) {
         top->clk = 1; top->eval();
     }
     top->rst_n = 1;
+
+    (void)top->audio_l;  // accessed in graphics path
+    (void)top->audio_r;
 
 #ifndef NUM_CORES
 #define NUM_CORES 2
@@ -166,11 +182,61 @@ static void build_palette(uint32_t* palette) {
     }
 }
 
+// --- SDL_audio: lock-free ring buffer fed by the simulator, drained
+// by the audio callback. ---
+struct AudioRing {
+    int16_t* buf;
+    int      capacity;          // power of two
+    int      mask;
+    volatile int wr;            // producer index (sim thread)
+    volatile int rd;            // consumer index (audio callback)
+};
+
+static AudioRing g_audio_ring;
+
+static void audio_callback(void* udata, Uint8* stream, int len) {
+    (void)udata;
+    int16_t* out = reinterpret_cast<int16_t*>(stream);
+    int n = len / 2; // 16-bit samples
+    for (int i = 0; i < n; i++) {
+        if (g_audio_ring.rd == g_audio_ring.wr) {
+            out[i] = 0; // underrun -> silence
+        } else {
+            out[i] = g_audio_ring.buf[g_audio_ring.rd];
+            g_audio_ring.rd = (g_audio_ring.rd + 1) & g_audio_ring.mask;
+        }
+    }
+}
+
 static int run_graphics(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
-    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 2;
     }
+
+    // --- Open audio device ---
+    SDL_AudioSpec desired = {};
+    desired.freq = AUDIO_RATE;
+    desired.format = AUDIO_S16SYS;
+    desired.channels = 2;
+    desired.samples = AUDIO_BUF_SAMPLES;
+    desired.callback = audio_callback;
+    SDL_AudioSpec obtained;
+    SDL_AudioDeviceID audio_dev =
+        SDL_OpenAudioDevice(nullptr, 0, &desired, &obtained, 0);
+    if (audio_dev == 0) {
+        fprintf(stderr, "SDL_OpenAudioDevice failed: %s (audio disabled)\n", SDL_GetError());
+    }
+
+    int ring_cap = 8192;
+    g_audio_ring.buf = new int16_t[ring_cap];
+    g_audio_ring.capacity = ring_cap;
+    g_audio_ring.mask = ring_cap - 1;
+    g_audio_ring.wr = 0;
+    g_audio_ring.rd = 0;
+
+    if (audio_dev != 0) SDL_PauseAudioDevice(audio_dev, 0);
+
 
     SDL_Window* win = SDL_CreateWindow(
         "fast_68000 framebuffer",
@@ -217,10 +283,23 @@ static int run_graphics(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
         // visible progress between renders. Tune CYCLES_PER_BATCH to balance
         // smoothness vs. simulator throughput.
         const int CYCLES_PER_BATCH = 2000;
+        int audio_cycle_acc = 0;
         for (int b = 0; b < CYCLES_PER_BATCH && cycle < max_cycles && !all_halted(); b++) {
             top->clk = 0; top->eval();
             top->clk = 1; top->eval();
             cycle++;
+            audio_cycle_acc++;
+            if (audio_cycle_acc >= CYCLES_PER_AUDIO) {
+                audio_cycle_acc = 0;
+                // Sample Paula's mixed output as interleaved L,R 16-bit.
+                int wr   = g_audio_ring.wr;
+                int next = (wr + 2) & g_audio_ring.mask;
+                if (next != g_audio_ring.rd) {
+                    g_audio_ring.buf[wr]               = (int16_t)top->audio_l;
+                    g_audio_ring.buf[(wr + 1) & g_audio_ring.mask] = (int16_t)top->audio_r;
+                    g_audio_ring.wr = next;
+                }
+            }
         }
 
         // Pump SDL events.
@@ -312,6 +391,12 @@ static int run_graphics(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
     }
 
     delete[] pixel_buf;
+    if (audio_dev != 0) {
+        SDL_PauseAudioDevice(audio_dev, 1);
+        SDL_CloseAudioDevice(audio_dev);
+    }
+    delete[] g_audio_ring.buf;
+    g_audio_ring.buf = nullptr;
     SDL_DestroyTexture(tex);
     SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);

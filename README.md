@@ -50,7 +50,8 @@ For the Amiga-inspired Copper coprocessor (memory-resident display lists
 driving the blitter autonomously), see [COPPER.md](COPPER.md) — demo via
 `make demo-cop`. For Denise — the bitplane rasterizer with HAM6 / EHB /
 dual-playfield / indexed display modes — see [DENISE.md](DENISE.md);
-demo via `make demo-den`.
+demo via `make demo-den`. For Paula — 4-voice 8-bit PCM audio routed
+through SDL_audio — see [PAULA.md](PAULA.md); demo via `make demo-pau`.
 
 ## Headline numbers
 

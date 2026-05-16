@@ -72,7 +72,15 @@ module m68k_bus #(
     output reg  [7:0]                     den_slv_addr,
     output reg  [3:0]                     den_slv_be,
     output reg  [31:0]                    den_slv_wdata,
-    input  wire [31:0]                    den_slv_rdata
+    input  wire [31:0]                    den_slv_rdata,
+
+    // Paula slave interface ($00FE_0200..$00FE_02FF).
+    output reg                            pau_slv_req,
+    output reg                            pau_slv_we,
+    output reg  [7:0]                     pau_slv_addr,
+    output reg  [3:0]                     pau_slv_be,
+    output reg  [31:0]                    pau_slv_wdata,
+    input  wire [31:0]                    pau_slv_rdata
 );
     localparam [31:0] IRQ_REG_ADDR  = 32'hFFFF_FFFC;
     localparam [31:0] BLT_BASE      = 32'h00FE_0000;
@@ -81,6 +89,8 @@ module m68k_bus #(
     localparam [31:0] COP_END       = 32'h00FE_007F;
     localparam [31:0] DEN_BASE      = 32'h00FE_0100;
     localparam [31:0] DEN_END       = 32'h00FE_01FF;
+    localparam [31:0] PAU_BASE      = 32'h00FE_0200;
+    localparam [31:0] PAU_END       = 32'h00FE_02FF;
     localparam PID_BITS = $clog2(N_PORTS);
     localparam AIDX_BITS = $clog2(MEM_WORDS);
 
@@ -167,12 +177,16 @@ module m68k_bus #(
     reg                 granted_is_den_q;
     reg                 granted_den_we_q;
     reg [31:0]          granted_den_rdata_q;
+    reg                 granted_is_pau_q;
+    reg                 granted_pau_we_q;
+    reg [31:0]          granted_pau_rdata_q;
 
     wire [AIDX_BITS-1:0] mem_idx = addr[winner][AIDX_BITS+1:2];
     wire is_irq_reg = (addr[winner] == IRQ_REG_ADDR);
     wire is_blt_reg = (addr[winner] >= BLT_BASE) && (addr[winner] <= BLT_END);
     wire is_cop_reg = (addr[winner] >= COP_BASE) && (addr[winner] <= COP_END);
     wire is_den_reg = (addr[winner] >= DEN_BASE) && (addr[winner] <= DEN_END);
+    wire is_pau_reg = (addr[winner] >= PAU_BASE) && (addr[winner] <= PAU_END);
 
     // Combinational slave ports.  When the winning access hits the blitter
     // or Copper register space, we route the request to the appropriate
@@ -199,6 +213,13 @@ module m68k_bus #(
         den_slv_be    = be[winner];
         den_slv_wdata = wdata[winner];
     end
+    always @* begin
+        pau_slv_req   = winner_valid && is_pau_reg;
+        pau_slv_we    = winner_valid && is_pau_reg && we[winner];
+        pau_slv_addr  = addr[winner][7:0];
+        pau_slv_be    = be[winner];
+        pau_slv_wdata = wdata[winner];
+    end
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -220,6 +241,9 @@ module m68k_bus #(
             granted_is_den_q <= 1'b0;
             granted_den_we_q <= 1'b0;
             granted_den_rdata_q <= 32'd0;
+            granted_is_pau_q <= 1'b0;
+            granted_pau_we_q <= 1'b0;
+            granted_pau_rdata_q <= 32'd0;
             irq_level <= 3'd0;
         end else begin
             // Writes to the IRQ register update irq_level (sticky) and do NOT
@@ -234,6 +258,8 @@ module m68k_bus #(
                 // Handled via cop_slv_we combinationally; nothing to do here.
             end else if (winner_valid && we[winner] && is_den_reg) begin
                 // Handled via den_slv_we combinationally; nothing to do here.
+            end else if (winner_valid && we[winner] && is_pau_reg) begin
+                // Handled via pau_slv_we combinationally; nothing to do here.
             end else if (winner_valid && we[winner]) begin
                 if (be[winner][3]) mem[mem_idx][31:24] <= wdata[winner][31:24];
                 if (be[winner][2]) mem[mem_idx][23:16] <= wdata[winner][23:16];
@@ -254,6 +280,8 @@ module m68k_bus #(
             granted_cop_we_q <= winner_valid && is_cop_reg && we[winner];
             granted_is_den_q <= winner_valid && is_den_reg;
             granted_den_we_q <= winner_valid && is_den_reg && we[winner];
+            granted_is_pau_q <= winner_valid && is_pau_reg;
+            granted_pau_we_q <= winner_valid && is_pau_reg && we[winner];
             // Latch combinational slave read results on the grant cycle
             // so the delayed response sees stable data.
             if (winner_valid && is_blt_reg && !we[winner])
@@ -262,6 +290,8 @@ module m68k_bus #(
                 granted_cop_rdata_q <= cop_slv_rdata;
             if (winner_valid && is_den_reg && !we[winner])
                 granted_den_rdata_q <= den_slv_rdata;
+            if (winner_valid && is_pau_reg && !we[winner])
+                granted_pau_rdata_q <= pau_slv_rdata;
 
             // Round-robin advance.
             if (winner_valid && !lock_pending) begin
@@ -293,6 +323,7 @@ module m68k_bus #(
                    : granted_is_blt_q ? granted_blt_rdata_q
                    : granted_is_cop_q ? granted_cop_rdata_q
                    : granted_is_den_q ? granted_den_rdata_q
+                   : granted_is_pau_q ? granted_pau_rdata_q
                    : mem[granted_idx_q];
         if (granted_valid_q) resp_valid[granted_port_q] = 1'b1;
     end
@@ -301,7 +332,8 @@ module m68k_bus #(
     // (Suppress for blitter-register writes since those don't touch memory.)
     always @* begin
         snoop_valid  = granted_valid_q && granted_we_q
-                       && !granted_blt_we_q && !granted_cop_we_q && !granted_den_we_q;
+                       && !granted_blt_we_q && !granted_cop_we_q
+                       && !granted_den_we_q && !granted_pau_we_q;
         snoop_addr   = granted_addr_q;
         snoop_src_id = granted_port_q;
     end

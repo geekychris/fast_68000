@@ -18,14 +18,19 @@ module m68k_top #(
     // Framebuffer peek for the simulator harness. Drive fb_peek_addr with a
     // word-aligned byte address; fb_peek_data returns the 32-bit word.
     input  wire [31:0] fb_peek_addr,
-    output wire [31:0] fb_peek_data
+    output wire [31:0] fb_peek_data,
+
+    // Live Paula audio output for the simulator harness.
+    output wire signed [15:0] audio_l,
+    output wire signed [15:0] audio_r
 );
     // Two ports per core (I-cache + D-cache) plus one each for the blitter,
-    // Copper, and Denise masters.
-    localparam N_PORTS  = 2 * N_CORES + 3;
+    // Copper, Denise, and Paula masters.
+    localparam N_PORTS  = 2 * N_CORES + 4;
     localparam BLT_PORT = 2 * N_CORES;       // blitter master
     localparam COP_PORT = 2 * N_CORES + 1;   // Copper master
     localparam DEN_PORT = 2 * N_CORES + 2;   // Denise master
+    localparam PAU_PORT = 2 * N_CORES + 3;   // Paula master
     localparam PID_BITS = $clog2(N_PORTS > 1 ? N_PORTS : 2);
 
     // Per-core cache <-> bus.
@@ -67,6 +72,14 @@ module m68k_top #(
     wire [3:0]  den_slv_be;
     wire [31:0] den_slv_wdata;
     wire [31:0] den_slv_rdata;
+
+    // Paula slave wires.
+    wire        pau_slv_req;
+    wire        pau_slv_we;
+    wire [7:0]  pau_slv_addr;
+    wire [3:0]  pau_slv_be;
+    wire [31:0] pau_slv_wdata;
+    wire [31:0] pau_slv_rdata;
 
     // Blitter busy signal exposed to the Copper (for WAIT).
     wire        blt_busy;
@@ -110,7 +123,13 @@ module m68k_top #(
         .den_slv_addr(den_slv_addr),
         .den_slv_be  (den_slv_be),
         .den_slv_wdata(den_slv_wdata),
-        .den_slv_rdata(den_slv_rdata)
+        .den_slv_rdata(den_slv_rdata),
+        .pau_slv_req (pau_slv_req),
+        .pau_slv_we  (pau_slv_we),
+        .pau_slv_addr(pau_slv_addr),
+        .pau_slv_be  (pau_slv_be),
+        .pau_slv_wdata(pau_slv_wdata),
+        .pau_slv_rdata(pau_slv_rdata)
     );
 
     // Blitter instance.  Its master port plugs into the bus at index
@@ -226,6 +245,44 @@ module m68k_top #(
     assign p_be   [4*DEN_PORT  +: 4]          = den_mst_be;
     assign den_mst_ack   = p_resp_valid[DEN_PORT];
     assign den_mst_rdata = p_resp_data;
+
+    // Paula master wires.
+    wire        pau_mst_req;
+    wire        pau_mst_we;
+    wire [31:0] pau_mst_addr;
+    wire [31:0] pau_mst_wdata;
+    wire [3:0]  pau_mst_be;
+    wire        pau_mst_ack;
+    wire [31:0] pau_mst_rdata;
+
+    m68k_paula u_pau (
+        .clk        (clk),
+        .rst_n      (rst_n),
+        .slv_req    (pau_slv_req),
+        .slv_we     (pau_slv_we),
+        .slv_addr   (pau_slv_addr),
+        .slv_be     (pau_slv_be),
+        .slv_wdata  (pau_slv_wdata),
+        .slv_rdata  (pau_slv_rdata),
+        .mst_req    (pau_mst_req),
+        .mst_we     (pau_mst_we),
+        .mst_addr   (pau_mst_addr),
+        .mst_wdata  (pau_mst_wdata),
+        .mst_be     (pau_mst_be),
+        .mst_ack    (pau_mst_ack),
+        .mst_rdata  (pau_mst_rdata),
+        .audio_l_o  (audio_l),
+        .audio_r_o  (audio_r)
+    );
+
+    assign p_req  [PAU_PORT]                  = pau_mst_req;
+    assign p_we   [PAU_PORT]                  = pau_mst_we;
+    assign p_lock [PAU_PORT]                  = 1'b0;
+    assign p_addr [32*PAU_PORT +: 32]         = pau_mst_addr;
+    assign p_wdata[32*PAU_PORT +: 32]         = pau_mst_wdata;
+    assign p_be   [4*PAU_PORT  +: 4]          = pau_mst_be;
+    assign pau_mst_ack   = p_resp_valid[PAU_PORT];
+    assign pau_mst_rdata = p_resp_data;
 
     genvar gi;
     generate
