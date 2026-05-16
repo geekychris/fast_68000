@@ -38,7 +38,9 @@ flowchart TB
 For the full design — pipeline, exception sequencer, memory subsystem,
 bus arbiter, hardware-integration notes, and a workload-by-workload
 performance breakdown — see [DESIGN.md](DESIGN.md). For the ISA encoding
-reference, see [ISA.md](ISA.md).
+reference, see [ISA.md](ISA.md). For a tutorial on writing programs that
+exploit the multi-core capability (with assembly and illustrative C
+examples), see [MULTICORE.md](MULTICORE.md).
 
 ## Headline numbers
 

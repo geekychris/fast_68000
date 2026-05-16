@@ -520,6 +520,12 @@ cores then poll the counter until it reaches 10 and STOP with code 0.
 writes a value and the other observes the snoop invalidation and reads
 the fresh data from memory.
 
+See [MULTICORE.md](MULTICORE.md) for a programmer-facing tutorial on
+writing multi-core code against this design, with worked assembly and
+illustrative C examples for the canonical primitives (mutex, barrier,
+SPSC queue, CAS emulation, IRQ broadcast) and a worked N-way parallel
+reduction.
+
 ---
 
 ## Exception and interrupt handling
