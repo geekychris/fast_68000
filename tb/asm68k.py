@@ -45,7 +45,7 @@ Labels:
 import sys, re, struct
 
 class Asm:
-    EA_DREG, EA_AREG, EA_AIND, EA_AINC, EA_ADEC, EA_EXT = 0, 1, 2, 3, 4, 7
+    EA_DREG, EA_AREG, EA_AIND, EA_AINC, EA_ADEC, EA_DISP, EA_EXT = 0, 1, 2, 3, 4, 5, 7
     EA7_ABSW, EA7_ABSL, EA7_IMM = 0, 1, 4
 
     CC = {
@@ -83,6 +83,12 @@ class Asm:
         # (Ar)+
         m = re.fullmatch(r'\(A([0-7])\)\+', tok, re.I)
         if m: return (self.EA_AINC, int(m.group(1)), [])
+        # disp(Ar) — 16-bit displacement addressing
+        m = re.fullmatch(r'(-?(?:\$[0-9a-fA-F]+|0x[0-9a-fA-F]+|\d+))\(A([0-7])\)', tok, re.I)
+        if m:
+            disp = self.parse_int(m.group(1)) & 0xFFFF
+            an = int(m.group(2))
+            return (self.EA_DISP, an, [disp])
         # (Ar)
         m = re.fullmatch(r'\(A([0-7])\)', tok, re.I)
         if m: return (self.EA_AIND, int(m.group(1)), [])
@@ -92,12 +98,16 @@ class Asm:
         # Ar
         m = re.fullmatch(r'A([0-7])', tok, re.I)
         if m: return (self.EA_AREG, int(m.group(1)), [])
-        # #imm.L
+        # #imm.L (literal or label reference, resolved in pass 2)
         if tok.startswith('#'):
-            v = self.parse_int(tok[1:]) & 0xFFFFFFFF
+            inner = tok[1:].strip()
+            if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', inner):
+                # Label as immediate: emit two zero halfwords, patched later.
+                return (self.EA_EXT, self.EA7_IMM, [('lbl_hi', inner), ('lbl_lo', inner)])
+            v = self.parse_int(inner) & 0xFFFFFFFF
             return (self.EA_EXT, self.EA7_IMM, [(v >> 16) & 0xFFFF, v & 0xFFFF])
         # abs.w
-        m = re.fullmatch(r'\$([0-9a-fA-F]+)\.w', tok)
+        m = re.fullmatch(r'\$([0-9a-fA-F]+)\.w', tok, re.I)
         if m:
             v = int(m.group(1), 16) & 0xFFFF
             return (self.EA_EXT, self.EA7_ABSW, [v])
@@ -160,9 +170,16 @@ class Asm:
             return
         if line.startswith('.long'):
             for tok in [t.strip() for t in line[5:].split(',')]:
-                v = self.parse_int(tok) & 0xFFFFFFFF
-                self.emit((v >> 16) & 0xFFFF)
-                self.emit(v & 0xFFFF)
+                try:
+                    v = self.parse_int(tok) & 0xFFFFFFFF
+                    self.emit((v >> 16) & 0xFFFF)
+                    self.emit(v & 0xFFFF)
+                except ValueError:
+                    # Treat as a label reference, patched in pass 2.
+                    self.fixups.append(('abs32_word', self.pc,     'lbl_hi', tok))
+                    self.fixups.append(('abs32_word', self.pc + 2, 'lbl_lo', tok))
+                    self.emit(0)
+                    self.emit(0)
             return
         # Mnemonic
         mnem, _, rest = line.partition(' ')
@@ -173,6 +190,89 @@ class Asm:
             self.emit(0x4E71)
         elif mnem == 'rts':
             self.emit(0x4E75)
+        elif mnem == 'rte':
+            self.emit(0x4E73)
+        elif mnem == 'rtr':
+            self.emit(0x4E77)
+        elif mnem == 'trapv':
+            self.emit(0x4E76)
+        elif mnem == 'trap':
+            n = self.parse_int(operands[0]) & 0xF
+            self.emit(0x4E40 | n)
+        elif mnem in ('movem.l', 'movem.w'):
+            sz = 1 if mnem == 'movem.l' else 0
+            op0 = operands[0].strip()
+            op1 = operands[1].strip()
+            # Distinguish reg-list vs EA by looking for ()/$/# in the EA side.
+            if '(' in op0 or op0.startswith('$') or op0.startswith('#'):
+                direction = 1   # mem -> regs
+                ea = self.parse_ea(op0)
+                regs = self._parse_reg_list(op1)
+            else:
+                direction = 0   # regs -> mem
+                regs = self._parse_reg_list(op0)
+                ea = self.parse_ea(op1)
+            predec = (ea[0] == self.EA_ADEC)
+            mask = 0
+            for kind, idx in regs:
+                reg_idx_full = idx + (8 if kind == 'A' else 0)
+                bit_pos = (15 - reg_idx_full) if predec else reg_idx_full
+                mask |= (1 << bit_pos)
+            op = (0b0100 << 12) | (1 << 11) | (direction << 10) | \
+                 (1 << 7) | (sz << 6) | (ea[0] << 3) | ea[1]
+            self.emit(op)
+            self.emit(mask & 0xFFFF)
+            self.emit_ea_ext(ea)
+        elif mnem == 'chk' or mnem == 'chk.w':
+            # 0100_ddd_110_mm_rrr
+            ea = self.parse_ea(operands[0])
+            dn = self.reg(operands[1], 'D')
+            op = (0b0100 << 12) | (dn << 9) | (0b110 << 6) | (ea[0] << 3) | ea[1]
+            self.emit(op)
+            self.emit_ea_ext(ea)
+        elif mnem in ('move.l', 'move.w') and len(operands) == 2 and \
+              (operands[0].strip().lower() == 'usp' or operands[1].strip().lower() == 'usp'):
+            # MOVE An,USP  (0100_1110_0110_0aaa = 0x4E60 | An)
+            # MOVE USP,An  (0100_1110_0110_1aaa = 0x4E68 | An)
+            if operands[1].strip().lower() == 'usp':
+                an = self.reg(operands[0], 'A')
+                self.emit(0x4E60 | an)
+            else:
+                an = self.reg(operands[1], 'A')
+                self.emit(0x4E68 | an)
+        elif mnem == 'andi' or mnem == 'ori' or mnem == 'eori':
+            # ANDI/ORI/EORI to CCR or SR -- no size suffix.
+            # 0000_xxxx_0011_1100 = to CCR (.B), 0000_xxxx_0111_1100 = to SR (.W)
+            fam = {'ori':0b0000,'andi':0b0010,'eori':0b1010}[mnem]
+            imm = self.parse_int(operands[0])
+            dst = operands[1].strip().lower()
+            if dst == 'ccr':
+                self.emit((0b0000 << 12) | (fam << 8) | 0b0011_1100)
+                self.emit(imm & 0xFF)
+            elif dst == 'sr':
+                self.emit((0b0000 << 12) | (fam << 8) | 0b0111_1100)
+                self.emit(imm & 0xFFFF)
+            else:
+                raise SyntaxError(f"{mnem} expects CCR or SR as dest, got {dst!r}")
+        elif mnem in ('move.w',) and len(operands) == 2 and \
+              (operands[0].strip().lower() in ('sr','ccr') or operands[1].strip().lower() in ('sr','ccr')):
+            # MOVE from SR: 0100_0000_11_mm_rrr (W)
+            # MOVE to CCR:  0100_0100_11_mm_rrr (W src; low byte used)
+            # MOVE to SR:   0100_0110_11_mm_rrr (W, priv)
+            src = operands[0].strip()
+            dst = operands[1].strip().lower()
+            if src.lower() == 'sr':
+                ea = self.parse_ea(operands[1])
+                self.emit((0b0100_0000 << 8) | (0b11 << 6) | (ea[0] << 3) | ea[1])
+                self.emit_ea_ext(ea)
+            elif dst == 'ccr':
+                ea = self.parse_ea(operands[0])
+                self.emit((0b0100_0100 << 8) | (0b11 << 6) | (ea[0] << 3) | ea[1])
+                self.emit_ea_ext(ea)
+            elif dst == 'sr':
+                ea = self.parse_ea(operands[0])
+                self.emit((0b0100_0110 << 8) | (0b11 << 6) | (ea[0] << 3) | ea[1])
+                self.emit_ea_ext(ea)
         elif mnem == 'stop':
             imm = self.parse_int(operands[0]) & 0xFFFF
             self.emit(0x4E72)
@@ -268,16 +368,139 @@ class Asm:
             else:
                 self.emit(imm & 0xFFFF)
             self.emit_ea_ext(ea)
+        elif mnem.startswith(('asl.', 'asr.', 'lsl.', 'lsr.',
+                              'rol.', 'ror.', 'roxl.', 'roxr.')):
+            family, _, sz_str = mnem.partition('.')
+            ss = {'b': 0b00, 'w': 0b01, 'l': 0b10}[sz_str]
+            d = 1 if family.endswith('l') else 0  # left if endswith 'l'
+            # type: 00=AS, 01=LS, 10=ROX, 11=RO
+            ttab = {'as': 0b00, 'ls': 0b01, 'rox': 0b10, 'ro': 0b11}
+            base = family[:-1] if family.endswith('l') else family[:-1]   # strip trailing l/r
+            tt = ttab[base]
+            # First operand: count (immediate or Dn). Second: Dn being shifted.
+            cnt = operands[0].strip()
+            dn  = self.reg(operands[1], 'D')
+            if cnt.startswith('#'):
+                imm = self.parse_int(cnt)
+                ccc = 0 if imm == 8 else (imm & 7)
+                i = 0
+            else:
+                ccc = self.reg(cnt, 'D')
+                i = 1
+            op = (0b1110 << 12) | (ccc << 9) | (d << 8) | (ss << 6) | (i << 5) | (tt << 3) | dn
+            self.emit(op)
+        elif mnem.startswith('db') and (mnem[2:] in self.CC or mnem == 'dbra'):
+            cc = self.CC['f'] if mnem == 'dbra' else self.CC[mnem[2:]]
+            dn = self.reg(operands[0], 'D')
+            target = operands[1]
+            # 0101_cccc_1100_1rrr + disp16
+            op = (0b0101 << 12) | (cc << 8) | (0b11001 << 3) | dn
+            self.emit(op)
+            self.fixups.append(('dbcc_disp', self.pc, target))
+            self.emit(0)
+        elif mnem == 'link':
+            # link Aa, #disp16
+            an = self.reg(operands[0], 'A')
+            imm = self.parse_int(operands[1])
+            op = (0b0100_1110_0101_0_000) | an
+            self.emit(op)
+            self.emit(imm & 0xFFFF)
+        elif mnem == 'unlk':
+            an = self.reg(operands[0], 'A')
+            op = (0b0100_1110_0101_1_000) | an
+            self.emit(op)
+        elif mnem == 'pea':
+            ea = self.parse_ea(operands[0])
+            op = (0b0100_1000_01 << 6) | (ea[0] << 3) | ea[1]
+            self.emit(op)
+            self.emit_ea_ext(ea)
+        elif mnem in ('mulu.w', 'muls.w', 'divu.w', 'divs.w'):
+            # 1100_ddd_011_mmrrr (MULU), 1100_ddd_111_mmrrr (MULS),
+            # 1000_ddd_011_mmrrr (DIVU), 1000_ddd_111_mmrrr (DIVS)
+            ea = self.parse_ea(operands[0])
+            dn = self.reg(operands[1], 'D')
+            base = 0b1100 if mnem.startswith('mul') else 0b1000
+            # 'mulu'/'divu' -> unsigned (sub=011); 'muls'/'divs' -> signed (sub=111).
+            # Use mnem[3] (the 'u' or 's' character) to distinguish.
+            sub  = 0b011 if mnem[3] == 'u' else 0b111
+            op = (base << 12) | (dn << 9) | (sub << 6) | (ea[0] << 3) | ea[1]
+            self.emit(op)
+            self.emit_ea_ext(ea)
+        elif mnem.startswith('s') and len(mnem) >= 2 and mnem[1:] in self.CC:
+            # Scc <ea>: 0101_cccc_11_mm_rrr
+            cc = self.CC[mnem[1:]]
+            ea = self.parse_ea(operands[0])
+            op = (0b0101 << 12) | (cc << 8) | (0b11 << 6) | (ea[0] << 3) | ea[1]
+            self.emit(op)
+            self.emit_ea_ext(ea)
+        elif mnem in ('btst', 'bchg', 'bclr', 'bset'):
+            # Two forms: static (#imm, ea) or dynamic (Dn, ea).
+            xx = {'btst':0b00,'bchg':0b01,'bclr':0b10,'bset':0b11}[mnem]
+            src = operands[0].strip()
+            ea = self.parse_ea(operands[1])
+            if src.startswith('#'):
+                # Static: 0000_1000_xx_mm_rrr + #imm extension word.
+                bitn = self.parse_int(src) & 0xFF
+                op = (0b0000_1000 << 8) | (xx << 6) | (ea[0] << 3) | ea[1]
+                self.emit(op)
+                self.emit(bitn & 0xFFFF)
+                self.emit_ea_ext(ea)
+            else:
+                # Dynamic: 0000_ddd_1xx_mm_rrr
+                dn = self.reg(src, 'D')
+                op = (0b0000 << 12) | (dn << 9) | (1 << 8) | (xx << 6) | (ea[0] << 3) | ea[1]
+                self.emit(op)
+                self.emit_ea_ext(ea)
         elif mnem == 'bra' or mnem == 'bsr' or (mnem.startswith('b') and mnem[1:] in self.CC):
             if mnem == 'bra': cc = self.CC['t']
             elif mnem == 'bsr': cc = self.CC['f']
             else: cc = self.CC[mnem[1:]]
             target = operands[0]
-            # Always emit short form with placeholder; the linker pass picks disp8 or disp16.
-            self.fixups.append(('branch', self.pc, target, cc))
-            self.emit(0)  # placeholder
+            # If target is a backward reference that fits in disp8, emit 1 word.
+            # Otherwise, emit 2 words (opcode|0x00 + disp16 extension).
+            tgt = self.labels.get(target)
+            if tgt is None:
+                tgt = None  # forward reference - try short literal only
+                try:
+                    tgt = self.parse_int(target)
+                except Exception:
+                    tgt = None
+            if tgt is not None:
+                disp = tgt - (self.pc + 2)
+                if -128 <= disp <= 127 and disp != 0:
+                    word = (0b0110 << 12) | (cc << 8) | (disp & 0xFF)
+                    self.emit(word)
+                else:
+                    word = (0b0110 << 12) | (cc << 8) | 0x00
+                    self.emit(word)
+                    self.emit(disp & 0xFFFF)
+            else:
+                # Forward reference to a label: always emit disp16 form.
+                self.fixups.append(('branch16', self.pc, target, cc))
+                self.emit((0b0110 << 12) | (cc << 8) | 0x00)
+                self.emit(0)  # placeholder for disp16
         else:
             raise SyntaxError(f"unknown mnemonic: {mnem!r}")
+
+    def _parse_reg_list(self, tok):
+        """Parse a register list like 'D0/D1/D7/A0-A2' into a set of (kind, idx)."""
+        regs = set()
+        for part in tok.split('/'):
+            p = part.strip().upper()
+            m = re.fullmatch(r'([DA])(\d)-([DA])(\d)', p)
+            if m:
+                k1, i1, k2, i2 = m.group(1), int(m.group(2)), m.group(3), int(m.group(4))
+                if k1 != k2:
+                    raise SyntaxError(f"bad reg range {p!r}")
+                lo, hi = min(i1, i2), max(i1, i2)
+                for i in range(lo, hi + 1):
+                    regs.add((k1, i))
+                continue
+            m = re.fullmatch(r'([DA])(\d)', p)
+            if not m:
+                raise SyntaxError(f"bad reg list element {p!r}")
+            regs.add((m.group(1), int(m.group(2))))
+        return regs
 
     def reg(self, tok, kind):
         m = re.fullmatch(rf'{kind}([0-7])', tok.strip(), re.I)
@@ -291,25 +514,29 @@ class Asm:
         # Patch branches and EA labels.
         words_by_pc = {pc: i for i, (pc, _) in enumerate(self.words)}
         for fix in self.fixups:
-            if fix[0] == 'branch':
+            if fix[0] == 'branch16':
+                # Forward-ref branch: we emitted opcode|0x00 at pc, disp16 at pc+2.
                 _, pc, target, cc = fix
                 tgt = self.labels[target] if target in self.labels else self.parse_int(target)
                 disp = tgt - (pc + 2)
-                # Try disp8 first.
-                if -128 <= disp <= 127 and disp != 0:
-                    word = (0b0110 << 12) | (cc << 8) | (disp & 0xFF)
-                    self.words[words_by_pc[pc]] = (pc, word & 0xFFFF)
-                else:
-                    # Use disp16: insert an extension word AFTER the branch.
-                    # Need to shift subsequent words by 2 bytes — but we can't easily.
-                    # Simpler: pre-allocate disp16 by inserting a dummy ext word. Re-run.
-                    raise SyntaxError(f"branch out of disp8 range to {target}; not supported")
+                if disp < -32768 or disp > 32767:
+                    raise SyntaxError(f"branch disp16 out of range to {target}")
+                self.words[words_by_pc[pc + 2]] = (pc + 2, disp & 0xFFFF)
             elif fix[0] == 'abs32_word':
                 _, pc, which, label = fix
                 addr = self.labels[label] if label in self.labels else self.parse_int(label)
                 addr &= 0xFFFFFFFF
                 half = (addr >> 16) if which == 'lbl_hi' else (addr & 0xFFFF)
                 self.words[words_by_pc[pc]] = (pc, half & 0xFFFF)
+            elif fix[0] == 'dbcc_disp':
+                # DBcc target = pc_of_opcode + 2 + sign_ext(disp16).
+                # We saved pc = address of the displacement word = pc_of_opcode + 2.
+                _, pc, target = fix
+                tgt = self.labels[target] if target in self.labels else self.parse_int(target)
+                disp = tgt - pc
+                if disp < -32768 or disp > 32767:
+                    raise SyntaxError(f"dbcc disp16 out of range to {target}")
+                self.words[words_by_pc[pc]] = (pc, disp & 0xFFFF)
 
     def to_hex(self, mem_words):
         """Pack 16-bit half-words into 32-bit big-endian memory words."""

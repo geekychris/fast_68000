@@ -221,6 +221,8 @@ module m68k_decoder (
                 reg_is_a = 1'b0;
                 src_mode = m3;
                 src_reg  = r0;
+                dst_mode = m3;
+                dst_reg  = r0;
                 src_ext_words = ea_ext(m3, r0, (m3 == `EA_DREG) ? `SZ_L : `SZ_B);
                 size = (m3 == `EA_DREG) ? `SZ_L : `SZ_B;
                 alu_op = {3'd0, opcode[7:6]};
@@ -395,6 +397,7 @@ module m68k_decoder (
             16'b0100_1110_0110_0???: begin
                 kind = K_MOVEUSP;
                 direction = 1'b0;
+                src_mode = `EA_AREG;
                 src_reg = r0;
                 privileged = 1'b1;
             end
@@ -402,6 +405,7 @@ module m68k_decoder (
             16'b0100_1110_0110_1???: begin
                 kind = K_MOVEUSP;
                 direction = 1'b1;
+                src_mode = `EA_AREG;
                 src_reg = r0;
                 privileged = 1'b1;
             end
@@ -420,6 +424,8 @@ module m68k_decoder (
             16'b0100_1110_0111_0111: kind = K_RTR;
             16'b0100_1110_0111_0010: begin
                 kind = K_STOP;
+                src_mode = `EA_EXT;
+                src_reg  = `EA7_IMM;
                 src_ext_words = 2'd1;
                 privileged = 1'b1;
             end
@@ -465,6 +471,7 @@ module m68k_decoder (
                 cc = opcode[11:8];
                 src_reg = r0;
                 src_ext_words = 2'd1;
+                needs_disp_word = 1'b1;  // pull disp16 into id_branch_imm
             end
             // Scc <ea>: 0101_cccc_11_mm_rrr (mode != 001)
             16'b0101_????_11_??_????: begin

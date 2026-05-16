@@ -32,8 +32,15 @@ module m68k_bus #(
 
     output reg                            snoop_valid,
     output reg  [31:0]                    snoop_addr,
-    output reg  [$clog2(N_PORTS)-1:0]     snoop_src_id
+    output reg  [$clog2(N_PORTS)-1:0]     snoop_src_id,
+
+    // Memory-mapped IRQ controller: writes to address $FFFF_FFFC (i.e.
+    // $FFFC.W with the 68000's sign-extension of absolute-short addresses)
+    // latch the low 3 bits of wdata into irq_level (sticky; clear by
+    // writing 0).
+    output reg  [2:0]                     irq_level
 );
+    localparam [31:0] IRQ_REG_ADDR = 32'hFFFF_FFFC;
     localparam PID_BITS = $clog2(N_PORTS);
     localparam AIDX_BITS = $clog2(MEM_WORDS);
 
@@ -107,8 +114,10 @@ module m68k_bus #(
     reg                 granted_we_q;
     reg [AIDX_BITS-1:0] granted_idx_q;
     reg [31:0]          granted_addr_q;
+    reg                 granted_is_irq_q;
 
     wire [AIDX_BITS-1:0] mem_idx = addr[winner][AIDX_BITS+1:2];
+    wire is_irq_reg = (addr[winner] == IRQ_REG_ADDR);
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -120,9 +129,14 @@ module m68k_bus #(
             granted_we_q    <= 1'b0;
             granted_idx_q   <= {AIDX_BITS{1'b0}};
             granted_addr_q  <= 32'd0;
+            granted_is_irq_q <= 1'b0;
+            irq_level <= 3'd0;
         end else begin
-            // Commit memory write this cycle.
-            if (winner_valid && we[winner]) begin
+            // Writes to the IRQ register update irq_level (sticky) and do NOT
+            // commit to main memory. Writes anywhere else update memory.
+            if (winner_valid && we[winner] && is_irq_reg) begin
+                if (be[winner][0]) irq_level <= wdata[winner][2:0];
+            end else if (winner_valid && we[winner]) begin
                 if (be[winner][3]) mem[mem_idx][31:24] <= wdata[winner][31:24];
                 if (be[winner][2]) mem[mem_idx][23:16] <= wdata[winner][23:16];
                 if (be[winner][1]) mem[mem_idx][15:8]  <= wdata[winner][15:8];
@@ -135,6 +149,7 @@ module m68k_bus #(
             granted_we_q    <= winner_valid && we[winner];
             granted_idx_q   <= mem_idx;
             granted_addr_q  <= addr[winner];
+            granted_is_irq_q <= winner_valid && is_irq_reg;
 
             // Round-robin advance.
             if (winner_valid && !lock_pending) begin
@@ -157,10 +172,11 @@ module m68k_bus #(
         end
     end
 
-    // Output response (1 cycle after grant).
+    // Output response (1 cycle after grant). Reads of the IRQ register return
+    // {29'b0, irq_level}; everything else reads from main memory.
     always @* begin
         resp_valid = {N_PORTS{1'b0}};
-        resp_data  = mem[granted_idx_q];
+        resp_data  = granted_is_irq_q ? {29'd0, irq_level} : mem[granted_idx_q];
         if (granted_valid_q) resp_valid[granted_port_q] = 1'b1;
     end
 

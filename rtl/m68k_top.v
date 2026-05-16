@@ -32,6 +32,7 @@ module m68k_top #(
     wire                  snoop_valid;
     wire [31:0]           snoop_addr;
     wire [PID_BITS-1:0]   snoop_src_id;
+    wire [2:0]            irq_level;
 
     m68k_bus #(
         .N_PORTS    (N_PORTS),
@@ -51,7 +52,8 @@ module m68k_top #(
         .resp_data   (p_resp_data),
         .snoop_valid (snoop_valid),
         .snoop_addr  (snoop_addr),
-        .snoop_src_id(snoop_src_id)
+        .snoop_src_id(snoop_src_id),
+        .irq_level   (irq_level)
     );
 
     genvar gi;
@@ -202,6 +204,7 @@ module m68k_top #(
                 .clk        (clk),
                 .rst_n      (rst_n),
                 .reset_a7   (reset_a7),
+                .ipl_i      (irq_level),
                 .ic_req     (ic_req),
                 .ic_we      (ic_we),
                 .ic_lock    (ic_lock),

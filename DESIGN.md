@@ -33,14 +33,17 @@ no-cache build of the same pipeline.
 4. [Pipeline microarchitecture](#pipeline-microarchitecture)
 5. [Memory subsystem](#memory-subsystem)
 6. [Multi-core, coherence, atomics](#multi-core-coherence-atomics)
-7. [Optimizations](#optimizations)
-8. [Module reference](#module-reference)
-9. [Verification methodology](#verification-methodology)
-10. [Benchmarks](#benchmarks)
-11. [Build and run](#build-and-run)
-12. [Known limitations](#known-limitations)
-13. [Future work](#future-work)
-14. [File map](#file-map)
+7. [Exception and interrupt handling](#exception-and-interrupt-handling)
+8. [Optimizations](#optimizations)
+9. [Module reference](#module-reference)
+10. [Verification methodology](#verification-methodology)
+11. [Benchmarks](#benchmarks)
+12. [Build and run](#build-and-run)
+13. [Hardware integration: replacing a real 68000](#hardware-integration-replacing-a-real-68000)
+14. [Performance benefits: what workloads benefit most](#performance-benefits-what-workloads-benefit-most)
+15. [ISA implementation status](#isa-implementation-status)
+16. [Future work](#future-work)
+17. [File map](#file-map)
 
 ---
 
@@ -63,19 +66,27 @@ no-cache build of the same pipeline.
 - Cycle-accurate emulation of the real 68000. We pick a subset of the ISA and
   measure clock cycles on our own implementation, then compare against PRM
   per-instruction cycle counts.
-- Full ISA coverage. No .B / .W sizes, no displacement/indexed addressing
-  modes, no DBcc, no MOVEM, no supervisor mode or exceptions.
+- Bit-exact behaviour on every corner of the ISA. The exception frame is
+  non-standard (8 bytes instead of 6), `d8(An,Xn)` indexed modes and BCD
+  arithmetic are not implemented, and interrupt acknowledgment is autovector
+  only. See [ISA implementation status](#isa-implementation-status) for a
+  precise list.
 - Hardware synthesis. Designed for clarity in simulation; gate-level timing
   was not analysed. Real silicon would need further work (clock-domain
-  consideration, retiming, ASIC/FPGA targeting).
+  consideration, retiming, ASIC/FPGA targeting) — covered in detail in
+  [Hardware integration](#hardware-integration-replacing-a-real-68000).
 
 ---
 
 ## ISA: 68K-mini
 
-A user-mode subset of the M68000 with a 32-bit datapath. Every arithmetic
-operation is long-word (.L). The full opcode encoding is documented in
-`ISA.md`; here is a summary.
+A 32-bit datapath implementing a broad subset of the M68000, including all
+three operand sizes (.B / .W / .L), user and supervisor modes, the standard
+exception model, and autovector interrupts. The full opcode encoding is
+documented in `ISA.md`; see [ISA implementation status](#isa-implementation-status)
+near the end of this document for a precise inventory of what's implemented,
+decoded-but-not-executed, and skipped. The summary below captures the
+foundational pieces.
 
 ### Registers
 
@@ -147,38 +158,47 @@ VC, VS, PL, MI, GE, LT, GT, LE).
 
 ## System architecture
 
-```
-                                    ┌──────────────────────────────┐
-                                    │       m68k_top.v             │
-                                    │                              │
-   per core i ∈ [0, N_CORES):       │                              │
-   ┌──────────────┐                 │                              │
-   │  m68k_core   │                 │                              │
-   │   (3-stage)  │                 │                              │
-   └─┬──────────┬─┘                 │                              │
-     │ ic_*     │ dc_*              │                              │
-     ▼          ▼                   │                              │
-   ┌──────┐  ┌──────┐               │                              │
-   │  IC$ │  │  DC$ │  m68k_cache   │                              │
-   │   /  │  │      │  (or pass-    │                              │
-   │  pass│  │      │   through)    │                              │
-   └──┬───┘  └──┬───┘               │                              │
-      │bus      │bus                │                              │
-      └────┬────┘                   │                              │
-           ▼                        │                              │
-        ┌───────────────────────────┴─────────────────────────────┐│
-        │                  m68k_bus.v                              ││
-        │  round-robin arbiter, lock tracking, snoop broadcast,    ││
-        │  big-endian 32-bit-wide memory ($readmemh program.hex)   ││
-        └───────────────────────────────────────────────────────────│
-                                                                    │
-                                    └────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph top["m68k_top.v (N_CORES instances)"]
+        direction TB
+        subgraph core0["Core 0"]
+            C0[m68k_core<br/>3-stage pipeline]
+            IC0[(L1 I-cache<br/>1 KB direct-mapped)]
+            DC0[(L1 D-cache<br/>1 KB direct-mapped<br/>write-through)]
+            C0 -- ic_req / ic_rdata --> IC0
+            C0 -- dc_req / dc_rdata / dc_we --> DC0
+        end
+        subgraph coreN["Core N-1"]
+            CN[m68k_core]
+            ICN[(L1 I-cache)]
+            DCN[(L1 D-cache)]
+            CN --> ICN
+            CN --> DCN
+        end
+        BUS["m68k_bus.v<br/>round-robin arbiter<br/>lock tracking<br/>snoop broadcast"]
+        MEM[("32-bit-wide memory<br/>MEM_WORDS × 4 B<br/>$readmemh program.hex")]
+        IRQ["IRQ register<br/>$FFFF_FFFC<br/>(autovector source)"]
+        IC0 -- bus_req --> BUS
+        DC0 -- bus_req --> BUS
+        ICN -- bus_req --> BUS
+        DCN -- bus_req --> BUS
+        BUS -- mem_we / mem_addr / mem_wdata --> MEM
+        BUS -- snoop_valid / snoop_addr / snoop_src --> IC0
+        BUS -- snoop_valid / snoop_addr / snoop_src --> DC0
+        BUS -- snoop_valid / snoop_addr / snoop_src --> ICN
+        BUS -- snoop_valid / snoop_addr / snoop_src --> DCN
+        IRQ -- irq_level --> C0
+        IRQ -- irq_level --> CN
+    end
 ```
 
 Every core has a private L1 instruction cache and L1 data cache. Both caches
 share the system bus, on which the arbiter implements round-robin priority
 with a lock-pending override for atomic RMW. Each accepted write transaction
 is broadcast on a snoop output so the other caches invalidate matching lines.
+A memory-mapped IRQ register at `$FFFF_FFFC` drives the `ipl_i[2:0]` input of
+every core for autovector interrupts.
 
 The `USE_CACHE` parameter on `m68k_top` swaps each cache instance for an
 `m68k_passthrough` that has the same interface but no storage, used for
@@ -191,23 +211,45 @@ performance comparisons.
 Three logical stages: **IF**, **ID**, and **EX** (with EX absorbing memory
 access and writeback for simplicity).
 
+```mermaid
+flowchart LR
+    subgraph IF["IF stage"]
+        direction TB
+        IF1[Issue I-cache fetch]
+        IF2[Latch opcode + ext words]
+        IF3[Streaming dispatch]
+        IF4[BTFNT speculative fetch]
+        IF1 --> IF2 --> IF3 --> IF4
+    end
+    subgraph ID["ID stage (combinational)"]
+        direction TB
+        ID1[Decode]
+        ID2[Regfile read]
+        ID3[Forwarding mux]
+        ID1 --> ID2 --> ID3
+    end
+    subgraph EX["EX stage (state machine)"]
+        direction TB
+        EX1[EA compute + ALU]
+        EX2[D-cache R/W]
+        EX3[Branch resolve]
+        EX4[Writeback + CCR]
+        EX1 --> EX2 --> EX3 --> EX4
+    end
+    IF -- "if_dispatch_w<br/>predict_taken_w" --> IFID[/"IF/ID register"/]
+    IFID --> ID
+    ID -- "id_op + operands" --> IDEX[/"ID/EX register"/]
+    IDEX --> EX
+    EX -- "redirect_valid (comb)" -.-> IF
+    EX -- "wb_main / wb_aux (comb)" --> ID
+    EX --> RF[(Regfile + CCR)]
 ```
-     ┌──────────────────┐     ┌──────────────┐     ┌─────────────────────┐
-     │       IF         │     │     ID       │     │       EX            │
-     │                  │     │              │     │ ALU                 │
-     │ - issue I-cache  │     │ - decode     │ ──► │ EA compute          │
-     │ - latch opcode + │ ──► │ - regfile rd │     │ D-cache R/W         │
-     │   ext words      │     │ - BTFNT pred │     │ branch resolve      │
-     │ - dispatch       │     │ - forwarding │     │ writeback (comb)    │
-     │ - speculative    │     │              │     │ CCR commit          │
-     │   fetch on pred  │     │              │     │                     │
-     └─────────┬────────┘     └──────┬───────┘     └──────────┬──────────┘
-               │ if_dispatch_w       │ id_valid               │ ex_valid
-               │ if_op, if_ext,      │ id_op, id_ext, etc.    │ writeback
-               │ predict_taken_w     │ + forwarded operands   │
-               ▼                     ▼                        ▼
-            IF/ID register        ID/EX register           regfile / CCR
-```
+
+The combinational EX→ID forwarding path (dashed in the figure conceptually
+but solid here) means register-only RAW hazards resolve with **zero stall**:
+EX writes back combinationally on `is_settled`, ID sees the new value the
+same cycle. The combinational `redirect_valid` from EX to IF also flushes
+wrong-path instructions before they can enter EX.
 
 ### IF stage
 
@@ -254,12 +296,41 @@ made at IF dispatch — so EX can detect mispredicts later.
 
 Implements an explicit state machine per in-flight instruction:
 
-- **S_RUN** — single-cycle ops (MOVEQ, MOVE reg-reg, ALU reg-reg, MOVEQ,
-  Bcc, JMP). Settles in one cycle and writes back the result combinationally.
+- **S_RUN** — single-cycle ops (MOVEQ, MOVE reg-reg, ALU reg-reg, Bcc, JMP).
+  Settles in one cycle and writes back the result combinationally.
 - **S_LOAD** — memory load in flight (MOVE-from-mem, ADD-from-mem, RTS, TAS
   phase 0). Settles when `dc_ack` arrives.
 - **S_STORE** — memory store in flight (MOVE-to-mem, JSR push, BSR push).
 - **S_TASW** — TAS phase 1: writes the test-and-set byte back to memory.
+- **S_RMW_W** — memory-destination read-modify-write (NEG.B / NOT.B / CLR /
+  TST on memory dest); pairs S_LOAD with S_RMW_W to write modified data back.
+- **S_MOVEM** — multi-cycle MOVEM iterator: walks the 16-bit register mask
+  one bit at a time, issuing one load or one store per cycle.
+- **S_EXC_PUSH_PC**, **S_EXC_PUSH_SR**, **S_EXC_FETCH** — exception
+  sequencer; pushes return PC and SR to the supervisor stack, then loads
+  vector from `vector_base + vec*4` and redirects PC.
+
+```mermaid
+stateDiagram-v2
+    [*] --> S_RUN
+    S_RUN --> S_RUN: register-only op<br/>(MOVEQ, ADD reg-reg, Bcc, JMP)
+    S_RUN --> S_LOAD: src needs mem<br/>(MOVE from mem, RTS, TAS)
+    S_RUN --> S_STORE: dst needs mem<br/>(MOVE to mem, JSR push)
+    S_LOAD --> S_RUN: dc_ack (reg dest)
+    S_LOAD --> S_STORE: dc_ack (mem dest, e.g. MOVE mem,mem)
+    S_LOAD --> S_RMW_W: dc_ack (RMW: NEG.B mem, NOT.B mem)
+    S_LOAD --> S_TASW: dc_ack (TAS phase 0 → phase 1)
+    S_STORE --> S_RUN: dc_ack
+    S_RMW_W --> S_RUN: dc_ack
+    S_TASW --> S_RUN: dc_ack
+    S_RUN --> S_MOVEM: MOVEM start
+    S_MOVEM --> S_MOVEM: bit set, more bits remain
+    S_MOVEM --> S_RUN: mask exhausted
+    S_RUN --> S_EXC_PUSH_PC: exc_launch_c<br/>(TRAP, /0, illegal, IRQ, ...)
+    S_EXC_PUSH_PC --> S_EXC_PUSH_SR: PC pushed
+    S_EXC_PUSH_SR --> S_EXC_FETCH: SR pushed
+    S_EXC_FETCH --> S_RUN: vector loaded
+```
 
 `is_settled` is the union of "did one of those states just complete?". When
 asserted, all of the instruction's side effects fire on the same posedge:
@@ -317,6 +388,22 @@ Tight register-only loops with BTFNT-correct branches achieve sustained
 ---
 
 ## Memory subsystem
+
+```mermaid
+flowchart LR
+    CPU["m68k_core<br/>(IF + EX ports)"] -- ic_req / ic_we=0 --> IC[("I-cache<br/>direct-mapped<br/>read-only")]
+    CPU -- dc_req / dc_we / dc_lock --> DC[("D-cache<br/>direct-mapped<br/>write-through<br/>no-write-allocate")]
+    IC -- "miss: bus_req" --> ARB{{"Bus arbiter<br/>round-robin +<br/>lock-pending"}}
+    DC -- "miss / write / lock: bus_req" --> ARB
+    ARB -- "grant" --> MEM[("Memory<br/>32-bit-wide<br/>per-byte enables")]
+    MEM -- "resp_data" --> ARB
+    ARB -- "resp_valid + data" --> IC
+    ARB -- "resp_valid + data" --> DC
+    ARB -- "snoop_valid + addr + src_id" --> IC
+    ARB -- "snoop_valid + addr + src_id" --> DC
+    IC -- "snoop match → invalidate" --> IC
+    DC -- "snoop match → invalidate" --> DC
+```
 
 ### Cache organisation
 
@@ -432,6 +519,71 @@ cores then poll the counter until it reaches 10 and STOP with code 0.
 `t07_coherence` exercises the producer/consumer pattern where one core
 writes a value and the other observes the snoop invalidation and reads
 the fresh data from memory.
+
+---
+
+## Exception and interrupt handling
+
+The core implements a unified multi-cycle exception sequencer for all
+synchronous traps and asynchronous interrupts.
+
+### Sources wired
+
+| vector | source                          | trigger                                     |
+|--------|----------------------------------|---------------------------------------------|
+| 4      | Illegal opcode                  | decoder returns `K_BAD`                     |
+| 5      | Divide by zero                  | DIVU/DIVS with src operand `= 0`            |
+| 6      | CHK out of range                | CHK detected `Dn < 0` or `Dn > bound`       |
+| 7      | TRAPV                           | TRAPV with V flag set                       |
+| 8      | Privilege violation             | RTE, MOVE-to-SR, MOVE-USP, etc. in user mode |
+| 24+N   | Autovector IRQ N (N ∈ 1..7)     | `ipl_i > sr_i` at instruction boundary      |
+| 32+N   | TRAP #N                         | TRAP #N instruction                         |
+
+### Sequencer state machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> S_RUN
+    S_RUN --> S_EXC_PUSH_PC: exc_launch_c<br/>(saves PC, vector, SR-at-fault)
+    note right of S_EXC_PUSH_PC
+        Switch to supervisor mode (S=1),
+        swap A7 ↔ USP if entering from user mode,
+        clear T-bit, set sr_i from IRQ level.
+    end note
+    S_EXC_PUSH_PC --> S_EXC_PUSH_SR: A7 -= 4; mem[A7] = saved_PC
+    S_EXC_PUSH_SR --> S_EXC_FETCH: A7 -= 4; mem[A7] = saved_SR
+    S_EXC_FETCH --> S_RUN: PC = mem[vector_base + vec*4]
+```
+
+Frame format is non-standard 8 bytes — a 32-bit SR push instead of the
+canonical 16-bit — because the data cache port is 32-bit-only in those
+states. `RTE` pops in the same format.
+
+### Privilege model
+
+- `sr_s`, `sr_t`, `sr_i[2:0]` are first-class state registers.
+- A second hidden register, `usp_shadow`, holds the inactive A7 (USP) when
+  the core is in supervisor mode (and the active A7, the SSP, when in
+  user). Transitions swap A7 ↔ `usp_shadow` so SP-relative code on either
+  side always sees the right stack.
+- Privilege-violation checks gate `RTE`, `MOVE-to-SR`, `MOVE-USP`, and
+  `ANDI/ORI/EORI to SR` to supervisor mode only. Attempting one in user
+  mode launches a vector-8 trap and discards the offending instruction's
+  side effects.
+
+### Autovector interrupts
+
+The system bus exposes a memory-mapped IRQ register at byte address
+`$FFFF_FFFC` (which the 68000's sign-extending abs.W mode reaches as
+`$FFFC.W`). Writing N to it latches `irq_level = N` (sticky). Every core's
+`ipl_i[2:0]` is wired to that level. At each instruction boundary the
+core compares `ipl_i` to `sr_i`; if `ipl_i > sr_i`, it suppresses the
+next instruction and launches an exception with vector `24 + ipl_i`,
+also setting `sr_i = ipl_i` on entry so equal- and lower-priority
+sources are masked until RTE restores SR.
+
+The handler clears the source by writing 0 to the IRQ register before
+RTE. This is **autovector only** — there is no vectored IACK bus cycle.
 
 ---
 
@@ -680,18 +832,36 @@ halt code; a 0 means the test passed.
 
 ### Regression suite
 
-| test            | covers                                                    |
-|-----------------|-----------------------------------------------------------|
-| `t01_basic`     | reset, NOP, STOP                                          |
-| `t02_arith`     | MOVEQ, ADD, SUB, CMP+BEQ, AND                             |
-| `t03_loop`      | ADDQ, signed-conditional branch loop                       |
-| `t04_memory`    | (An)+, -(An), per-core branch by SP                       |
-| `t05_call`      | BSR/RTS, JSR abs.L, recursion + stack                     |
-| `t06_multicore` | TAS-protected shared counter, two cores                   |
-| `t07_coherence` | producer/consumer ping-pong via shared memory + snoop     |
+The suite has grown from the original 7 tests to **18 tests, all passing**
+under both `USE_CACHE = 1` and `USE_CACHE = 0`, at `N_CORES = 1`, `2`, and
+`4`.
 
-All seven pass under both `USE_CACHE = 1` (cached build) and the no-cache
-build, with both `N_CORES = 1` and `N_CORES = 2`.
+| test              | covers                                                    |
+|-------------------|-----------------------------------------------------------|
+| `t01_basic`       | reset, NOP, STOP                                          |
+| `t02_arith`       | MOVEQ, ADD, SUB, CMP+BEQ, AND                             |
+| `t03_loop`        | ADDQ, signed-conditional branch loop                      |
+| `t04_memory`      | `(An)+`, `-(An)`, per-core branch by SP                   |
+| `t05_call`        | BSR/RTS, JSR abs.L, recursion + stack                     |
+| `t06_multicore`   | TAS-protected shared counter, two cores                   |
+| `t07_coherence`   | producer/consumer ping-pong via shared memory + snoop     |
+| `t08_new_insns`   | EXT.W/L, SWAP, EXG, NEG/NOT (Dn), CLR/TST, LINK/UNLK, PEA |
+| `t09_loops`       | DBcc/DBRA across all 16 conditions; shift/rotate forms    |
+| `t10_muldiv`      | MULU/MULS/DIVU/DIVS .W; BTST/BCHG/BCLR/BSET static & dyn; Scc |
+| `t11_trap`        | TRAP #N → vector 32+N; RTE; ILLEGAL opcode (vec 4)        |
+| `t12_supervisor`  | S-bit, USP/SSP swap, MOVE-USP, privilege violation (vec 8) |
+| `t13_exceptions`  | DIVU-by-zero (vec 5), TRAPV (vec 7); ANDI/ORI/EORI to CCR/SR |
+| `t14_chk_rtr`     | CHK (vec 6 on out-of-range); RTR (CCR + PC restore)       |
+| `t15_irq`         | autovector IRQs 1..7 via memory-mapped IRQ register       |
+| `t16_memdest`     | NEG.B/NEG.W/NOT.B mem dest (RMW); CLR mem, TST mem        |
+| `t17_movem`       | MOVEM.L reglist↔-(An)/+(An)/(An), prologue/epilogue       |
+| `t18_disp`        | d16(An) addressing: read, write, mixed with autoinc       |
+
+The `tb/sim_main.cpp` harness inspects each core's halt code: 0 means pass,
+anything else is a specific failure marker the program chose. The harness
+exits with the first nonzero halt code, or `0xFFFE` on cycle-cap timeout,
+or 0 on full success. `make test` builds the simulator, assembles each `.s`,
+runs it, and prints a PASS / FAIL summary.
 
 ### Benchmark methodology
 
@@ -800,6 +970,291 @@ python3 tb/asm68k.py tests/t03_loop.s build/program.hex
 
 ---
 
+## Hardware integration: replacing a real 68000
+
+This core was designed for clarity in simulation, not as a drop-in DIP-64
+68000 replacement. The pipeline, cache, and bus protocols are all
+synchronous Verilog with single-cycle handshakes — fundamentally different
+from the asynchronous, multi-clock bus cycle of the 1979-era part. Anyone
+wanting to use it in real hardware faces three categories of work:
+**glue logic at the pin boundary**, **clock and reset alignment**, and
+**unimplemented ISA / system bits**.
+
+### What you'd build around the core
+
+```mermaid
+flowchart LR
+    subgraph FPGA["FPGA or ASIC die"]
+        direction TB
+        CORE[m68k_top.v<br/>this design]
+        BC[Bus converter<br/>sync ↔ async]
+        ASEQ[Address-strobe<br/>state machine]
+        ICTL[IRQ encoder +<br/>IACK responder]
+        VEC[Reset-vector<br/>ROM shim]
+        CLK[Clock divider /<br/>PLL]
+        CORE -- bus_addr / be / we<br/>+ resp_valid --> BC
+        BC -- "/AS /UDS /LDS<br/>R/W~ DTACK~" --> EXT[(External bus<br/>DRAM/ROM/peripherals)]
+        ICTL -- ipl_i[2:0] --> CORE
+        EXT -- IPL0~..IPL2~ --> ICTL
+        VEC -- bootstrap PC/SP --> CORE
+        CLK -- clk --> CORE
+        CLK -- "phi1/phi2 (if needed)" --> BC
+    end
+    PROG[(Off-chip ROM)] --> EXT
+    DRAM[(DRAM)] --> EXT
+    PER[(UART, timer,<br/>graphics, etc.)] --> EXT
+```
+
+The block called "Bus converter" is the most substantial piece. Its job
+is to translate this core's `bus_req / bus_resp_valid` handshake into the
+real 68000's asynchronous protocol:
+
+| 68000 pin                  | direction | what to drive it from                                         |
+|----------------------------|-----------|---------------------------------------------------------------|
+| A0–A23                     | out       | `bus_addr[23:0]`. A0 is implicit in `be` for byte ops on real 68k |
+| D0–D15                     | bi-dir    | `bus_wdata[15:0]` muxed with the 16-bit half selected by `bus_addr[1]`. Demux read responses into the right half of `bus_rdata` |
+| /UDS, /LDS                 | out       | derive from `bus_be[3:0]` and `bus_addr[1]` (which two bytes are live) |
+| R/W~                       | out       | `bus_we`                                                       |
+| /AS                        | out       | high while `bus_req`; goes low one core cycle after grant      |
+| /DTACK                     | in        | externally driven by the slave; assert `bus_resp_valid` to the core when it falls |
+| /BERR, /HALT               | in        | bus-error / address-error exceptions are not implemented yet; tie inactive |
+| FC0–FC2                    | out       | derive from `sr_s` (supervisor/user) and the current cycle (program/data) |
+| /BR, /BG, /BGACK           | in/out    | DMA arbitration — not used unless you want external bus masters |
+| E, /VPA, /VMA              | out/in    | 6800-style peripherals — wire only if you need them            |
+| /IPL0..2                   | in        | feed into the IRQ encoder block above                          |
+| /RESET                     | bi-dir    | active-low; this core has a synchronous active-high `rst` input |
+| CLK                        | in        | the only clock the core uses; the bus protocol is async        |
+
+Two specific things that need design attention on the bus converter:
+
+- **Data width.** This core uses a 32-bit-wide memory port and 32-bit
+  `bus_wdata` / `bus_rdata`. The real 68000 is 16 bits external. Every
+  long-word access becomes two consecutive 16-bit bus cycles, and the
+  converter must serialise them. The core does not currently issue
+  long-word accesses as two halves — that change lives in the bus
+  converter, not in the core.
+- **DTACK timing.** Real 68000 bus cycles take a variable number of clocks
+  depending on DTACK. This core expects `bus_resp_valid` to pulse exactly
+  one cycle after `bus_req`, regardless of slave speed. The converter is
+  responsible for stretching the core's view by holding `bus_req` and
+  delaying `bus_resp_valid` until DTACK is asserted.
+
+### Reset vector and bootstrap
+
+The real 68000 reads SP and PC from `mem[0]` and `mem[4]` on reset. This
+core loads them from parameters (`RESET_PC = 0x0000_0400`, per-core SP
+derived from `CORE_ID`). For a drop-in replacement, you need a small
+ROM shim that:
+
+1. Maps the lowest 8 bytes of physical memory to a boot ROM during the
+   first cycles after reset.
+2. Modifies `m68k_core.v`'s reset block to issue two reads from that
+   region before transitioning into `S_RUN` (or, equivalently, override
+   `RESET_PC` and the per-core SP via top-level wires sampled at reset).
+
+A minimal change in `m68k_core.v` would replace the reset constants with
+an `initial_pc_i` / `initial_sp_i` input, and a tiny external
+state machine in the bus converter would clock those values in from
+`mem[0]/mem[4]` before deasserting `rst`.
+
+### Clock and reset
+
+- This design is a single clock domain — feed it the same clock you'd
+  drive the 68000 with, except now you can run it much faster: simulated
+  CPI is 1.27–3.07 vs. the 68000's typical 6–11 cycles per instruction,
+  so the same external clock rate gives roughly **3.6×–6.4× more useful
+  work per second** before any frequency increase.
+- Reset is synchronous and active-high. Wrap it with an asynchronous-
+  assert / synchronous-deassert flop chain (a standard reset
+  synchroniser) to interface with `/RESET`.
+
+### ISA / behavioural gaps to close before drop-in
+
+Most real-world 68000 software hits these eventually:
+
+| feature                                  | status here                            | what you need to add                                 |
+|------------------------------------------|----------------------------------------|------------------------------------------------------|
+| `d8(An,Xn)` / `d8(PC,Xn)` indexed modes  | not decoded                            | add 4th regfile read port for the index register     |
+| ABCD / SBCD / NBCD                       | not decoded                            | BCD adder; rare in modern code, often skippable      |
+| ADDX / SUBX / NEGX                       | not decoded                            | multi-precision extend; usually only matters for >32-bit arithmetic |
+| MOVEP                                    | not decoded                            | byte-sequence peripheral access                      |
+| Bus error / address error                | not wired                              | trap vector 2 / 3; needs /BERR observation in converter |
+| Trace exception (vec 9)                  | not wired                              | check T-bit at instruction boundary                  |
+| Line A / Line F (vec 10 / 11)            | not wired                              | trap on `1010`/`1111` opcodes (the decoder already returns K_BAD; just retarget the vector) |
+| Vectored interrupts (non-autovector)     | not implemented                        | IACK bus cycle support in the converter; small core change to read vector number off D7..D0 |
+| `RESET` instruction                      | not decoded                            | mostly a no-op (asserts /RESET out); easy add        |
+| 16-bit external bus                      | core is 32-bit wide                    | serialisation in the bus converter (see above)       |
+| Canonical exception frame (6-byte short) | uses non-standard 8-byte frame         | rewrite push/pop in `S_EXC_*` and `RTE` to use `dc_be` byte enables |
+
+### FPGA targeting notes
+
+The design is small (estimated < 5K LUTs per core on a Xilinx 7-series
+device, dominated by the regfile and ALU) and has no inferred multi-
+clock paths, but it has not been timing-closed. Specific spots to
+expect closure work on:
+
+- The combinational L1 cache hit + EX writeback + ID forwarding mux
+  forms a long combinational chain. On modern FPGAs at ~100 MHz this
+  is usually fine; pushing higher needs a pipeline register inserted
+  somewhere on that path.
+- The combinational mispredict redirect from EX to IF is also long.
+  Same fix: pipeline it, accept a +1 cycle mispredict penalty.
+- The single-cycle 16×16 multiplier (`muls_ua32 = a * b`) is mapped
+  to DSP blocks by every vendor synthesis tool; no concerns there.
+
+For ASIC implementation, you would additionally need clock-gating
+insertion (the per-core core/cache pair is a natural domain), retiming
+across the writeback path, and bringing the regfile to a hardened SRAM
+macro instead of inferring it from registers.
+
+---
+
+## Performance benefits: what workloads benefit most
+
+The `vs_68k` column of the benchmark table is the ratio of canonical
+M68000 PRM cycles to our cycles for the same instruction stream — i.e.,
+how many fewer clock cycles this design takes to execute the same
+program on equivalent hardware. The wins come from three independent
+sources, and different workloads benefit from each by different amounts.
+
+### Where the speedup comes from
+
+```mermaid
+flowchart LR
+    subgraph WORKLOAD["Workload property"]
+        direction TB
+        W1[Sequential I-fetch]
+        W2[Repeated D-cache hits]
+        W3[Predictable backward branches]
+        W4[Independent register chains]
+        W5[Single-cycle 32-bit ALU]
+    end
+    subgraph OPT["Microarchitectural optimization"]
+        direction TB
+        O1[Streaming IF<br/>+ combinational hit]
+        O2[Write-through D-cache<br/>+ snoop coherence]
+        O3[BTFNT branch prediction]
+        O4[EX→ID forwarding<br/>zero-stall RAW]
+        O5[Single-cycle ALU<br/>vs. 68000's microcoded one]
+    end
+    W1 -- amortised over loop --> O1
+    W2 -- saves bus round-trip --> O2
+    W3 -- 1 mispredict per loop --> O3
+    W4 -- no stall on Dn=Dn+x --> O4
+    W5 -- 4–14× faster per op --> O5
+    O1 --> S[Sustained CPI ≈ 1<br/>on tight loops]
+    O2 --> S
+    O3 --> S
+    O4 --> S
+    O5 --> S
+```
+
+The real 68000 takes 4 cycles for `MOVE Dn,Dm`, 8 cycles for `ADD Dn,Dm`,
+8–10 cycles for `MOVE.L (An),Dn`, and 10 cycles for a taken `Bcc`.
+This core does each of those in 1 cycle on a cache hit. The arithmetic
+mean is around 8 cycles per simple instruction on the 68000 vs. 1 cycle
+here — that's the 6×–8× ceiling that workloads approach when everything
+goes right.
+
+### Workload-by-workload analysis
+
+Headline numbers:
+
+```
+benchmark   retired  68k_ref cpi_ref    fast cpi_fast    slow cpi_slow  vs_68k  vs_slow
+fib             105      718    6.84     133     1.27     338     3.22   5.40x    2.54x
+jsr             304     3334   10.97     934     3.07    1835     6.04   3.57x    1.96x
+memcopy         458     4286    9.36     888     1.94    1669     3.64   4.83x    1.88x
+sum             404     4034    9.99     632     1.56    1835     4.54   6.38x    2.90x
+```
+
+- **`sum` (6.38×)** — the **best-case** workload. Tight register-only
+  loop, all-backward branches (BTFNT correct ≈100%), no memory traffic
+  after warmup, zero load-use hazards. Sustained CPI 1.56 vs. 9.99 on
+  68000. Anything resembling this — ALU-bound inner loops, dot
+  products, integer summing, polynomial evaluation, simple hashing — sees
+  the same 5–6× speedup.
+- **`fib` (5.40×)** — close to `sum`. All registers, all backward
+  branches, no memory after warmup. Slightly worse CPI because of the
+  three-register-chain dependency that benefits less from forwarding.
+- **`memcopy` (4.83×)** — streaming `(An)+` loads/stores. Two of every
+  three bus accesses miss the cache (the line is 1 word so there's no
+  spatial reuse). The `vs_slow` column shows what the cache alone is
+  worth here (1.88×); the rest is pipelining and BTFNT.
+- **`jsr` (3.57×)** — the **worst-case** workload of the four. Every
+  JSR/RTS causes a pipeline flush (no return-address stack predictor),
+  every push/pop is a bus access, and the call/return overhead is most
+  of the cycle count. The 68000 also spends most of its cycles on
+  JSR/RTS, so the speedup is real but smaller. CPI 3.07 vs. 10.97.
+
+### What benefits and what doesn't
+
+**Benefits most (5–6×):**
+
+- Tight inner loops with backward branches (`Bcc.s loop` patterns).
+- Register-resident arithmetic — anything you can hold in D0–D7 across
+  the hot loop. Image processing kernels, FIR filters, encryption
+  inner loops, integer-only signal processing.
+- Streaming reads that exploit the 32-bit-wide load path even though
+  the line is only one word.
+- Small kernels that fit entirely in the 1 KB L1 caches.
+- Multi-core algorithms that synchronise rarely (the TAS lock pinning
+  is correct but serial; if every core hits it once per iteration, you
+  lose multi-core scaling).
+
+**Benefits least (3×, occasionally less):**
+
+- Subroutine-heavy code (`jsr`, recursion, dispatchers, virtual
+  function calls): no return-stack predictor, so every RTS flushes
+  the pipeline.
+- Indirect-branch-heavy code (`JMP (A0)`, jump tables, interpreter
+  loops): not predicted at all.
+- Working sets larger than 1 KB of code or 1 KB of data: conflict
+  misses on the direct-mapped caches start to dominate.
+- Long-latency operations that aren't natively single-cycle:
+  multi-precision arithmetic, BCD (when added), shifts with large
+  counts in the variable-shifter path.
+- Heavy TAS / shared-counter contention: the lock pin in the arbiter
+  serialises the RMW correctly but at one-RMW-per-cycle throughput.
+
+**Doesn't benefit at all:**
+
+- I/O-bound code: the bus is fast but external memory latency in real
+  hardware is the same as it would be on a 68000.
+- Code dominated by 32-bit multiplication or division: the
+  `MULU/MULS/DIVU/DIVS .W` ops are single-cycle here but the algorithm
+  itself was designed around the 70-cycle 68000 cost, so the
+  improvement looks like a 70× per-op speedup but contributes little
+  to overall runtime in typical code.
+
+### Implications for porting code
+
+If you have a body of 68000 assembly and you're considering this core
+as a replacement, the speedup you should expect depends on the
+**instruction mix**. As a back-of-the-envelope estimate, weight each
+instruction class by its frequency in the program:
+
+| class                                    | typical 68k cycles | our cycles (cache hit) | per-op speedup |
+|------------------------------------------|--------------------|------------------------|----------------|
+| Register-only ALU                        | 4–8                | 1                      | 4–8×           |
+| MOVE register-register                   | 4                  | 1                      | 4×             |
+| MOVE.L (An),Dn / Dn,(An)                 | 12–16              | 1 (cache hit)          | 12–16× hot      |
+| Conditional Bcc taken (predicted)        | 10                 | 1                      | 10×            |
+| Conditional Bcc not taken                | 8                  | 1                      | 8×             |
+| Bcc mispredicted                         | 10                 | 3                      | 3.3×           |
+| JSR abs.L                                | 18                 | ~5–7 (flush)           | ~3×            |
+| RTS                                      | 16                 | ~5 (flush + load)      | ~3×            |
+| MULU/MULS .W                             | 70 worst           | 1                      | 70×            |
+| TAS uncontended                          | 12                 | 2                      | 6×             |
+| TAS contended (N cores)                  | ~12·N              | ~2·N                   | 6×             |
+
+A program made of 70% register ALU, 20% memory references with locality,
+and 10% control flow lands around 5×. Pure dispatcher code (lots of
+JSR/RTS, lots of indirect jumps) lands around 3×. Pure inner loops
+with no memory traffic and predictable branches land at the 6× ceiling.
+
+---
+
 ## ISA implementation status
 
 This implementation is being expanded toward a complete 68000. The
@@ -817,30 +1272,36 @@ are decoded but not yet fully executed; see the table below.
 | immediate arithmetic (Dn dest)   | ADDI, SUBI, ANDI, ORI, EORI, CMPI                                 |
 | immediate quick                  | ADDQ, SUBQ                                                        |
 | single-operand (Dn dest)         | CLR, TST, NEG, NOT                                                |
+| single-operand (memory dest)     | CLR.{B,W,L} (write-only), TST.{B,W,L} (read-only), NEG.{B,W,L} / NOT.{B,W,L} (true RMW via S_RMW_W state) |
+| multi-register move              | MOVEM.L reglist↔-(An), MOVEM.L reglist↔(An)+, MOVEM.L reglist↔(An) (multi-cycle S_MOVEM iterator; regfile read port mux for store-MOVEM source) |
 | sign-extend / swap               | EXT.W, EXT.L, SWAP                                                |
 | register exchange                | EXG (D-D, A-A, D-A)                                               |
 | program control                  | Bcc, BRA, BSR, JMP, JSR, RTS, NOP, STOP                            |
-| address calculation              | LEA                                                               |
+| address calculation              | LEA, PEA                                                          |
 | atomic                           | TAS                                                               |
+| stack frame                      | LINK An,#disp16; UNLK An                                          |
+| shifts / rotates (Dn dest, .B/.W/.L) | ASL/ASR/LSL/LSR/ROL/ROR/ROXL/ROXR (immediate and register count) |
+| loop primitive                   | DBcc / DBRA (all 16 condition codes)                              |
+| set on condition (Dn dest)       | Scc.B (all 16 condition codes)                                    |
+| bit operations (Dn dest)         | BTST / BCHG / BCLR / BSET (static and dynamic bit number)         |
+| multiply / divide (.W)           | MULU.W, MULS.W, DIVU.W, DIVS.W                                    |
+| exception entry / return         | TRAP #N (vec 32+N); RTE; RTR; TRAPV (vec 7 when V); DIVU/DIVS by 0 (vec 5); ILLEGAL (vec 4); privilege violation (vec 8); CHK (vec 6) |
+| status-register access           | MOVE from SR, MOVE to CCR (non-priv); MOVE to SR (priv); ANDI/ORI/EORI to CCR/SR; MOVE An,USP / MOVE USP,An (priv) |
+| interrupts                       | autovector IRQs 1..7 (vec 24+N) via memory-mapped IRQ register at `$FFFF_FFFC` (== `$FFFC.W`); sr_i mask checked at instruction boundaries |
 
 ### Decoded but NOT yet executed
 
 Decoder maps these correctly; the EX stage either handles only register
-destinations or does not yet implement them at all. They are present so
-the assembler can emit them and the pipeline can dispatch them — but
-they will produce incorrect results until each EX case is filled in.
+destinations or does not yet implement them at all.
 
 | category                                | what works / what's missing                                |
 |-----------------------------------------|------------------------------------------------------------|
-| ALUI / CLR / TST / NEG / NOT to memory  | needs read-modify-write state (not yet wired)              |
-| LINK / UNLK / PEA                       | decoder only; EX stub                                      |
-| MOVEM                                   | decoder only; needs multi-cycle reg-mask iterator           |
-| Shifts and rotates (ASL/ASR/LSL/LSR/ROL/ROR/ROXL/ROXR) | ALU has the math; EX integration not yet wired |
-| Bit ops (BTST/BCHG/BCLR/BSET)           | decoder only; EX stub                                      |
-| DBcc, Scc, CHK                          | decoder only; EX stub                                      |
-| MULU / MULS / DIVU / DIVS               | decoder only; EX stub                                      |
-| MOVE to/from SR/CCR, MOVE USP           | decoder only; needs SR register and supervisor mode         |
-| TRAP, TRAPV, RTE, RTR, ILLEGAL          | decoder only; needs exception model                         |
+| ALUI to memory                          | Dn-dest OK; memory-dest needs RMW state                    |
+| Bit ops (BTST/BCHG/BCLR/BSET) to memory | Dn-dest OK; memory-dest needs RMW state                    |
+| Scc to memory                           | Dn-dest OK; memory-dest needs RMW state                    |
+| Shifts to memory (single-bit, .W)       | Dn-dest OK; memory-dest needs RMW state                    |
+| MOVEM.W                                 | only MOVEM.L implemented; .W word-size MOVEM needs byte-enable plumbing |
+| MOVEM.L with d16(An) / abs.* EA modes   | only predec/postinc/(An) supported (the common prologue/epilogue forms) |
 
 ### Not yet decoded
 
@@ -854,14 +1315,36 @@ they will produce incorrect results until each EX case is filled in.
 
 ### Architectural pieces still TODO for a real 68000
 
-- **Supervisor mode**: dual stack pointers (USP/SSP), S bit in SR,
-  privilege violation traps. None of this is wired up.
-- **Status register**: only the CCR low byte (N, Z, V, C, X) is tracked;
-  the upper byte (T, S, I0..I2) does not exist.
-- **Exception model**: no vector table at memory address 0, no
-  exception stack frame, no exception entry / RTE round-trip.
-- **Interrupts**: no IPL inputs to the core, no interrupt acknowledge
-  bus cycle.
+- **Status register**: SR is stored (T/S/I bits and CCR), composed
+  into a 16-bit view, set on reset to S=1/T=0/I=7, written by RTE,
+  saved on exception entry, and writable by MOVE-to-SR / ANDI / ORI /
+  EORI-to-SR (all privileged) and MOVE-to-CCR / ANDI / ORI / EORI-to-CCR
+  (non-privileged). MOVE-from-SR reads it into a Dn.
+- **Supervisor mode**: S bit and the USP/SSP shadow exist. TRAP and
+  RTE swap A7 ↔ usp_shadow on user/supervisor transitions.
+  MOVE-An-to-USP / MOVE-USP-to-An are wired (privileged).
+  Privilege violation traps are wired for RTE, MOVE-to-SR, MOVE-USP,
+  ANDI/ORI/EORI-to-SR when executed in user mode.
+- **Exception sources wired**: TRAP #N (vec 32+N), RTE, privilege
+  violation (vec 8), illegal opcode (vec 4), divide-by-zero (vec 5),
+  TRAPV (vec 7). All share the same multi-cycle exception sequencer
+  (`S_EXC_PUSH_PC` → `S_EXC_PUSH_SR` → `S_EXC_FETCH` → S_RUN).
+- **Exception frame**: the implementation uses a **non-standard 8-byte
+  frame** (32-bit SR push instead of canonical 16-bit) because the
+  data cache is 32-bit only for these states. RTE matches the same
+  frame format.
+- **Exception sources NOT yet wired**: trace (vec 9), line A (vec 10),
+  line F (vec 11), bus error / address error.
+- **Interrupts**: autovector IRQs 1..7 are wired. The `m68k_core`
+  exposes an `ipl_i[2:0]` input pin; an instruction-boundary check
+  asserts an exception with vector `24 + ipl_i` whenever
+  `ipl_i > sr_i`, sets `sr_i = ipl_i` on entry (masking same/lower
+  priorities), and saves the PC of the suppressed next instruction.
+  The `m68k_bus` provides a memory-mapped IRQ register at byte
+  address `$FFFF_FFFC` (== `$FFFC.W` after the 68000's sign-extension
+  of absolute-short): writing N latches `irq_level <= N` (sticky).
+  Handlers clear the source by writing 0 before RTE. **No vectored
+  IACK bus cycle** — only autovector.
 - **Reset vector from memory**: SP and PC are loaded from parameters,
   not from `mem[0]` and `mem[4]`.
 

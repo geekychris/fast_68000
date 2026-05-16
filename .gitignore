@@ -1,0 +1,9 @@
+build/
+build_fast/
+build_slow/
+build_trace/
+build_fast.log
+build_slow.log
+*.pyc
+__pycache__/
+.DS_Store

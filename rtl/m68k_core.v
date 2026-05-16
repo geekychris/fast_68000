@@ -24,6 +24,11 @@ module m68k_core #(
     input  wire        clk,
     input  wire        rst_n,
     input  wire [31:0] reset_a7,
+    // Pending interrupt level (0 = none, 1..7 = priority). When > sr_i,
+    // the CPU takes an autovector interrupt at the next instruction
+    // boundary (saved PC = address of suppressed next instruction, new
+    // sr_i = ipl_i so same/lower-priority IRQs are masked while servicing).
+    input  wire [2:0]  ipl_i,
 
     // I-cache port.
     output wire        ic_req,
@@ -100,10 +105,17 @@ module m68k_core #(
     localparam K_ILLEGAL = 6'd42;
 
     // EX state.
-    localparam S_RUN   = 2'd0;
-    localparam S_LOAD  = 2'd1;
-    localparam S_STORE = 2'd2;
-    localparam S_TASW  = 2'd3;
+    localparam S_RUN           = 4'd0;
+    localparam S_LOAD          = 4'd1;
+    localparam S_STORE         = 4'd2;
+    localparam S_TASW          = 4'd3;
+    localparam S_EXC_PUSH_PC   = 4'd4;  // push 32-bit PC at (SSP-4)
+    localparam S_EXC_PUSH_SR   = 4'd5;  // push 32-bit {0,SR} at (SSP-4)
+    localparam S_EXC_FETCH     = 4'd6;  // read 32-bit vector from (vec*4)
+    localparam S_RTE_POP_SR    = 4'd7;  // pop 32-bit SR (low 16 used)
+    localparam S_RTE_POP_PC    = 4'd8;  // pop 32-bit PC
+    localparam S_RMW_W         = 4'd9;  // RMW write phase (NEG/NOT to memory)
+    localparam S_MOVEM         = 4'd10; // MOVEM register-list iterator
 
     // Helpful pure functions on byte position within a 32-bit word.
     function [3:0] be_for_byte;
@@ -141,6 +153,21 @@ module m68k_core #(
             endcase
         end
     endfunction
+    // Word-position byte enables (for .W writes at a given 16-bit offset).
+    // 68000 word accesses must be even-aligned; we honor that with addr[1].
+    function [3:0] be_for_word;
+        input ahalf;   // addr[1]: 0 = high half (bytes 0..1), 1 = low half (2..3)
+        begin
+            be_for_word = ahalf ? 4'b0011 : 4'b1100;
+        end
+    endfunction
+    function [31:0] word_into_word;
+        input [15:0] w;
+        input        ahalf;
+        begin
+            word_into_word = ahalf ? {16'd0, w} : {w, 16'd0};
+        end
+    endfunction
     function [3:0] reg_idx_of_ea;
         input [2:0] m;
         input [2:0] r;
@@ -148,7 +175,9 @@ module m68k_core #(
             case (m)
                 `EA_DREG: reg_idx_of_ea = {1'b0, r};
                 `EA_AREG: reg_idx_of_ea = {1'b1, r};
-                `EA_AIND, `EA_AINC, `EA_ADEC: reg_idx_of_ea = {1'b1, r};
+                // All An-relative modes use the An register on a regfile port.
+                `EA_AIND, `EA_AINC, `EA_ADEC,
+                `EA_DISP, `EA_IDX: reg_idx_of_ea = {1'b1, r};
                 default: reg_idx_of_ea = 4'd0;
             endcase
         end
@@ -402,6 +431,13 @@ module m68k_core #(
         ? {{16{id_ext[0][15]}}, id_ext[0]}
         : {id_ext[0], id_ext[1]};
 
+    // STOP #imm is the only instruction whose halt-code immediate is sourced
+    // from an extension word rather than encoded in the opcode; route the
+    // ext-word imm into ex_imm_raw for that kind, and the decoder's static
+    // imm field (TRAP vector, MOVEQ data, ADDQ count, etc.) for everything
+    // else.
+    wire [31:0] id_imm_eff = (idec_kind == K_STOP) ? id_src_imm32 : idec_imm;
+
     wire [15:0] id_dst_e0 = id_ext[idec_src_ext_words];
     wire [15:0] id_dst_e1 = id_ext[idec_src_ext_words + 2'd1];
     wire [31:0] id_dst_imm32 = (idec_dst_ext_words == 2'd1)
@@ -421,7 +457,7 @@ module m68k_core #(
             K_MULU, K_MULS, K_DIVU, K_DIVS,
             K_BIT, K_SHIFT, K_EXG, K_CHK:        id_rb_idx = id_reg_idx_full;
             K_MOVE, K_MOVEA:                     id_rb_idx = id_dst_base_idx;
-            K_ALUI:                              id_rb_idx = {1'b0, idec_dst_reg};
+            K_ALUI:                              id_rb_idx = {idec_dst_mode != `EA_DREG, idec_dst_reg};
             K_DBCC:                              id_rb_idx = {1'b0, idec_src_reg};
             default:                             id_rb_idx = 4'd0;
         endcase
@@ -439,11 +475,18 @@ module m68k_core #(
     reg  [3:0]  wb_aux_idx;
     reg  [31:0] wb_aux_data;
 
+    // MOVEM register-iterator state lives further down; here we just declare
+    // forward wires so the regfile's `ra_idx` can be muxed to point at the
+    // current MOVEM register during store-MOVEM transfers.
+    wire movem_active;
+    wire [3:0] movem_curr_reg_full;
+    wire [3:0] rf_ra_idx_eff = movem_active ? movem_curr_reg_full : id_ra_idx;
+
     m68k_regfile u_rf (
         .clk      (clk),
         .rst_n    (rst_n),
         .reset_a7 (reset_a7),
-        .ra_idx   (id_ra_idx),
+        .ra_idx   (rf_ra_idx_eff),
         .ra_data  (rf_ra_data),
         .rb_idx   (id_rb_idx),
         .rb_data  (rf_rb_data),
@@ -542,7 +585,7 @@ module m68k_core #(
             ex_src_imm32   <= id_src_imm32;
             ex_dst_imm32   <= id_dst_imm32;
             ex_branch_imm  <= id_branch_imm;
-            ex_imm_raw     <= idec_imm;
+            ex_imm_raw     <= id_imm_eff;
             ex_cc          <= idec_cc;
             ex_ra          <= id_ra_fwd;
             ex_rb          <= id_rb_fwd;
@@ -654,9 +697,102 @@ module m68k_core #(
     end
 
     reg cc_n, cc_z, cc_v, cc_c, cc_x;
-    reg [1:0] ex_state;
+
+    // Status-register bits beyond the CCR. The lower byte of SR is the CCR
+    // (X,N,Z,V,C). The upper byte holds T (trace), S (supervisor) and
+    // I[2:0] (interrupt-mask priority).
+    reg        sr_s;
+    reg        sr_t;
+    reg  [2:0] sr_i;
+
+    // Shadow stack pointer: holds the inactive SP. When sr_s==1, regfile[A7]
+    // is the SSP and usp_shadow holds the saved USP. When sr_s==0, regfile[A7]
+    // is the USP and usp_shadow holds the saved SSP. The shadow is swapped
+    // with A7 on user/supervisor transitions via TRAP/RTE/MOVE-USP.
+    reg [31:0] usp_shadow;
+
+    // 16-bit SR view (combinational).
+    wire [15:0] sr_now = {sr_t, 1'b0, sr_s, 2'b00, sr_i, 3'b000,
+                          cc_x, cc_n, cc_z, cc_v, cc_c};
+
+    reg [3:0] ex_state;
 
     reg [31:0] ex_tas_word;  // word read in TAS phase 0
+    reg [31:0] ex_exc_saved_pc;
+    reg [15:0] ex_exc_saved_sr;
+    reg  [7:0] ex_exc_vector;
+    reg        ex_exc_was_user; // 1 if we were in user mode entering this exception
+    reg [31:0] working_sp;      // SP being incremented/decremented during exc/rte
+    reg  [2:0] ex_exc_new_sri;  // new sr_i to install after entry (==ipl for IRQ)
+
+    // MOVEM iterator state.
+    reg [15:0] movem_mask;       // remaining bits to process (LSB-first)
+    reg  [4:0] movem_idx;        // current bit position (0..15; 16 = done)
+    reg [31:0] movem_addr;       // current An ("address pointer" tracked per step)
+    reg        movem_busy;       // 1 = bus transaction outstanding
+    reg        movem_dir;        // 0 = regs->mem, 1 = mem->regs
+    reg        movem_predec;     // 1 if EA was -(An)
+    reg        movem_an_update;  // 1 if predec or postinc (commit final An)
+    reg  [2:0] movem_an_idx;     // An register index for final commit
+
+
+    // MULS 16x16 -> 32 signed multiplication. Done manually as |a| * |b|
+    // with sign adjustment. The 16-bit absolute value is computed at 16-bit
+    // width and then zero-extended to 32 bits; using 32-bit negation on a
+    // zero-extended operand would produce the 32-bit twos-complement value
+    // (e.g. -0x0000FFFD = 0xFFFF0003), which corrupts the multiplication.
+    wire [15:0] muls_a_abs16  = ex_rb[15]       ? (16'd0 - ex_rb[15:0])       : ex_rb[15:0];
+    wire [15:0] muls_b_abs16  = src_operand[15] ? (16'd0 - src_operand[15:0]) : src_operand[15:0];
+    wire [15:0] muls_bm_abs16 = dc_rdata[15]    ? (16'd0 - dc_rdata[15:0])    : dc_rdata[15:0];
+    wire [31:0] muls_ua32 = {16'd0, muls_a_abs16} * {16'd0, muls_b_abs16};
+    wire [31:0] muls_um32 = {16'd0, muls_a_abs16} * {16'd0, muls_bm_abs16};
+    wire [31:0] muls_y_signed     =
+        (ex_rb[15] ^ src_operand[15]) ? (32'd0 - muls_ua32) : muls_ua32;
+    wire [31:0] muls_y_signed_mem =
+        (ex_rb[15] ^ dc_rdata[15])    ? (32'd0 - muls_um32) : muls_um32;
+
+    // DIVS 32/16 -> {rem[15:0], quot[15:0]} signed division, computed
+    // manually: take absolute values, do unsigned division, then apply sign
+    // adjustments. Quotient sign = XOR of operand signs; remainder sign
+    // matches dividend.
+    wire        divs_dividend_neg = ex_rb[31];
+    wire [31:0] divs_a_abs = divs_dividend_neg ? (32'd0 - ex_rb) : ex_rb;
+    wire        divs_divisor_neg     = src_operand[15];
+    wire        divs_divisor_neg_mem = dc_rdata[15];
+    wire [31:0] divs_b_abs     = divs_divisor_neg     ? {16'd0, (16'd0 - src_operand[15:0])} : {16'd0, src_operand[15:0]};
+    wire [31:0] divs_b_abs_mem = divs_divisor_neg_mem ? {16'd0, (16'd0 - dc_rdata[15:0])}    : {16'd0, dc_rdata[15:0]};
+    wire [31:0] divs_uq     = divs_a_abs / divs_b_abs;
+    wire [31:0] divs_ur     = divs_a_abs % divs_b_abs;
+    wire [31:0] divs_uq_mem = divs_a_abs / divs_b_abs_mem;
+    wire [31:0] divs_ur_mem = divs_a_abs % divs_b_abs_mem;
+    wire [15:0] divs_q     = (divs_dividend_neg ^ divs_divisor_neg)     ? (16'd0 - divs_uq[15:0])     : divs_uq[15:0];
+    wire [15:0] divs_r     =  divs_dividend_neg                          ? (16'd0 - divs_ur[15:0])     : divs_ur[15:0];
+    wire [15:0] divs_q_mem = (divs_dividend_neg ^ divs_divisor_neg_mem) ? (16'd0 - divs_uq_mem[15:0]) : divs_uq_mem[15:0];
+    wire [15:0] divs_r_mem =  divs_dividend_neg                          ? (16'd0 - divs_ur_mem[15:0]) : divs_ur_mem[15:0];
+    wire [31:0] divs_y     = {divs_r,     divs_q};
+    wire [31:0] divs_y_mem = {divs_r_mem, divs_q_mem};
+
+    // K_BIT operand selection: for dynamic, destination read via ex_ra (src_base m3/r0)
+    // and bit-count register read via ex_rb (reg_idx_full = r9). For static, the
+    // destination is read via ex_rb (reg_idx_full = r9 — matches r0 when the asm
+    // encoding has r9==r0; the test ensures this).
+    wire [31:0] bit_dest_val = ex_shift_dyn ? ex_ra : ex_rb;
+    wire [4:0]  bit_n        = ex_shift_dyn ? ex_rb[4:0] : ex_src_imm32[4:0];
+
+    assign movem_active = (ex_state == S_MOVEM);
+    // For predec mode the mask is bit-reversed (mask[0]=A7, mask[15]=D0); for
+    // every other mode mask[0]=D0, mask[15]=A7. movem_idx is the bit position
+    // currently under consideration.
+    assign movem_curr_reg_full = movem_predec ? (4'd15 - movem_idx[3:0])
+                                              :  movem_idx[3:0];
+    // Address used for the current step's bus transaction. Predec uses an
+    // address one step below the tracked An (the An is decremented along with
+    // the transfer); other modes use the tracked address directly.
+    wire [31:0] movem_step_addr = movem_predec ? (movem_addr - 32'd4) : movem_addr;
+    // Combinational signal: the current bus step has just acked. Used to gate
+    // intermediate regfile writes (for load-MOVEM) without going through
+    // is_settled (which only fires at end-of-instruction).
+    wire movem_step_commit = movem_active && movem_busy && dc_ack && ex_valid && !halted;
 
     // Plan signals for this cycle.
     reg        want_mem;
@@ -669,6 +805,25 @@ module m68k_core #(
     reg        wb_main_we_c;
     reg [3:0]  wb_main_idx_c;
     reg [31:0] wb_main_data_c;
+    reg [1:0]  wb_main_size_c;
+
+    // Exception-launch (combinational): asserted in S_RUN to ask the sequential
+    // block to start the exception entry sequence with the given vector and
+    // saved-PC. Used by TRAP, illegal opcode, divide-by-zero, TRAPV, priv-vio,
+    // and pending IRQ. For IRQ, exc_is_irq_c is also set so the sequential
+    // block can install the new sr_i (==ipl_i) on entry.
+    reg        exc_launch_c;
+    reg        exc_is_irq_c;
+    reg  [7:0] exc_vector_c;
+    reg [31:0] exc_saved_pc_c;
+
+    // Combinational SR writeback (for MOVE-to-SR, ANDI/ORI/EORI to SR/CCR, etc.).
+    // Setting sr_we_c installs sr_data_c into the SR bits on the settled cycle.
+    reg        sr_we_c;
+    reg [15:0] sr_data_c;
+    // Combinational USP write (for MOVE An,USP in supervisor mode).
+    reg        usp_we_c;
+    reg [31:0] usp_data_c;
 
     reg        wb_aux_we_c;
     reg [3:0]  wb_aux_idx_c;
@@ -711,13 +866,35 @@ module m68k_core #(
     // Settlement conditions: when the current EX-stage instruction completes
     // its work this cycle, downstream effects (regfile writeback, CCR commit,
     // branch redirect) take effect and the pipeline can advance.
-    wire is_settled_in_run     = (ex_state == S_RUN) && !want_mem && ex_valid && !halted;
+    // When any exception is being launched in S_RUN, or an RTE / RTR / MOVEM
+    // is starting up its multi-cycle sequence in S_RUN, S_RUN is NOT a
+    // settled state: those instructions only settle when the final bus
+    // transaction completes (see is_settled_after_exc / _after_rte /
+    // _after_movem).
+    wire run_launches_exc = (ex_state == S_RUN) && ex_valid && !halted &&
+                            (exc_launch_c ||
+                             ((ex_kind == K_RTE) && sr_s) ||
+                             (ex_kind == K_RTR) ||
+                             (ex_kind == K_MOVEM));
+    wire is_settled_in_run     = (ex_state == S_RUN) && !want_mem && !run_launches_exc &&
+                                 ex_valid && !halted;
+    wire load_starts_rmw = (ex_kind == K_NEG) || (ex_kind == K_NOT);
     wire is_settled_after_load = (ex_state == S_LOAD)  && dc_ack &&
-                                 ex_valid && !halted && (ex_kind != K_TAS);
+                                 ex_valid && !halted && (ex_kind != K_TAS) &&
+                                 !(load_starts_rmw && (ex_src_mode != `EA_DREG));
     wire is_settled_after_store= (ex_state == S_STORE) && dc_ack && ex_valid && !halted;
     wire is_settled_after_tasw = (ex_state == S_TASW)  && dc_ack && ex_valid && !halted;
+    wire is_settled_after_exc  = (ex_state == S_EXC_FETCH) && dc_ack && ex_valid && !halted;
+    wire is_settled_after_rte  = (ex_state == S_RTE_POP_PC) && dc_ack && ex_valid && !halted;
+    wire is_settled_after_rmw  = (ex_state == S_RMW_W) && dc_ack && ex_valid && !halted;
+    // MOVEM settles only when the mask is fully exhausted AND we are not
+    // mid-transaction (so the final An commit happens cleanly).
+    wire is_settled_after_movem = movem_active && !movem_busy &&
+                                  (movem_mask == 16'd0) && ex_valid && !halted;
     wire is_settled = is_settled_in_run || is_settled_after_load ||
-                      is_settled_after_store || is_settled_after_tasw;
+                      is_settled_after_store || is_settled_after_tasw ||
+                      is_settled_after_exc || is_settled_after_rte ||
+                      is_settled_after_rmw || is_settled_after_movem;
 
     assign stall = ex_valid && !halted && !is_settled;
 
@@ -727,11 +904,39 @@ module m68k_core #(
     wire stop_now      = ex_valid && (ex_kind == K_STOP) && (ex_state == S_RUN) && !halted;
     wire bcc_mispred   = is_settled && (ex_kind == K_BCC) && (ex_predicted_taken != take_branch_c);
     wire other_branch  = is_settled && (ex_kind != K_BCC) && take_branch_c;
-    assign redirect_valid = bcc_mispred || other_branch || stop_now;
-    assign redirect_pc    = stop_now ? ex_pc :
+    wire exc_redirect  = is_settled_after_exc || is_settled_after_rte;
+    assign redirect_valid = bcc_mispred || other_branch || stop_now || exc_redirect;
+    assign redirect_pc    = exc_redirect ? dc_rdata :
+                            stop_now ? ex_pc :
                             (ex_kind == K_BCC)
                               ? (take_branch_c ? (ex_pc + 32'd2 + ex_branch_imm) : ex_pc_next)
                               : take_branch_target_c;
+
+    // Evaluate one of the 16 condition codes against current CCR bits.
+    function cond_true;
+        input [3:0] cc;
+        begin
+            case (cc)
+                `CC_T:  cond_true = 1'b1;
+                `CC_F:  cond_true = 1'b0;
+                `CC_HI: cond_true = !cc_c && !cc_z;
+                `CC_LS: cond_true =  cc_c ||  cc_z;
+                `CC_CC: cond_true = !cc_c;
+                `CC_CS: cond_true =  cc_c;
+                `CC_NE: cond_true = !cc_z;
+                `CC_EQ: cond_true =  cc_z;
+                `CC_VC: cond_true = !cc_v;
+                `CC_VS: cond_true =  cc_v;
+                `CC_PL: cond_true = !cc_n;
+                `CC_MI: cond_true =  cc_n;
+                `CC_GE: cond_true = (cc_n &&  cc_v) || (!cc_n && !cc_v);
+                `CC_LT: cond_true = (cc_n && !cc_v) || (!cc_n &&  cc_v);
+                `CC_GT: cond_true = !cc_z && ((cc_n && cc_v) || (!cc_n && !cc_v));
+                `CC_LE: cond_true =  cc_z || (cc_n && !cc_v) || (!cc_n && cc_v);
+                default: cond_true = 1'b0;
+            endcase
+        end
+    endfunction
 
     // Big planning block — computes wb_*_c, cc_*_c, want_mem etc. based on
     // ex_state and ex_kind.
@@ -749,6 +954,15 @@ module m68k_core #(
         alu_op_c = `ALU_MOV;
         alu_size_c = ex_size;
         alu_shamt_c = 6'd0;
+        wb_main_size_c = ex_size;
+        exc_launch_c = 1'b0;
+        exc_is_irq_c = 1'b0;
+        exc_vector_c = 8'd0;
+        exc_saved_pc_c = ex_pc;
+        sr_we_c = 1'b0;
+        sr_data_c = 16'd0;
+        usp_we_c = 1'b0;
+        usp_data_c = 32'd0;
 
         if (!ex_valid || halted) ;
         else case (ex_state)
@@ -876,7 +1090,8 @@ module m68k_core #(
                     // ----------------------------------------------------
                     K_ALUI: begin
                         // src is immediate (in ex_src_imm32); dst is the EA from
-                        // dst_mode/dst_reg. We support Dn destinations here.
+                        // dst_mode/dst_reg. We support Dn destinations and the
+                        // special "CCR/SR" destination encoded as dst_mode=3'b110.
                         if (ex_dst_mode == `EA_DREG) begin
                             alu_op_c = ex_alu_op;
                             alu_a = ex_rb;            // Dn destination value
@@ -890,6 +1105,34 @@ module m68k_core #(
                                 wb_main_we_c  = 1'b1;
                                 wb_main_idx_c = {1'b0, ex_dst_reg};
                                 wb_main_data_c = alu_y;
+                            end
+                        end else if (ex_dst_mode == 3'b110) begin
+                            // ANDI/ORI/EORI to CCR (dst_reg=0) or SR (dst_reg=1).
+                            // SR variant is privileged.
+                            if (ex_dst_reg == 3'b001 && !sr_s) begin
+                                exc_launch_c   = 1'b1;
+                                exc_vector_c   = 8'd`VEC_PRIV_VIO;
+                                exc_saved_pc_c = ex_pc;
+                            end else begin
+                                sr_we_c = 1'b1;
+                                if (ex_dst_reg == 3'b000) begin
+                                    // CCR variant: source is 8 bits, only CCR
+                                    // byte changes; upper byte of SR untouched.
+                                    case (ex_alu_op)
+                                        `ALU_AND: sr_data_c = {sr_now[15:8], sr_now[7:0] & ex_src_imm32[7:0]};
+                                        `ALU_OR:  sr_data_c = {sr_now[15:8], sr_now[7:0] | ex_src_imm32[7:0]};
+                                        `ALU_EOR: sr_data_c = {sr_now[15:8], sr_now[7:0] ^ ex_src_imm32[7:0]};
+                                        default:  sr_data_c = sr_now;
+                                    endcase
+                                end else begin
+                                    // SR variant: source is 16 bits.
+                                    case (ex_alu_op)
+                                        `ALU_AND: sr_data_c = sr_now & ex_src_imm32[15:0];
+                                        `ALU_OR:  sr_data_c = sr_now | ex_src_imm32[15:0];
+                                        `ALU_EOR: sr_data_c = sr_now ^ ex_src_imm32[15:0];
+                                        default:  sr_data_c = sr_now;
+                                    endcase
+                                end
                             end
                         end
                         // ALUI to memory: would need RMW; not implemented.
@@ -921,6 +1164,24 @@ module m68k_core #(
                             wb_main_data_c = 32'd0;
                             cc_we_c = 1'b1;
                             cc_z_c = 1'b1;
+                        end else if (src_needs_mem) begin
+                            // CLR <ea>: write 0 to memory with size-appropriate
+                            // byte enables. No read needed (CCR is always
+                            // Z=1, N=V=C=0 regardless of prior value).
+                            want_mem = 1'b1; want_we = 1'b1;
+                            want_addr = src_ea;
+                            want_wdata = 32'd0;
+                            case (ex_size)
+                                `SZ_B: want_be = be_for_byte(src_ea[1:0]);
+                                `SZ_W: want_be = be_for_word(src_ea[1]);
+                                default: want_be = 4'b1111;
+                            endcase
+                            if (src_an_update) begin
+                                wb_aux_we_c   = 1'b1;
+                                wb_aux_idx_c  = {1'b1, ex_src_reg};
+                                wb_aux_data_c = src_an_next;
+                            end
+                            // CCR commit in S_STORE.
                         end
                     end
                     K_TST: begin
@@ -930,8 +1191,17 @@ module m68k_core #(
                             alu_size_c = ex_size;
                             cc_we_c = 1'b1;
                             cc_n_c = alu_n; cc_z_c = alu_z;
+                        end else begin
+                            // Memory TST: issue a load; CCR set in S_LOAD ack.
+                            want_mem = 1'b1; want_we = 1'b0;
+                            want_addr = src_ea;
+                            want_be   = 4'b1111;
+                            if (src_an_update) begin
+                                wb_aux_we_c   = 1'b1;
+                                wb_aux_idx_c  = {1'b1, ex_src_reg};
+                                wb_aux_data_c = src_an_next;
+                            end
                         end
-                        // Memory TST: would need load; not implemented.
                     end
                     K_NEG, K_NOT: begin
                         if (ex_src_mode == `EA_DREG) begin
@@ -945,6 +1215,18 @@ module m68k_core #(
                             wb_main_we_c   = 1'b1;
                             wb_main_idx_c  = {1'b0, ex_src_reg};
                             wb_main_data_c = alu_y;
+                        end else if (src_needs_mem) begin
+                            // Memory NEG/NOT: read-modify-write. Issue load
+                            // here; S_LOAD will drive the ALU with rdata and
+                            // start the write into S_RMW_W.
+                            want_mem = 1'b1; want_we = 1'b0;
+                            want_addr = src_ea;
+                            want_be   = 4'b1111;
+                            if (src_an_update) begin
+                                wb_aux_we_c   = 1'b1;
+                                wb_aux_idx_c  = {1'b1, ex_src_reg};
+                                wb_aux_data_c = src_an_next;
+                            end
                         end
                     end
                     K_EXT: begin
@@ -978,12 +1260,381 @@ module m68k_core #(
                         wb_aux_data_c  = ex_rb;
                     end
                     K_DBCC: begin
-                        // Test cc first. If TRUE: fall through. If FALSE: decrement
-                        // Dn[15:0]; branch unless result is -1.
-                        // (We approximate Dn[15:0] using ex_ra[15:0].)
+                        // Evaluate condition (same as Bcc). If TRUE: fall through.
+                        // If FALSE: decrement Dn[15:0]; branch unless result == -1.
+                        // The Dn register is read via rb (we set rb_idx accordingly in ID).
+                        case (ex_cc)
+                            `CC_T:  take_branch_c = 1'b1;     // dbt: cond always TRUE -> no decrement
+                            `CC_F:  take_branch_c = 1'b0;     // dbra: never TRUE -> always decrement
+                            `CC_HI: take_branch_c = !cc_c && !cc_z;
+                            `CC_LS: take_branch_c =  cc_c ||  cc_z;
+                            `CC_CC: take_branch_c = !cc_c;
+                            `CC_CS: take_branch_c =  cc_c;
+                            `CC_NE: take_branch_c = !cc_z;
+                            `CC_EQ: take_branch_c =  cc_z;
+                            `CC_VC: take_branch_c = !cc_v;
+                            `CC_VS: take_branch_c =  cc_v;
+                            `CC_PL: take_branch_c = !cc_n;
+                            `CC_MI: take_branch_c =  cc_n;
+                            `CC_GE: take_branch_c = (cc_n &&  cc_v) || (!cc_n && !cc_v);
+                            `CC_LT: take_branch_c = (cc_n && !cc_v) || (!cc_n &&  cc_v);
+                            `CC_GT: take_branch_c = !cc_z && ((cc_n && cc_v) || (!cc_n && !cc_v));
+                            `CC_LE: take_branch_c =  cc_z || (cc_n && !cc_v) || (!cc_n && cc_v);
+                            default: ;
+                        endcase
+                        // Note: for DBcc we use take_branch_c here as the COND result;
+                        // we re-purpose the redirect logic below.
+                        if (!take_branch_c) begin
+                            // Cond false -> decrement Dn.W
+                            wb_main_we_c   = 1'b1;
+                            wb_main_idx_c  = {1'b0, ex_src_reg};
+                            wb_main_data_c = {ex_rb[31:16], ex_rb[15:0] - 16'd1};
+                            wb_main_size_c = `SZ_W;
+                            // Branch if result != -1 (i.e., ex_rb[15:0] != 0 before dec)
+                            if (ex_rb[15:0] != 16'd0) begin
+                                take_branch_c = 1'b1;    // tell redirect logic to take branch
+                                take_branch_target_c = ex_pc + 32'd2 + ex_branch_imm;
+                            end
+                            // else fall through (take_branch_c stays 0)
+                        end else begin
+                            // Cond true -> fall through (no decrement, no branch).
+                            take_branch_c = 1'b0;
+                        end
+                    end
+                    K_SHIFT: begin
+                        // Register-form shift: src is Dn (read via ra). Count is either
+                        // an immediate (ex_shift_count, 0→8) or a register (ex_rb low 6 bits).
+                        alu_op_c    = ex_alu_op;
+                        alu_b       = ex_ra;
+                        alu_size_c  = ex_size;
+                        alu_shamt_c = ex_shift_dyn
+                                       ? ex_rb[5:0]
+                                       : ((ex_shift_count == 4'd0) ? 6'd8 : {2'b00, ex_shift_count[2:0]});
+                        cc_we_c    = 1'b1;
+                        cc_x_we_c  = (alu_shamt_c != 6'd0);
+                        cc_n_c = alu_n; cc_z_c = alu_z; cc_v_c = alu_v;
+                        cc_c_c = alu_c; cc_x_c = alu_x;
+                        wb_main_we_c   = 1'b1;
+                        wb_main_idx_c  = {1'b0, ex_src_reg};
+                        wb_main_data_c = alu_y;
+                    end
+                    K_LINK: begin
+                        // Push An, set An = SP-4, SP = SP-4 + disp16.
+                        want_mem  = 1'b1; want_we = 1'b1;
+                        want_addr = ex_sp - 32'd4;
+                        want_wdata = ex_ra;
+                        want_be    = 4'b1111;
+                    end
+                    K_UNLK: begin
+                        // SP = An; An = (SP)+; effectively load new An from mem[An], SP = An+4.
+                        want_mem  = 1'b1; want_we = 1'b0;
+                        want_addr = ex_ra;
+                        want_be   = 4'b1111;
+                    end
+                    K_PEA: begin
+                        // Push the EA itself (computed in src_ea) onto the stack.
+                        want_mem  = 1'b1; want_we = 1'b1;
+                        want_addr = ex_sp - 32'd4;
+                        want_wdata = src_ea;
+                        want_be    = 4'b1111;
+                    end
+                    K_MULU, K_MULS: begin
+                        // 16x16 -> 32. Destination is Dx (reg_idx_full, in ex_rb).
+                        // Source is .W from EA: register operand in src_operand[15:0]
+                        // for Dn source, or a memory load otherwise.
+                        if (src_needs_mem) begin
+                            want_mem = 1'b1; want_we = 1'b0;
+                            want_addr = src_ea;
+                            want_be   = 4'b1111;
+                            if (src_an_update) begin
+                                wb_aux_we_c   = 1'b1;
+                                wb_aux_idx_c  = {1'b1, ex_src_reg};
+                                wb_aux_data_c = src_an_next;
+                            end
+                        end else begin
+                            // Compute now.
+                            cc_we_c = 1'b1;
+                            wb_main_we_c   = 1'b1;
+                            wb_main_idx_c  = ex_reg_idx_full;
+                            wb_main_size_c = `SZ_L;
+                            if (ex_kind == K_MULU) begin
+                                wb_main_data_c = {16'd0, ex_rb[15:0]} *
+                                                 {16'd0, src_operand[15:0]};
+                            end else begin
+                                wb_main_data_c = muls_y_signed;
+                            end
+                            cc_n_c = wb_main_data_c[31];
+                            cc_z_c = (wb_main_data_c == 32'd0);
+                            cc_v_c = 1'b0;
+                            cc_c_c = 1'b0;
+                        end
+                    end
+                    K_DIVU, K_DIVS: begin
+                        // 32 / 16 -> {rem[31:16], quot[15:0]}. Dx is the dividend (.L).
+                        if (src_needs_mem) begin
+                            want_mem = 1'b1; want_we = 1'b0;
+                            want_addr = src_ea;
+                            want_be   = 4'b1111;
+                            if (src_an_update) begin
+                                wb_aux_we_c   = 1'b1;
+                                wb_aux_idx_c  = {1'b1, ex_src_reg};
+                                wb_aux_data_c = src_an_next;
+                            end
+                        end else begin
+                            if (src_operand[15:0] == 16'd0) begin
+                                exc_launch_c   = 1'b1;
+                                exc_vector_c   = 8'd`VEC_DIV_ZERO;
+                                exc_saved_pc_c = ex_pc_next;
+                            end else if (ex_kind == K_DIVU) begin
+                                cc_we_c = 1'b1;
+                                wb_main_we_c   = 1'b1;
+                                wb_main_idx_c  = ex_reg_idx_full;
+                                wb_main_size_c = `SZ_L;
+                                wb_main_data_c = (((ex_rb % {16'd0, src_operand[15:0]}) & 32'h0000FFFF) << 16)
+                                               |  ((ex_rb / {16'd0, src_operand[15:0]}) & 32'h0000FFFF);
+                                cc_n_c = wb_main_data_c[15];
+                                cc_z_c = (wb_main_data_c[15:0] == 16'd0);
+                                cc_v_c = 1'b0;
+                                cc_c_c = 1'b0;
+                            end else begin
+                                // DIVS: signed 32 / signed 16 (manual sign handling)
+                                cc_we_c = 1'b1;
+                                wb_main_we_c   = 1'b1;
+                                wb_main_idx_c  = ex_reg_idx_full;
+                                wb_main_size_c = `SZ_L;
+                                wb_main_data_c = divs_y;
+                                cc_n_c = wb_main_data_c[15];
+                                cc_z_c = (wb_main_data_c[15:0] == 16'd0);
+                                cc_v_c = 1'b0;
+                                cc_c_c = 1'b0;
+                            end
+                        end
+                    end
+                    K_BIT: begin
+                        // BTST/BCHG/BCLR/BSET. For Dn dest: 32-bit position (mod 32).
+                        // Static: bit pos in ex_src_imm32, destination read via ex_rb (reg_idx_full).
+                        // Dynamic: bit pos in Dr (read via ex_rb=reg_idx_full),
+                        //          destination read via ex_ra (src_base m3/r0).
+                        if (ex_dst_mode == `EA_DREG) begin
+                            cc_we_c = 1'b1;
+                            cc_n_c = cc_n; cc_v_c = cc_v; cc_c_c = cc_c; // unchanged
+                            cc_z_c = !bit_dest_val[bit_n];
+                            if (ex_alu_op != 5'd0) begin
+                                wb_main_we_c   = 1'b1;
+                                wb_main_idx_c  = {1'b0, ex_dst_reg};
+                                wb_main_size_c = `SZ_L;
+                                case (ex_alu_op[1:0])
+                                    2'b01: wb_main_data_c = bit_dest_val ^ (32'd1 << bit_n); // BCHG
+                                    2'b10: wb_main_data_c = bit_dest_val & ~(32'd1 << bit_n); // BCLR
+                                    2'b11: wb_main_data_c = bit_dest_val |  (32'd1 << bit_n); // BSET
+                                    default: wb_main_data_c = bit_dest_val;
+                                endcase
+                            end
+                        end
+                        // Memory bit ops: would need RMW for BCHG/BCLR/BSET (or simple
+                        // load for BTST); not implemented.
+                    end
+                    K_SCC: begin
+                        // Scc <ea>.B: write 0xFF if cond true, else 0x00. We support Dn dest.
+                        if (ex_src_mode == `EA_DREG) begin
+                            wb_main_we_c   = 1'b1;
+                            wb_main_idx_c  = {1'b0, ex_src_reg};
+                            wb_main_size_c = `SZ_B;
+                            wb_main_data_c = {24'd0, {8{cond_true(ex_cc)}}};
+                        end
+                    end
+                    K_TRAP: begin
+                        // TRAP #N takes vector 32+N, saves the return PC.
+                        exc_launch_c   = 1'b1;
+                        exc_vector_c   = 8'd32 + {4'd0, ex_imm_raw[3:0]};
+                        exc_saved_pc_c = ex_pc_next;
+                    end
+                    K_RTE: begin
+                        // Privileged. If currently in user mode -> priv violation.
+                        if (!sr_s) begin
+                            exc_launch_c   = 1'b1;
+                            exc_vector_c   = 8'd`VEC_PRIV_VIO;
+                            exc_saved_pc_c = ex_pc;
+                        end
+                        // Otherwise the sequential block kicks off the RTE
+                        // pop sequence (this case is a planning no-op).
+                    end
+                    K_TRAPV: begin
+                        if (cc_v) begin
+                            exc_launch_c   = 1'b1;
+                            exc_vector_c   = 8'd`VEC_TRAPV;
+                            exc_saved_pc_c = ex_pc_next;
+                        end
+                    end
+                    K_ILLEGAL: begin
+                        exc_launch_c   = 1'b1;
+                        exc_vector_c   = 8'd`VEC_ILLEGAL;
+                        exc_saved_pc_c = ex_pc;
+                    end
+                    K_MOVEUSP: begin
+                        // Privileged. ex_direction: 0 = An→USP, 1 = USP→An.
+                        if (!sr_s) begin
+                            exc_launch_c   = 1'b1;
+                            exc_vector_c   = 8'd`VEC_PRIV_VIO;
+                            exc_saved_pc_c = ex_pc;
+                        end else if (ex_direction) begin
+                            // Read USP into An. usp_shadow holds USP while sup.
+                            wb_main_we_c   = 1'b1;
+                            wb_main_idx_c  = {1'b1, ex_src_reg};
+                            wb_main_data_c = usp_shadow;
+                            wb_main_size_c = `SZ_L;
+                        end else begin
+                            // Write An -> USP.
+                            usp_we_c   = 1'b1;
+                            usp_data_c = ex_ra;
+                        end
+                    end
+                    K_MOVESR: begin
+                        // direction 0: read SR into Dn (or memory dst). 1: write SR.
+                        if (ex_direction == 1'b0) begin
+                            // MOVE from SR (non-priv in 68000; treat as such).
+                            // Support Dn destination only.
+                            if (ex_dst_mode == `EA_DREG) begin
+                                wb_main_we_c   = 1'b1;
+                                wb_main_idx_c  = {1'b0, ex_dst_reg};
+                                wb_main_size_c = `SZ_W;
+                                wb_main_data_c = {16'd0, sr_now};
+                            end
+                        end else begin
+                            // MOVE to SR (privileged).
+                            if (!sr_s) begin
+                                exc_launch_c   = 1'b1;
+                                exc_vector_c   = 8'd`VEC_PRIV_VIO;
+                                exc_saved_pc_c = ex_pc;
+                            end else begin
+                                sr_we_c = 1'b1;
+                                // Source: register (Dn / An — only Dn really
+                                // makes sense here) or immediate. src_operand
+                                // is the EA contents; for memory sources we'd
+                                // need a load.
+                                sr_data_c = src_operand[15:0];
+                            end
+                        end
+                    end
+                    K_MOVECCR: begin
+                        // MOVE to CCR (non-priv). Source low byte → CCR bits.
+                        sr_we_c = 1'b1;
+                        sr_data_c = {sr_now[15:8], src_operand[7:0]};
+                    end
+                    K_CHK: begin
+                        // CHK.W: trap to vec 6 if Dn[15:0] (signed) < 0 or > src (signed).
+                        if (src_needs_mem) begin
+                            want_mem = 1'b1; want_we = 1'b0;
+                            want_addr = src_ea;
+                            want_be   = 4'b1111;
+                            if (src_an_update) begin
+                                wb_aux_we_c   = 1'b1;
+                                wb_aux_idx_c  = {1'b1, ex_src_reg};
+                                wb_aux_data_c = src_an_next;
+                            end
+                        end else begin
+                            // Both operands are 16-bit signed.
+                            if (ex_rb[15] == 1'b1) begin
+                                // Negative => trap, set N=1.
+                                cc_we_c = 1'b1; cc_n_c = 1'b1;
+                                exc_launch_c   = 1'b1;
+                                exc_vector_c   = 8'd`VEC_CHK;
+                                exc_saved_pc_c = ex_pc_next;
+                            end else if ($signed(ex_rb[15:0]) > $signed(src_operand[15:0])) begin
+                                cc_we_c = 1'b1; cc_n_c = 1'b0;
+                                exc_launch_c   = 1'b1;
+                                exc_vector_c   = 8'd`VEC_CHK;
+                                exc_saved_pc_c = ex_pc_next;
+                            end
+                            // else: in range, no-op (N undefined; leave as-is).
+                        end
                     end
                     default: ;
                 endcase
+                // Pending interrupt check: take an autovector interrupt at the
+                // next instruction boundary. Detected here in S_RUN, where the
+                // current instruction is about to dispatch. Saved PC = ex_pc
+                // (so RTE will re-execute the suppressed instruction).
+                // Only fires if no other exception is already being launched.
+                if (!exc_launch_c && (ipl_i > sr_i)) begin
+                    exc_launch_c   = 1'b1;
+                    exc_is_irq_c   = 1'b1;
+                    exc_vector_c   = 8'd24 + {5'd0, ipl_i};
+                    exc_saved_pc_c = ex_pc;
+                end
+            end
+            // Final cycle of exception entry sequence: write A7 := working_sp
+            // (the final SSP after both pushes). If we entered from user mode,
+            // also stash old A7 in usp_shadow (handled in sequential block).
+            S_EXC_FETCH: begin
+                if (dc_ack) begin
+                    wb_aux_we_c   = 1'b1;
+                    wb_aux_idx_c  = 4'd15;
+                    wb_aux_data_c = working_sp;
+                end
+            end
+            // Final cycle of RTE/RTR: write A7 := working_sp (final SP after
+            // both pops). For RTE, if we're returning to user mode the swap
+            // with usp_shadow happens; RTR never changes supervisor mode.
+            S_RTE_POP_PC: begin
+                if (dc_ack) begin
+                    wb_aux_we_c   = 1'b1;
+                    wb_aux_idx_c  = 4'd15;
+                    wb_aux_data_c = ((ex_kind == K_RTE) &&
+                                     (ex_exc_saved_sr[`SR_S] == 1'b0))
+                                    ? usp_shadow
+                                    : working_sp;
+                end
+            end
+            // MOVEM iteration. On each step ack: load-MOVEM writes the
+            // current register; store-MOVEM doesn't need a regfile write.
+            // When the mask is exhausted: if predec/postinc, commit final An
+            // via wb_aux at the settle cycle.
+            S_MOVEM: begin
+                if (movem_busy && dc_ack && movem_dir) begin
+                    // Intermediate load-step register write (gated by
+                    // movem_step_commit in the wb block, not by is_settled).
+                    wb_main_we_c   = 1'b1;
+                    wb_main_idx_c  = movem_curr_reg_full;
+                    wb_main_data_c = dc_rdata;
+                    wb_main_size_c = `SZ_L;
+                end else if (!movem_busy && (movem_mask == 16'd0)) begin
+                    // Final settle: commit An if predec/postinc.
+                    if (movem_an_update) begin
+                        wb_aux_we_c   = 1'b1;
+                        wb_aux_idx_c  = {1'b1, movem_an_idx};
+                        wb_aux_data_c = movem_addr;
+                    end
+                end
+            end
+            // RMW write phase: the new value is in ex_tas_word; on ack we
+            // commit CCR from that value (size-aware).
+            S_RMW_W: begin
+                if (dc_ack) begin
+                    cc_we_c   = 1'b1;
+                    cc_v_c    = 1'b0;
+                    cc_x_we_c = (ex_kind == K_NEG);
+                    case (ex_size)
+                        `SZ_B: begin
+                            cc_n_c = ex_tas_word[7];
+                            cc_z_c = (ex_tas_word[7:0] == 8'd0);
+                            cc_c_c = (ex_kind == K_NEG) ? (ex_tas_word[7:0] != 8'd0) : 1'b0;
+                            cc_x_c = cc_c_c;
+                        end
+                        `SZ_W: begin
+                            cc_n_c = ex_tas_word[15];
+                            cc_z_c = (ex_tas_word[15:0] == 16'd0);
+                            cc_c_c = (ex_kind == K_NEG) ? (ex_tas_word[15:0] != 16'd0) : 1'b0;
+                            cc_x_c = cc_c_c;
+                        end
+                        default: begin
+                            cc_n_c = ex_tas_word[31];
+                            cc_z_c = (ex_tas_word == 32'd0);
+                            cc_c_c = (ex_kind == K_NEG) ? (ex_tas_word != 32'd0) : 1'b0;
+                            cc_x_c = cc_c_c;
+                        end
+                    endcase
+                end
             end
             S_LOAD: begin
                 case (ex_kind)
@@ -1025,6 +1676,109 @@ module m68k_core #(
                         wb_aux_idx_c = 4'd15;
                         wb_aux_data_c = ex_sp + 32'd4;
                     end
+                    K_TST: begin
+                        // Memory TST: rdata holds the read value at src_ea.
+                        // Extract size-appropriate field, set N/Z, clear V/C.
+                        cc_we_c = 1'b1;
+                        cc_v_c = 1'b0; cc_c_c = 1'b0;
+                        case (ex_size)
+                            `SZ_B: begin
+                                cc_n_c = byte_at(dc_rdata, dc_addr[1:0])[7];
+                                cc_z_c = (byte_at(dc_rdata, dc_addr[1:0]) == 8'd0);
+                            end
+                            `SZ_W: begin
+                                cc_n_c = dc_addr[1] ? dc_rdata[15] : dc_rdata[31];
+                                cc_z_c = dc_addr[1] ? (dc_rdata[15:0] == 16'd0)
+                                                    : (dc_rdata[31:16] == 16'd0);
+                            end
+                            default: begin
+                                cc_n_c = dc_rdata[31];
+                                cc_z_c = (dc_rdata == 32'd0);
+                            end
+                        endcase
+                    end
+                    K_NEG, K_NOT: begin
+                        // Memory NEG/NOT — drive ALU with rdata; sequential
+                        // block captures alu_y, issues the write-back, and
+                        // transitions to S_RMW_W. For .B and .W we extract
+                        // the byte/word at the actual EA position before
+                        // feeding the ALU, so the size-masked ALU operates
+                        // on the right bits (in big-endian, byte 0 of a long
+                        // is the HIGH byte at addr offset 0).
+                        alu_op_c = (ex_kind == K_NEG) ? `ALU_NEG : `ALU_NOT;
+                        case (ex_size)
+                            `SZ_B: alu_b = {24'd0, byte_at(dc_rdata, dc_addr[1:0])};
+                            `SZ_W: alu_b = {16'd0, dc_addr[1] ? dc_rdata[15:0]
+                                                              : dc_rdata[31:16]};
+                            default: alu_b = dc_rdata;
+                        endcase
+                        alu_size_c = ex_size;
+                    end
+                    K_MOVEA: begin
+                        // MOVEA from memory: load source, sign-extend if .W, write to An.
+                        wb_main_we_c   = 1'b1;
+                        wb_main_idx_c  = {1'b1, ex_dst_reg};
+                        wb_main_data_c = (ex_size == `SZ_W)
+                                         ? {{16{dc_rdata[15]}}, dc_rdata[15:0]}
+                                         : dc_rdata;
+                        if (src_an_update) begin
+                            wb_aux_we_c   = 1'b1;
+                            wb_aux_idx_c  = {1'b1, ex_src_reg};
+                            wb_aux_data_c = src_an_next;
+                        end
+                    end
+                    K_UNLK: begin
+                        // Loaded data is the new An; SP becomes old An + 4.
+                        wb_main_we_c   = 1'b1;
+                        wb_main_idx_c  = {1'b1, ex_src_reg};
+                        wb_main_data_c = dc_rdata;
+                        wb_aux_we_c    = 1'b1;
+                        wb_aux_idx_c   = 4'd15;
+                        wb_aux_data_c  = ex_ra + 32'd4;
+                    end
+                    K_MULU, K_MULS: begin
+                        cc_we_c = 1'b1;
+                        wb_main_we_c   = 1'b1;
+                        wb_main_idx_c  = ex_reg_idx_full;
+                        wb_main_size_c = `SZ_L;
+                        if (ex_kind == K_MULU) begin
+                            wb_main_data_c = {16'd0, ex_rb[15:0]} *
+                                             {16'd0, dc_rdata[15:0]};
+                        end else begin
+                            wb_main_data_c = muls_y_signed_mem;
+                        end
+                        cc_n_c = wb_main_data_c[31];
+                        cc_z_c = (wb_main_data_c == 32'd0);
+                        cc_v_c = 1'b0;
+                        cc_c_c = 1'b0;
+                    end
+                    K_DIVU, K_DIVS: begin
+                        if (dc_rdata[15:0] == 16'd0) begin
+                            cc_we_c = 1'b1;
+                            cc_v_c = 1'b1;
+                        end else if (ex_kind == K_DIVU) begin
+                            cc_we_c = 1'b1;
+                            wb_main_we_c   = 1'b1;
+                            wb_main_idx_c  = ex_reg_idx_full;
+                            wb_main_size_c = `SZ_L;
+                            wb_main_data_c = (((ex_rb % {16'd0, dc_rdata[15:0]}) & 32'h0000FFFF) << 16)
+                                           |  ((ex_rb / {16'd0, dc_rdata[15:0]}) & 32'h0000FFFF);
+                            cc_n_c = wb_main_data_c[15];
+                            cc_z_c = (wb_main_data_c[15:0] == 16'd0);
+                            cc_v_c = 1'b0;
+                            cc_c_c = 1'b0;
+                        end else begin
+                            cc_we_c = 1'b1;
+                            wb_main_we_c   = 1'b1;
+                            wb_main_idx_c  = ex_reg_idx_full;
+                            wb_main_size_c = `SZ_L;
+                            wb_main_data_c = divs_y_mem;
+                            cc_n_c = wb_main_data_c[15];
+                            cc_z_c = (wb_main_data_c[15:0] == 16'd0);
+                            cc_v_c = 1'b0;
+                            cc_c_c = 1'b0;
+                        end
+                    end
                     default: ;
                 endcase
             end
@@ -1055,6 +1809,27 @@ module m68k_core #(
                         take_branch_c = 1'b1;
                         take_branch_target_c = ex_pc + 32'd2 + ex_branch_imm;
                     end
+                    K_LINK: begin
+                        // Store done: An <- SP-4, SP <- SP-4 + disp16.
+                        wb_main_we_c   = 1'b1;
+                        wb_main_idx_c  = {1'b1, ex_src_reg};
+                        wb_main_data_c = ex_sp - 32'd4;
+                        wb_main_size_c = `SZ_L;
+                        wb_aux_we_c    = 1'b1;
+                        wb_aux_idx_c   = 4'd15;
+                        wb_aux_data_c  = ex_sp - 32'd4 + ex_src_imm32;
+                    end
+                    K_PEA: begin
+                        wb_aux_we_c   = 1'b1;
+                        wb_aux_idx_c  = 4'd15;
+                        wb_aux_data_c = ex_sp - 32'd4;
+                    end
+                    K_CLR: begin
+                        // Memory CLR: write done; commit CCR.
+                        cc_we_c = 1'b1;
+                        cc_z_c = 1'b1;
+                        cc_n_c = 1'b0; cc_v_c = 1'b0; cc_c_c = 1'b0;
+                    end
                     default: ;
                 endcase
             end
@@ -1079,11 +1854,17 @@ module m68k_core #(
         if (is_settled) begin
             wb_we       = wb_main_we_c;
             wb_widx     = wb_main_idx_c;
-            wb_size     = ex_size;
+            wb_size     = wb_main_size_c;
             wb_wdata    = wb_main_data_c;
             wb_aux_we   = wb_aux_we_c;
             wb_aux_idx  = wb_aux_idx_c;
             wb_aux_data = wb_aux_data_c;
+        end else if (movem_step_commit && movem_dir) begin
+            // Intermediate load-MOVEM register write: fire main writeback only.
+            wb_we    = wb_main_we_c;
+            wb_widx  = wb_main_idx_c;
+            wb_size  = wb_main_size_c;
+            wb_wdata = wb_main_data_c;
         end
     end
 
@@ -1091,8 +1872,26 @@ module m68k_core #(
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             cc_n <= 1'b0; cc_z <= 1'b0; cc_v <= 1'b0; cc_c <= 1'b0; cc_x <= 1'b0;
+            sr_s <= 1'b1;          // boot in supervisor mode
+            sr_t <= 1'b0;          // no trace
+            sr_i <= 3'd7;          // all interrupts masked
+            usp_shadow <= 32'd0;
             ex_state <= S_RUN;
             ex_tas_word <= 32'd0;
+            ex_exc_saved_pc <= 32'd0;
+            ex_exc_saved_sr <= 16'd0;
+            ex_exc_vector <= 8'd0;
+            ex_exc_was_user <= 1'b0;
+            ex_exc_new_sri <= 3'd0;
+            working_sp <= 32'd0;
+            movem_mask <= 16'd0;
+            movem_idx <= 5'd0;
+            movem_addr <= 32'd0;
+            movem_busy <= 1'b0;
+            movem_dir <= 1'b0;
+            movem_predec <= 1'b0;
+            movem_an_update <= 1'b0;
+            movem_an_idx <= 3'd0;
             dc_req_r <= 1'b0;
             dc_we <= 1'b0; dc_lock <= 1'b0;
             dc_addr <= 32'd0; dc_wdata <= 32'd0; dc_be <= 4'b1111;
@@ -1108,6 +1907,33 @@ module m68k_core #(
             end
             if (is_settled && cc_x_we_c) cc_x <= cc_x_c;
 
+            // SR write (MOVE-to-SR, ANDI/ORI/EORI to SR, etc.). If S
+            // toggles to 0 (going to user mode) the A7 currently in regfile
+            // must swap with usp_shadow; the EX-handlers that drive sr_we_c
+            // for non-RTE paths are expected to be in supervisor mode with
+            // S preserved, so this code only handles the S=stay case.
+            if (is_settled && sr_we_c) begin
+                cc_x <= sr_data_c[`SR_X];
+                cc_n <= sr_data_c[`SR_N];
+                cc_z <= sr_data_c[`SR_Z];
+                cc_v <= sr_data_c[`SR_V];
+                cc_c <= sr_data_c[`SR_C];
+                // Upper byte only writable from supervisor mode (callers ensure).
+                if (sr_s) begin
+                    sr_t <= sr_data_c[`SR_T];
+                    sr_i <= sr_data_c[10:8];
+                    // If S is being cleared, swap A7 with usp_shadow.
+                    if (sr_data_c[`SR_S] == 1'b0 && sr_s == 1'b1) begin
+                        usp_shadow <= rf_rc_data;   // save SSP
+                        // A7 := usp_shadow would need a wb_aux from planning;
+                        // not implemented (use RTE for clean U/S transitions).
+                    end
+                    sr_s <= sr_data_c[`SR_S];
+                end
+            end
+            // USP write (MOVE An,USP — supervisor only, handled by planning).
+            if (is_settled && usp_we_c) usp_shadow <= usp_data_c;
+
             // STOP halts.
             if (ex_valid && ex_kind == K_STOP && ex_state == S_RUN && !halted) begin
                 halted <= 1'b1;
@@ -1116,7 +1942,62 @@ module m68k_core #(
 
             case (ex_state)
                 S_RUN: begin
-                    if (ex_valid && !halted && want_mem) begin
+                    if (ex_valid && !halted && exc_launch_c) begin
+                        // Any exception entry source (TRAP, illegal, priv-vio,
+                        // div-by-zero, TRAPV, IRQ, etc.). Save the supplied
+                        // PC and the current SR, push PC at SSP-4.
+                        ex_exc_saved_pc <= exc_saved_pc_c;
+                        ex_exc_saved_sr <= sr_now;
+                        ex_exc_vector   <= exc_vector_c;
+                        ex_exc_was_user <= ~sr_s;
+                        // For IRQ: set new sr_i to ipl level so further IRQs
+                        // at the same/lower priority are masked. For other
+                        // exceptions: sr_i is preserved.
+                        ex_exc_new_sri  <= exc_is_irq_c ? ipl_i : sr_i;
+                        working_sp <= (sr_s ? rf_rc_data : usp_shadow) - 32'd4;
+                        dc_req_r <= 1'b1;
+                        dc_we    <= 1'b1;
+                        dc_lock  <= 1'b0;
+                        dc_addr  <= (sr_s ? rf_rc_data : usp_shadow) - 32'd4;
+                        dc_wdata <= exc_saved_pc_c;
+                        dc_be    <= 4'b1111;
+                        ex_state <= S_EXC_PUSH_PC;
+                    end else if (ex_valid && !halted && (ex_kind == K_MOVEM)) begin
+                        // MOVEM: capture mask + initial address. We only
+                        // support .L MOVEM with predec/(An)/postinc EA modes.
+                        // Mask bits map to registers differently for predec:
+                        //   predec:    mask[0]=A7, ..., mask[15]=D0
+                        //   other:     mask[0]=D0, ..., mask[15]=A7
+                        // The iterator walks bit 0..15 in order and uses the
+                        // appropriate mapping to pick the register.
+                        movem_mask    <= ex_src_imm32[15:0];
+                        movem_idx     <= 5'd0;
+                        movem_dir     <= ex_direction;
+                        movem_predec  <= (ex_src_mode == `EA_ADEC);
+                        movem_an_idx  <= ex_src_reg;
+                        movem_an_update <= (ex_src_mode == `EA_ADEC) ||
+                                           (ex_src_mode == `EA_AINC);
+                        // Initial An: for predec the tracked An starts at the
+                        // original An (each step uses An-4 then decrements).
+                        // For postinc and fixed (An), the tracked address is
+                        // the current write/read address.
+                        movem_addr    <= ex_ra;
+                        movem_busy    <= 1'b0;
+                        ex_state      <= S_MOVEM;
+                    end else if (ex_valid && !halted &&
+                                 ((ex_kind == K_RTE && sr_s) || (ex_kind == K_RTR))) begin
+                        // RTE in supervisor mode: pop SR + PC. RTR: pop CCR + PC
+                        // (uses same state path; the SR-pop ack handler only
+                        // restores CCR for K_RTR). User-mode RTE is handled
+                        // above as a priv-vio via exc_launch_c.
+                        working_sp <= rf_rc_data;
+                        dc_req_r <= 1'b1;
+                        dc_we    <= 1'b0;
+                        dc_lock  <= 1'b0;
+                        dc_addr  <= rf_rc_data;
+                        dc_be    <= 4'b1111;
+                        ex_state <= S_RTE_POP_SR;
+                    end else if (ex_valid && !halted && want_mem) begin
                         dc_req_r <= 1'b1;
                         dc_we <= want_we;
                         dc_lock <= want_lock;
@@ -1139,6 +2020,32 @@ module m68k_core #(
                             dc_wdata <= byte_into_word(byte_at(dc_rdata, dc_addr[1:0]) | 8'h80,
                                                        dc_addr[1:0]);
                             ex_state <= S_TASW;
+                        end else if (load_starts_rmw && (ex_src_mode != `EA_DREG)) begin
+                            // Memory NEG/NOT: capture the ALU result (computed
+                            // combinationally from dc_rdata) and issue the
+                            // write-back; transition to S_RMW_W.
+                            ex_tas_word <= alu_y;
+                            dc_req_r <= 1'b1;
+                            dc_we    <= 1'b1;
+                            // For .B/.W, the cache merges by byte enables; we
+                            // place the new bytes at the right position in the
+                            // write word.
+                            case (ex_size)
+                                `SZ_B: begin
+                                    dc_be    <= be_for_byte(dc_addr[1:0]);
+                                    dc_wdata <= byte_into_word(alu_y[7:0], dc_addr[1:0]);
+                                end
+                                `SZ_W: begin
+                                    dc_be    <= be_for_word(dc_addr[1]);
+                                    dc_wdata <= word_into_word(alu_y[15:0], dc_addr[1]);
+                                end
+                                default: begin
+                                    dc_be    <= 4'b1111;
+                                    dc_wdata <= alu_y;
+                                end
+                            endcase
+                            // dc_addr already set from the read.
+                            ex_state <= S_RMW_W;
                         end else begin
                             ex_state <= S_RUN;
                         end
@@ -1155,6 +2062,128 @@ module m68k_core #(
                     if (dc_ack) begin
                         dc_req_r <= 1'b0;
                         dc_lock <= 1'b0;
+                        ex_state <= S_RUN;
+                    end
+                end
+                S_RMW_W: begin
+                    if (dc_ack) begin
+                        dc_req_r <= 1'b0;
+                        ex_state <= S_RUN;
+                    end
+                end
+                S_MOVEM: begin
+                    if (movem_busy) begin
+                        // Waiting for current step's ack.
+                        if (dc_ack) begin
+                            dc_req_r <= 1'b0;
+                            movem_busy <= 1'b0;
+                            // Advance: shift mask, advance idx, advance addr.
+                            movem_mask <= movem_mask >> 1;
+                            movem_idx  <= movem_idx + 5'd1;
+                            // For predec, the An is decremented along with
+                            // each transfer; for postinc and fixed-EA the
+                            // address increases each step.
+                            if (movem_predec) movem_addr <= movem_addr - 32'd4;
+                            else              movem_addr <= movem_addr + 32'd4;
+                        end
+                    end else begin
+                        // Scanning for next set bit, or done.
+                        if (movem_mask == 16'd0) begin
+                            // Done: settle. The settle wire fires this cycle;
+                            // sequential effects: clear req, return to S_RUN.
+                            ex_state <= S_RUN;
+                        end else if (movem_mask[0]) begin
+                            // Issue this step's transaction.
+                            dc_req_r <= 1'b1;
+                            dc_we    <= ~movem_dir;        // 0 = load, 1 = store
+                            dc_lock  <= 1'b0;
+                            dc_addr  <= movem_step_addr;
+                            dc_be    <= 4'b1111;
+                            // For store, the wdata comes from regfile ra
+                            // (overridden to movem_curr_reg_full).
+                            if (movem_dir == 1'b0) dc_wdata <= rf_ra_data;
+                            movem_busy <= 1'b1;
+                        end else begin
+                            // Bit not set: skip; shift mask, advance idx.
+                            movem_mask <= movem_mask >> 1;
+                            movem_idx  <= movem_idx + 5'd1;
+                            // No addr advance (no transfer for this register).
+                        end
+                    end
+                end
+                S_EXC_PUSH_PC: begin
+                    if (dc_ack) begin
+                        // PC pushed. Now push SR at (working_sp - 4).
+                        working_sp <= working_sp - 32'd4;
+                        dc_req_r <= 1'b1;
+                        dc_we    <= 1'b1;
+                        dc_addr  <= working_sp - 32'd4;
+                        dc_wdata <= {16'd0, ex_exc_saved_sr};
+                        dc_be    <= 4'b1111;
+                        ex_state <= S_EXC_PUSH_SR;
+                    end
+                end
+                S_EXC_PUSH_SR: begin
+                    if (dc_ack) begin
+                        // SR pushed. Fetch vector at (vector * 4).
+                        dc_req_r <= 1'b1;
+                        dc_we    <= 1'b0;
+                        dc_addr  <= {22'd0, ex_exc_vector, 2'b00};
+                        dc_be    <= 4'b1111;
+                        ex_state <= S_EXC_FETCH;
+                        // Now enforce supervisor mode and clear trace. If we
+                        // came from user mode, save current A7 (the USP) into
+                        // usp_shadow. The new A7 (= working_sp) is written by
+                        // the planning block when the next ack arrives.
+                        if (ex_exc_was_user) usp_shadow <= rf_rc_data;
+                        sr_s <= 1'b1;
+                        sr_t <= 1'b0;
+                        sr_i <= ex_exc_new_sri;
+                    end
+                end
+                S_EXC_FETCH: begin
+                    if (dc_ack) begin
+                        dc_req_r <= 1'b0;
+                        // PC redirect happens via redirect_pc = dc_rdata.
+                        // A7 update happens via wb_aux from planning block.
+                        ex_state <= S_RUN;
+                    end
+                end
+                S_RTE_POP_SR: begin
+                    if (dc_ack) begin
+                        // Top word popped. For RTE, it's a full SR word; for
+                        // RTR, only the CCR (low byte) is restored.
+                        ex_exc_saved_sr <= dc_rdata[15:0];
+                        if (ex_kind == K_RTE) begin
+                            sr_t <= dc_rdata[`SR_T];
+                            sr_s <= dc_rdata[`SR_S];
+                            sr_i <= dc_rdata[10:8];
+                        end
+                        cc_x <= dc_rdata[`SR_X];
+                        cc_n <= dc_rdata[`SR_N];
+                        cc_z <= dc_rdata[`SR_Z];
+                        cc_v <= dc_rdata[`SR_V];
+                        cc_c <= dc_rdata[`SR_C];
+                        working_sp <= working_sp + 32'd4;
+                        dc_req_r <= 1'b1;
+                        dc_we    <= 1'b0;
+                        dc_addr  <= working_sp + 32'd4;
+                        dc_be    <= 4'b1111;
+                        ex_state <= S_RTE_POP_PC;
+                    end
+                end
+                S_RTE_POP_PC: begin
+                    if (dc_ack) begin
+                        dc_req_r <= 1'b0;
+                        // PC redirect via redirect_pc = dc_rdata.
+                        // For RTE returning to user mode, swap the USP back
+                        // into A7 and stash the SP we just popped to into
+                        // usp_shadow. RTR never changes supervisor state.
+                        working_sp <= working_sp + 32'd4;
+                        if ((ex_kind == K_RTE) && (ex_exc_saved_sr[`SR_S] == 1'b0)) begin
+                            usp_shadow <= working_sp + 32'd4;
+                            // A7 := usp_shadow is committed by planning block.
+                        end
                         ex_state <= S_RUN;
                     end
                 end
