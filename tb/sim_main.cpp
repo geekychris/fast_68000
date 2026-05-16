@@ -245,8 +245,10 @@ static int run_graphics(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
         SDL_RenderPresent(ren);
     }
 
-    // On halt, leave the final frame on screen until the user closes the window.
-    if (all_halted() && !quit) {
+    // Once the simulator stops advancing (either every core halted or we hit
+    // max_cycles), leave the last frame on screen until the user closes the
+    // window. This is the convenient behavior for a long-running demo.
+    if (!quit) {
         // Final render of the halt state.
         for (int y = 0; y < FB_H; y++) {
             for (int x = 0; x < FB_W; x++) {
@@ -259,7 +261,7 @@ static int run_graphics(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
         SDL_RenderClear(ren);
         SDL_RenderCopy(ren, tex, nullptr, nullptr);
         SDL_RenderPresent(ren);
-        SDL_SetWindowTitle(win, "fast_68000 framebuffer (halted) — press ESC to quit");
+        SDL_SetWindowTitle(win, "fast_68000 framebuffer (stopped) — press ESC to quit");
 
         while (!quit) {
             SDL_Event e;
