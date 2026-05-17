@@ -21,10 +21,10 @@ RTL_SRCS := $(RTL_DIR)/m68k_alu.v \
             $(RTL_DIR)/m68k_cache.v \
             $(RTL_DIR)/m68k_passthrough.v \
             $(RTL_DIR)/m68k_bus.v \
-            $(RTL_DIR)/m68k_blitter.v \
-            $(RTL_DIR)/m68k_copper.v \
-            $(RTL_DIR)/m68k_denise.v \
-            $(RTL_DIR)/m68k_paula.v \
+            $(RTL_DIR)/chipset/blitter.v \
+            $(RTL_DIR)/chipset/copper.v \
+            $(RTL_DIR)/chipset/denise.v \
+            $(RTL_DIR)/chipset/paula.v \
             $(RTL_DIR)/m68k_core.v \
             $(RTL_DIR)/m68k_top.v
 

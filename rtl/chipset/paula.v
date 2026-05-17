@@ -20,9 +20,9 @@
 //
 // Register page: $00FE_0200..$00FE_02FF.
 
-`include "m68k_defs.vh"
 
-module m68k_paula (
+
+module paula (
     input  wire        clk,
     input  wire        rst_n,
 

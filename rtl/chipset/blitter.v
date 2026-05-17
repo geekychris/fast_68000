@@ -49,9 +49,9 @@
 //                  *Writing this register starts a blit.*
 //   $3C  BLTSTAT  RO: bit 0 = BUSY.
 
-`include "m68k_defs.vh"
 
-module m68k_blitter (
+
+module blitter (
     input  wire        clk,
     input  wire        rst_n,
 

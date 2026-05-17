@@ -35,9 +35,9 @@
 // Triggering: write any value to DENRUN. Denise rasterizes the full
 // 256x192 framebuffer and sets DENSTAT.BUSY low when done.
 
-`include "m68k_defs.vh"
 
-module m68k_denise #(
+
+module denise #(
     parameter FB_BASE = 32'h0001_0000,
     parameter FB_W    = 256,
     parameter FB_H    = 192

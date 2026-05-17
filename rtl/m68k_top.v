@@ -142,7 +142,7 @@ module m68k_top #(
     wire        blt_mst_ack;
     wire [31:0] blt_mst_rdata;
 
-    m68k_blitter u_blt (
+    blitter u_blt (
         .clk          (clk),
         .rst_n        (rst_n),
         .slv_req      (blt_slv_req),
@@ -181,7 +181,7 @@ module m68k_top #(
     wire        cop_mst_ack;
     wire [31:0] cop_mst_rdata;
 
-    m68k_copper u_cop (
+    copper u_cop (
         .clk        (clk),
         .rst_n      (rst_n),
         .slv_req    (cop_slv_req),
@@ -219,7 +219,7 @@ module m68k_top #(
     wire        den_mst_ack;
     wire [31:0] den_mst_rdata;
 
-    m68k_denise u_den (
+    denise u_den (
         .clk        (clk),
         .rst_n      (rst_n),
         .slv_req    (den_slv_req),
@@ -255,7 +255,7 @@ module m68k_top #(
     wire        pau_mst_ack;
     wire [31:0] pau_mst_rdata;
 
-    m68k_paula u_pau (
+    paula u_pau (
         .clk        (clk),
         .rst_n      (rst_n),
         .slv_req    (pau_slv_req),

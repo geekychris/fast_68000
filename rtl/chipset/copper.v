@@ -36,9 +36,9 @@
 //   $00FE_0044 COPJMP1  W    write any value to (re)start the Copper at COP1LC
 //   $00FE_0048 COPSTAT  RO   bit 0 = COP_BUSY
 
-`include "m68k_defs.vh"
 
-module m68k_copper (
+
+module copper (
     input  wire        clk,
     input  wire        rst_n,
 
