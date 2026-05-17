@@ -1,6 +1,6 @@
 ; Denise sprite demo: 8 hardware sprites bouncing across the screen.
 ;
-; Each sprite shares the same 16x16 ball-shape data at $00006000..$0000601F.
+; Each sprite shares the same 16x16 ball-shape data at $00007000..$0000701F.
 ; Sprites are stacked vertically with each one moving at a different
 ; horizontal velocity, producing a row of bouncing balls in 8 colors over a
 ; solid-blue background.
@@ -18,16 +18,16 @@ zp:     move.l  #0, (A0)+
         subq.l  #1, D0
         bne     zp
 
-        ; ---- write the 16x16 ball sprite at $00006000 ----
+        ; ---- write the 16x16 ball sprite at $00007000 ----
         ;   16 words; packed two-per-long.
-        move.l  #$00000FF0, $00006000          ; row 0 = $0000, row 1 = $0FF0
-        move.l  #$3FFC7FFE, $00006004          ; row 2 = $3FFC, row 3 = $7FFE
-        move.l  #$FFFFFFFF, $00006008          ; row 4, row 5
-        move.l  #$FFFFFFFF, $0000600C          ; row 6, row 7
-        move.l  #$FFFFFFFF, $00006010          ; row 8, row 9
-        move.l  #$FFFFFFFF, $00006014          ; row 10, row 11
-        move.l  #$7FFE3FFC, $00006018          ; row 12 = $7FFE, row 13 = $3FFC
-        move.l  #$0FF00000, $0000601C          ; row 14 = $0FF0, row 15 = $0000
+        move.l  #$00000FF0, $00007000          ; row 0 = $0000, row 1 = $0FF0
+        move.l  #$3FFC7FFE, $00007004          ; row 2 = $3FFC, row 3 = $7FFE
+        move.l  #$FFFFFFFF, $00007008          ; row 4, row 5
+        move.l  #$FFFFFFFF, $0000700C          ; row 6, row 7
+        move.l  #$FFFFFFFF, $00007010          ; row 8, row 9
+        move.l  #$FFFFFFFF, $00007014          ; row 10, row 11
+        move.l  #$7FFE3FFC, $00007018          ; row 12 = $7FFE, row 13 = $3FFC
+        move.l  #$0FF00000, $0000701C          ; row 14 = $0FF0, row 15 = $0000
 
         ; ---- palette ----
         move.l  #$0000000F, $00FE0180          ; COLOR00 blue (background)
@@ -48,14 +48,14 @@ zp:     move.l  #0, (A0)+
         move.l  #0,         $00FE0128
 
         ; ---- All sprites point to the same data, height = 16 ----
-        move.l  #$00006000, $00FE0130          ; SPR0PT
-        move.l  #$00006000, $00FE0138          ; SPR1PT
-        move.l  #$00006000, $00FE0148          ; SPR2PT
-        move.l  #$00006000, $00FE0150          ; SPR3PT
-        move.l  #$00006000, $00FE0158          ; SPR4PT
-        move.l  #$00006000, $00FE0160          ; SPR5PT
-        move.l  #$00006000, $00FE0168          ; SPR6PT
-        move.l  #$00006000, $00FE0178          ; SPR7PT
+        move.l  #$00007000, $00FE0130          ; SPR0PT
+        move.l  #$00007000, $00FE0138          ; SPR1PT
+        move.l  #$00007000, $00FE0148          ; SPR2PT
+        move.l  #$00007000, $00FE0150          ; SPR3PT
+        move.l  #$00007000, $00FE0158          ; SPR4PT
+        move.l  #$00007000, $00FE0160          ; SPR5PT
+        move.l  #$00007000, $00FE0168          ; SPR6PT
+        move.l  #$00007000, $00FE0178          ; SPR7PT
 
         ; ---- enable all 8 sprites ----
         move.l  #$000000FF, $00FE0170
