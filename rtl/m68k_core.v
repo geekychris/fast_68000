@@ -1639,31 +1639,34 @@ module m68k_core #(
             S_LOAD: begin
                 case (ex_kind)
                     K_MOVE: begin
-                        wb_main_we_c = 1'b1;
-                        wb_main_idx_c = (ex_dst_mode == `EA_AREG) ? {1'b1, ex_dst_reg}
-                                                                  : {1'b0, ex_dst_reg};
-                        // Size-aware extraction: pick the right byte/word
-                        // from dc_rdata so the sized writeback sees the
-                        // proper value in its low bits.  CCR likewise.
-                        case (ex_size)
-                            `SZ_B: begin
-                                wb_main_data_c = {24'd0, byte_at(dc_rdata, dc_addr[1:0])};
-                                cc_n_c = byte_at(dc_rdata, dc_addr[1:0])[7];
-                                cc_z_c = (byte_at(dc_rdata, dc_addr[1:0]) == 8'd0);
-                            end
-                            `SZ_W: begin
-                                wb_main_data_c = {16'd0, dc_addr[1] ? dc_rdata[15:0] : dc_rdata[31:16]};
-                                cc_n_c = dc_addr[1] ? dc_rdata[15] : dc_rdata[31];
-                                cc_z_c = dc_addr[1] ? (dc_rdata[15:0] == 16'd0)
-                                                    : (dc_rdata[31:16] == 16'd0);
-                            end
-                            default: begin
-                                wb_main_data_c = dc_rdata;
-                                cc_n_c = dc_rdata[31];
-                                cc_z_c = (dc_rdata == 32'd0);
-                            end
-                        endcase
-                        cc_we_c = (ex_dst_mode == `EA_DREG);
+                        // For memory-to-memory moves the destination is not a
+                        // register, so suppress register writeback.  The
+                        // sequential block chains a store to dst_ea after the
+                        // load completes.
+                        if (!dst_is_mem) begin
+                            wb_main_we_c = 1'b1;
+                            wb_main_idx_c = (ex_dst_mode == `EA_AREG) ? {1'b1, ex_dst_reg}
+                                                                      : {1'b0, ex_dst_reg};
+                            case (ex_size)
+                                `SZ_B: begin
+                                    wb_main_data_c = {24'd0, byte_at(dc_rdata, dc_addr[1:0])};
+                                    cc_n_c = byte_at(dc_rdata, dc_addr[1:0])[7];
+                                    cc_z_c = (byte_at(dc_rdata, dc_addr[1:0]) == 8'd0);
+                                end
+                                `SZ_W: begin
+                                    wb_main_data_c = {16'd0, dc_addr[1] ? dc_rdata[15:0] : dc_rdata[31:16]};
+                                    cc_n_c = dc_addr[1] ? dc_rdata[15] : dc_rdata[31];
+                                    cc_z_c = dc_addr[1] ? (dc_rdata[15:0] == 16'd0)
+                                                        : (dc_rdata[31:16] == 16'd0);
+                                end
+                                default: begin
+                                    wb_main_data_c = dc_rdata;
+                                    cc_n_c = dc_rdata[31];
+                                    cc_z_c = (dc_rdata == 32'd0);
+                                end
+                            endcase
+                            cc_we_c = (ex_dst_mode == `EA_DREG);
+                        end
                         if (src_an_update) begin
                             wb_aux_we_c = 1'b1;
                             wb_aux_idx_c = {1'b1, ex_src_reg};
@@ -2064,6 +2067,32 @@ module m68k_core #(
                             endcase
                             // dc_addr already set from the read.
                             ex_state <= S_RMW_W;
+                        end else if (ex_kind == K_MOVE && dst_is_mem) begin
+                            // Memory-to-memory MOVE: chain a store of the
+                            // loaded data to dst_ea.  For .B/.W, slot the byte
+                            // or word into the position implied by dst_ea.
+                            dc_req_r <= 1'b1;
+                            dc_we    <= 1'b1;
+                            dc_addr  <= dst_ea;
+                            case (ex_size)
+                                `SZ_B: begin
+                                    dc_be    <= be_for_byte(dst_ea[1:0]);
+                                    dc_wdata <= byte_into_word(
+                                        byte_at(dc_rdata, dc_addr[1:0]),
+                                        dst_ea[1:0]);
+                                end
+                                `SZ_W: begin
+                                    dc_be    <= be_for_word(dst_ea[1]);
+                                    dc_wdata <= word_into_word(
+                                        dc_addr[1] ? dc_rdata[15:0] : dc_rdata[31:16],
+                                        dst_ea[1]);
+                                end
+                                default: begin
+                                    dc_be    <= 4'b1111;
+                                    dc_wdata <= dc_rdata;
+                                end
+                            endcase
+                            ex_state <= S_STORE;
                         end else begin
                             ex_state <= S_RUN;
                         end

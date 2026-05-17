@@ -260,10 +260,17 @@ module m68k_blitter (
     endfunction
 
     // Apply Amiga-style fill across a 16-bit word, returning {new_fill_carry,
-    // filled_word}.  Processes bits LSB-first (bit 0 first) for ascending
-    // mode, MSB-first for descending. Amiga fill direction matches the
-    // overall scan direction: ascending = right-to-left within a row, but
-    // here we just consume bits in the natural order for our DESC convention.
+    // filled_word}.  The carry has to walk consistently with the row scan
+    // direction so it propagates correctly across word boundaries:
+    //
+    //   Ascending  (DESC=0): words processed low-addr -> high-addr.
+    //                        Within each word, bit 15 (leftmost pixel)
+    //                        first, bit 0 last.  Scan direction is visually
+    //                        left-to-right across the row.
+    //   Descending (DESC=1): words processed high-addr -> low-addr.
+    //                        Within each word, bit 0 (rightmost pixel)
+    //                        first, bit 15 last.  Scan direction is
+    //                        visually right-to-left.
     //
     //   IFE (inclusive): out = in OR carry; carry ^= in
     //   EFE (exclusive): out = carry;       carry ^= in
@@ -280,10 +287,8 @@ module m68k_blitter (
         begin
             fc = fc_in;
             dout = 16'd0;
-            // Process bits in scan order: bit 0 first (LSB) for ascending,
-            // bit 15 first (MSB) for descending.
             for (i = 0; i < 16; i = i + 1) begin
-                bi = do_desc ? (15 - i) : i;
+                bi = do_desc ? i : (15 - i);
                 bit_in = din[bi];
                 if (do_efe) begin
                     dout[bi] = fc;

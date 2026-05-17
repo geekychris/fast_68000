@@ -6,10 +6,14 @@
 ; in scan order is set.  $8001 -> $FFFF.
 ;
 ; Exclusive fill (EFE): every bit strictly between two set bits is set
-; (endpoints clear).  $8001 -> $7FFE.
+; (endpoints clear).
 ;
-; The fill uses ascending scan (bit 0 first).  $8001 in ascending bit
-; order is: bit 0 = 1, bits 1..14 = 0, bit 15 = 1.
+; Ascending mode (DESC=0) scans bit 15 first within each word so the
+; carry propagates left-to-right across multi-word rows.  For $8001:
+;   bit 15: in=1, out=fc(0)=0, fc->1
+;   bits 14..1: in=0, out=fc(1)=1
+;   bit 0: in=1, out=fc(1)=1, fc->0
+; EFE result: bit 15 clear, bits 14..0 set = $7FFF.
 
         .org $400
 
@@ -59,13 +63,9 @@ w2:     move.l $00FE003C, D0
         andi.l #1, D0
         bne    w2
 
-        ; Exclusive fill (ascending scan, bit 0 first):
-        ;   bit 0: in=1, out = fc_before(0) = 0, fc -> 1
-        ;   bits 1..14: in=0, out = fc(1) = 1
-        ;   bit 15: in=1, out = fc(1) = 1, fc -> 0
-        ; Result word: bit 0 = 0, bits 1..15 = 1 = $FFFE.
+        ; EFE expected = $7FFF (see header comment).
         move.l $00003000, D2
-        cmpi.l #$FFFE0000, D2
+        cmpi.l #$7FFF0000, D2
         bne    fail2
 
         stop   #0
