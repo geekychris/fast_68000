@@ -62,7 +62,12 @@ no_clear:
         move.l  D1,   $00030008     ; x1
         move.l  D2,   $0003000C     ; y1
 
+        ; draw_line clobbers every register including D7 (it reuses D7 as
+        ; the dy-sign register).  Stash the frame counter in scratch so
+        ; the outer loop can advance it after the call.
+        move.l  D7, $00030020
         bsr     draw_line
+        move.l  $00030020, D7
 
         ; advance frame
         addq.l  #1, D7
@@ -206,21 +211,25 @@ dl_dom_done:
         lsl.l   D3, D1
         or.l    D1, D0              ; merge octant at bits [10:8]
 
-        ; ---- write blitter registers ----
-        move.l  D0,            $00FE0000   ; BLTCON
-        move.l  #$0000FFFF,    $00FE0004   ; BLTAFWM
-        move.l  #$0000FFFF,    $00FE0008   ; BLTALWM
-        move.l  $00030010,     $00FE000C   ; BLTAPT
-        move.l  #0,            $00FE0010   ; BLTBPT (unused)
-        move.l  A1, D0
-        move.l  D0,            $00FE0014   ; BLTCPT
-        move.l  D0,            $00FE0018   ; BLTDPT
-        move.l  $00030014,     $00FE001C   ; BLTAMOD
-        move.l  $00030018,     $00FE0020   ; BLTBMOD
-        move.l  #32,           $00FE0024   ; BLTCMOD = bytes/row
-        move.l  #32,           $00FE0028   ; BLTDMOD
-        move.l  #$0000FFFF,    $00FE0030   ; BLTBDAT = solid line pattern
-        move.l  $0003001C,     $00FE0038   ; BLTSIZE -> START
+        ; ---- write blitter registers (reg-to-mem only) ----
+        move.l  D0,         $00FE0000   ; BLTCON
+        move.l  #$0000FFFF, $00FE0004   ; BLTAFWM
+        move.l  #$0000FFFF, $00FE0008   ; BLTALWM
+        move.l  $00030010, D1
+        move.l  D1,         $00FE000C   ; BLTAPT
+        move.l  #0,         $00FE0010   ; BLTBPT (unused)
+        move.l  A1, D1
+        move.l  D1,         $00FE0014   ; BLTCPT
+        move.l  D1,         $00FE0018   ; BLTDPT
+        move.l  $00030014, D1
+        move.l  D1,         $00FE001C   ; BLTAMOD
+        move.l  $00030018, D1
+        move.l  D1,         $00FE0020   ; BLTBMOD
+        move.l  #32,        $00FE0024   ; BLTCMOD = bytes/row
+        move.l  #32,        $00FE0028   ; BLTDMOD
+        move.l  #$0000FFFF, $00FE0030   ; BLTBDAT = solid line pattern
+        move.l  $0003001C, D1
+        move.l  D1,         $00FE0038   ; BLTSIZE -> START
 
 dl_w1:  move.l  $00FE003C, D0
         andi.l  #1, D0
