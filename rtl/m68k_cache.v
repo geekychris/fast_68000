@@ -83,11 +83,17 @@ module m68k_cache #(
 
     // I/O region: any address with [31:24] >= 8'hF0 is treated as
     // uncached (memory-mapped device registers).  This covers the IRQ
-    // register at $FFFF_FFFC and the blitter registers at $00FE_0000-
-    // $00FE_003F. Note the blitter address uses bits [23:16]=$FE while
-    // [31:24]=$00, so we add an explicit check for that range too.
+    // register at $FFFF_FFFC and the Kickstart ROM at $F8_0000+.  We also
+    // cover our legacy chipset window $00FE_xxxx, the canonical Amiga
+    // chipset at $00DF_F000-$00DF_FFFF, and the canonical CIA pages at
+    // $00BF_E000-$00BF_EFFF and $00BF_D000-$00BF_DFFF -- writes/reads
+    // there must always observe the live device state, not a cached copy
+    // from a previous access via the alternate address.
     wire is_io = (cpu_addr[31:24] >= 8'hF0) ||
-                 (cpu_addr[31:16] == 16'h00FE);
+                 (cpu_addr[31:16] == 16'h00FE) ||
+                 (cpu_addr[31:12] == 20'h00DFF) ||
+                 (cpu_addr[31:12] == 20'h00BFE) ||
+                 (cpu_addr[31:12] == 20'h00BFD);
 
     // Combinational read-hit response (no state change).
     // Locked reads (TAS phase 0) always go to the bus so the arbiter sees

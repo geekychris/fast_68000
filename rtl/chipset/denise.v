@@ -16,15 +16,30 @@
 // Hardware scroll (BPLCON1) and 1bpp sprites are implemented.  Hires,
 // HAM8, and genlock are not implemented (see DENISE.md).
 //
-// Sprites: 8 hardware sprites, 16 pixels wide, monochrome (1 bit per
-// pixel), with one palette index per sprite.  Per sprite:
-//   SPRxPT   ($30+8i)  32-bit byte pointer to sprite data (one 16-bit
-//                       word per scanline, packed two-per-long).
+// Sprites: 8 hardware sprites, 16 pixels wide.  Each can be 1bpp (one
+// monochrome plane) or 2bpp (two planes -> 4 colours, value 0 = transparent).
+// Pairs of sprites (0+1, 2+3, 4+5, 6+7) can be ATTACHED to form one
+// 4bpp sprite (16 colours, value 0 = transparent).  Per sprite:
+//   SPRxPT   ($30+8i)  32-bit byte pointer to sprite data.
+//                      1bpp layout: one 16-bit data_a word per row,
+//                                   packed two-per-long.
+//                      2bpp layout: one 32-bit row containing
+//                                   {data_a[15:0], data_b[15:0]}
+//                                   (high half = A, low half = B).
+//                      ATTACHED layout: each member sprite is 2bpp.
+//                                   Pixel = {oddA[i], oddB[i], evenA[i], evenB[i]}.
 //   SPRxCTL  ($34+8i)  {YPOS[31:24], XPOS[23:16], HEIGHT[15:8],
-//                       reserved[7:5], COLOR_IDX[4:0]}
+//                       ATT[7], BPP2[6], reserved[5], COLOR_IDX[4:0]}
 //                       YPOS/XPOS: 8-bit screen coordinates (0..255)
 //                       HEIGHT:    8-bit row count
-//                       COLOR_IDX: palette[0..31] index for opaque bits
+//                       ATT:       1 = attach to even-numbered partner
+//                                  (only meaningful on odd sprites 1/3/5/7)
+//                       BPP2:      1 = 2-bit-per-pixel layout
+//                       COLOR_IDX: base palette index.  Sprite pixel value V
+//                                  (1..3 in 2bpp; 1..15 attached) selects
+//                                  colors[COLOR_IDX + V]; V = 0 is transparent.
+//                                  In 1bpp mode, only V = 1 is meaningful and
+//                                  it selects colors[COLOR_IDX].
 // Global enable: SPRENA ($70), bit i = enable for sprite i.
 // Priority: lower sprite number wins.  Sprites composite OVER the
 // bitplane image (sprite bit=1 means opaque, bit=0 means transparent).
@@ -49,7 +64,7 @@ module denise #(
     // of register space).
     input  wire        slv_req,
     input  wire        slv_we,
-    input  wire [7:0]  slv_addr,
+    input  wire [8:0]  slv_addr,        // bank bit [8] = 1 for $300..$3FF window
     input  wire [3:0]  slv_be,
     input  wire [31:0] slv_wdata,
     output reg  [31:0] slv_rdata,
@@ -61,26 +76,51 @@ module denise #(
     output reg  [31:0] mst_wdata,
     output reg  [3:0]  mst_be,
     input  wire        mst_ack,
-    input  wire [31:0] mst_rdata
+    input  wire [31:0] mst_rdata,
+
+    // Live raster position (the row currently being rasterised).  Held
+    // at its last value when idle.  Exported so the Copper can wait on
+    // a specific scanline via WAIT-RASTER.
+    output wire [15:0] vbeam_o
 );
     // ---------------- Registers programmed by the CPU ----------------
     reg [31:0] bplcon0;
     reg [31:0] bplcon1;
     reg [31:0] bplcon2;
-    reg [31:0] bpl_pt   [0:5];
+    reg [31:0] diwstrt;          // {Y_start[15:0], X_start[15:0]}, inclusive
+    reg [31:0] diwstop;          // {Y_stop[15:0],  X_stop[15:0]},  exclusive
+    wire [15:0] diw_x0 = diwstrt[15:0];
+    wire [15:0] diw_y0 = diwstrt[31:16];
+    wire [15:0] diw_x1 = diwstop[15:0];
+    wire [15:0] diw_y1 = diwstop[31:16];
+    reg [31:0] bpl_pt   [0:7];   // BPL1PT..BPL8PT (planes 6,7 used only in HAM8)
     reg [31:0] bpl_mod  [0:1];   // BPL1MOD (odd-plane stride bonus), BPL2MOD (even)
-    reg [31:0] colors   [0:31];
+    reg [31:0] colors   [0:63];  // colors[0..31] standard; [32..63] HAM8 base only
     reg [31:0] spr_pt   [0:7];
     reg [31:0] spr_ctl  [0:7];
     reg [7:0]  sprena;
     reg        den_busy;
 
     // BPLCON0 decode.
-    wire [2:0] nplanes = bplcon0[14:12];
-    wire       ham_en  = bplcon0[11];
-    wire       dpf_en  = bplcon0[10];
+    //   [14:12]   = BPU[2:0] (planes 0..7)
+    //   [11]      = HAM enable
+    //   [10]      = DPF enable
+    //   [4]       = BPU[3] — when set with HAM, selects HAM8 (8 planes, 6
+    //               bits of data + 2 control bits, 64-entry palette base).
+    wire [2:0] nplanes_lo = bplcon0[14:12];
+    wire       bpu_hi     = bplcon0[4];
+    wire [3:0] nplanes    = bpu_hi ? 4'd8 : {1'b0, nplanes_lo};
+    wire       ham_en     = bplcon0[11];
+    wire       dpf_en     = bplcon0[10];
+    wire       ham8_en    = ham_en && bpu_hi;          // HAM8: 8-plane HAM
+    wire       ham6_en    = ham_en && !bpu_hi && (nplanes_lo == 3'd6);
     // EHB is the implicit fall-through when nplanes=6 and neither HAM nor DPF.
-    wire       ehb_en  = (nplanes == 3'd6) && !ham_en && !dpf_en;
+    wire       ehb_en     = (nplanes == 4'd6) && !ham_en && !dpf_en;
+    // BPLCON0[15] = HIRES: 2x word-groups per row (32 instead of 16),
+    // producing FB_W = 512 chunky pixels per row.  Demo / test code must
+    // build with FB_W >= 512 for hires output to be visible end-to-end.
+    wire       hires_en   = bplcon0[15];
+    wire [4:0] wg_last    = hires_en ? 5'd31 : 5'd15;
 
     // BPLCON1 decode: horizontal scroll per playfield (4 bits each).
     //   PF1H = BPLCON1[3:0] (applied to planes 0, 2, 4 - "odd" 1-indexed)
@@ -88,8 +128,15 @@ module denise #(
     wire [3:0] pf1h = bplcon1[3:0];
     wire [3:0] pf2h = bplcon1[7:4];
 
-    // BPLCON2: PF2 priority over PF1 when bit 6 is set.
+    // BPLCON2: bit 6 = PF2-in-front-of-PF1 (DPF mode);
+    //          [5:3] = PF1P (playfield-1 vs. sprite-pair priority threshold);
+    //          [2:0] = PF2P (playfield-2 vs. sprite-pair priority threshold).
+    // A sprite-pair with level L is in front of playfield X iff L < PFxP.
+    // PFxP == 0 puts the playfield in front of every sprite; PFxP == 4+
+    // (the reset value of zero-extended bits) puts it behind every sprite.
     wire       pf2_pri = bplcon2[6];
+    wire [2:0] pf1p    = bplcon2[5:3];
+    wire [2:0] pf2p    = bplcon2[2:0];
 
     // ---------------- mst_req gating --------------------------------
     reg mst_req_r;
@@ -99,10 +146,25 @@ module denise #(
     integer rk;
     always @* begin
         slv_rdata = 32'd0;
+        if (slv_addr[8]) begin
+            // ---- Bank 1: $300..$3FF (HAM8 extension) ----
+            case (slv_addr[7:0])
+                8'h00: slv_rdata = bpl_pt[6];          // BPL7PT
+                8'h04: slv_rdata = bpl_pt[7];          // BPL8PT
+                default: begin
+                    if (slv_addr[7] == 1'b1) begin
+                        // $380..$3FF maps colors[32..63].
+                        slv_rdata = colors[{1'b1, slv_addr[6:2]}];
+                    end
+                end
+            endcase
+        end else
         case (slv_addr[7:0])
             8'h00: slv_rdata = bplcon0;
             8'h04: slv_rdata = bplcon1;
             8'h08: slv_rdata = bplcon2;
+            8'h0C: slv_rdata = diwstrt;
+            8'h74: slv_rdata = diwstop;
             8'h10: slv_rdata = bpl_pt[0];
             8'h14: slv_rdata = bpl_pt[1];
             8'h18: slv_rdata = bpl_pt[2];
@@ -134,7 +196,7 @@ module denise #(
             default: begin
                 if (slv_addr[7] == 1'b1) begin
                     // $80..$FF = COLOR00..COLOR1F (32 entries x 4 bytes).
-                    slv_rdata = colors[slv_addr[6:2]];
+                    slv_rdata = colors[{1'b0, slv_addr[6:2]}];
                 end
             end
         endcase
@@ -160,18 +222,23 @@ module denise #(
 
     // Per-row state.
     reg [15:0] row_idx;             // 0..FB_H-1
-    reg [31:0] row_bpl_pt [0:5];    // current row pointers (modified by reads)
+    reg [31:0] row_bpl_pt [0:7];    // current row pointers (modified by reads)
     reg [11:0] row_prev_color;      // HAM prev-color, init to COLOR00 each row
+
+    // Expose the current raster row to whoever consumes the chipset
+    // (the Copper wires this to its WAIT-RASTER comparator).
+    assign vbeam_o = row_idx;
 
     // Per-word-group state.
     reg [4:0]  wg_idx;              // 0..(FB_W/16 - 1)
-    reg [2:0]  pi_idx;              // current plane being fetched (0..5)
-    reg [15:0] plane_word [0:5];    // latched 16-bit word per plane
-    reg [15:0] plane_prev [0:5];    // previous word per plane (for scroll)
+    reg [3:0]  pi_idx;              // current plane being fetched (0..7)
+    reg [15:0] plane_word [0:7];    // latched 16-bit word per plane
+    reg [15:0] plane_prev [0:7];    // previous word per plane (for scroll)
 
     // Per-sprite running state.
     reg [31:0] spr_row_pt [0:7];    // running fetch pointer per sprite
-    reg [15:0] spr_word   [0:7];    // current row's sprite pixel word
+    reg [15:0] spr_word_a [0:7];    // current row's data_a (low plane)
+    reg [15:0] spr_word_b [0:7];    // current row's data_b (high plane); zero in 1bpp
     reg [7:0]  spr_active;          // bitmask: sprite i visible this row
     reg [3:0]  spr_idx;             // sprite walker during S_SPR_FETCH (0..8)
 
@@ -235,27 +302,55 @@ module denise #(
         end
     endfunction
 
-    // Sprite compositing.  Returns 6'b{hit, color_idx[4:0]}; hit=1 means a
-    // sprite is opaque at the given screen X.  Sprite 0 has highest
-    // priority.  Inactive sprites contribute nothing.
-    function [5:0] sprite_pixel;
-        input [7:0] screen_x;
+    // Sprite compositing.  Returns 9'b{hit, sprite_idx[2:0], color_idx[4:0]};
+    // hit=1 means an opaque sprite pixel exists at the given X.  Sprite 0
+    // has highest priority (returned first if multiple sprites overlap).
+    // sprite_idx is the index of the winning sprite; callers can derive
+    // the sprite-pair level (idx >> 1) for BPLCON2 priority comparisons.
+    //
+    // Handles 1bpp (data_b == 0), 2bpp, and ATTACHED pair mode.  When the
+    // odd sprite of a pair has ATT set we consider the pair as a single
+    // 4-bit (16-colour) sprite indexed by the odd sprite's base palette.
+    function [8:0] sprite_pixel;
+        input [8:0] screen_x;
         integer si;
+        reg [8:0] sx;
         reg done;
-        reg [7:0] sx;
         reg [3:0] bp;
         reg [4:0] cidx;
+        reg [3:0] sv;            // sprite pixel value (1bpp:0..1, 2bpp:0..3, ATT:0..15)
+        reg       att;           // odd partner has ATT bit set?
+        reg       bpp2;
+        reg       skip;
         begin
-            sprite_pixel = 6'd0;
+            sprite_pixel = 9'd0;
             done = 1'b0;
             for (si = 0; si < 8; si = si + 1) begin
-                if (!done && spr_active[si]) begin
-                    sx = spr_ctl[si][23:16];
-                    if (screen_x >= sx && screen_x < (sx + 8'd16)) begin
-                        bp   = 4'd15 - (screen_x - sx);
+                // The even sprite of an attached pair is "consumed" by the
+                // odd sprite's compositing path; skip standalone hit-check.
+                att  = spr_ctl[si | 1][7] && spr_ctl[si | 1][6];  // partner's ATT && BPP2
+                skip = (si[0] == 1'b0) && att;
+                bpp2 = spr_ctl[si][6];
+                if (!done && spr_active[si] && !skip) begin
+                    // Sprite X is 8-bit in SPRxCTL[23:16]; zero-extend so a
+                    // sprite placed at X < 256 still composites under hires.
+                    sx = {1'b0, spr_ctl[si][23:16]};
+                    if (screen_x >= sx && screen_x < (sx + 9'd16)) begin
+                        bp   = 4'd15 - (screen_x[3:0] - sx[3:0]);
                         cidx = spr_ctl[si][4:0];
-                        if (spr_word[si][bp]) begin
-                            sprite_pixel = {1'b1, cidx};
+                        if (si[0] && att) begin
+                            // ATT: combine even partner's two planes with odd's two.
+                            sv = {spr_word_b[si][bp], spr_word_a[si][bp],
+                                  spr_word_b[si & 3'b110][bp], spr_word_a[si & 3'b110][bp]};
+                        end else if (bpp2) begin
+                            sv = {2'd0, spr_word_b[si][bp], spr_word_a[si][bp]};
+                        end else begin
+                            sv = {3'd0, spr_word_a[si][bp]};
+                        end
+                        if (sv != 4'd0) begin
+                            // 1bpp: V=1 -> base.  2bpp: base+V.  ATT: base+V.
+                            sprite_pixel = {1'b1, si[2:0],
+                                            bpp2 ? (cidx + {1'b0, sv}) : cidx};
                             done = 1'b1;
                         end
                     end
@@ -267,15 +362,15 @@ module denise #(
     // Compose the 6-bit pixel value from the latched plane words, with
     // per-playfield horizontal scroll applied.  PF1 (odd planes 0,2,4)
     // uses PF1H; PF2 (even planes 1,3,5) uses PF2H.
-    function [5:0] pixel_value;
+    function [7:0] pixel_value;
         input [3:0] pix;
         integer pli;
-        reg [5:0] v;
+        reg [7:0] v;
         reg [15:0] scrolled;
         reg [3:0] sh;
         begin
-            v = 6'd0;
-            for (pli = 0; pli < 6; pli = pli + 1) begin
+            v = 8'd0;
+            for (pli = 0; pli < 8; pli = pli + 1) begin
                 if (pli < nplanes) begin
                     sh = (pli[0]) ? pf2h : pf1h;
                     scrolled = scrolled_word(plane_prev[pli], plane_word[pli], sh);
@@ -293,20 +388,21 @@ module denise #(
             bplcon0 <= 32'd0;
             bplcon1 <= 32'd0;
             bplcon2 <= 32'd0;
-            bpl_pt[0] <= 32'd0;
-            bpl_pt[1] <= 32'd0;
-            bpl_pt[2] <= 32'd0;
-            bpl_pt[3] <= 32'd0;
-            bpl_pt[4] <= 32'd0;
-            bpl_pt[5] <= 32'd0;
+            // Default DIW covers the entire rendered area (both lores 256
+            // and hires 512 widths).  Software that wants a narrower
+            // window must program DIWSTRT/DIWSTOP explicitly.
+            diwstrt <= 32'd0;
+            diwstop <= 32'hFFFF_FFFF;
+            for (i = 0; i < 8; i = i + 1) bpl_pt[i] <= 32'd0;
             bpl_mod[0] <= 32'd0;
             bpl_mod[1] <= 32'd0;
-            for (i = 0; i < 32; i = i + 1) colors[i] <= 32'd0;
+            for (i = 0; i < 64; i = i + 1) colors[i] <= 32'd0;
             for (i = 0; i < 8;  i = i + 1) begin
                 spr_pt[i]    <= 32'd0;
                 spr_ctl[i]   <= 32'd0;
                 spr_row_pt[i] <= 32'd0;
-                spr_word[i]  <= 16'd0;
+                spr_word_a[i] <= 16'd0;
+                spr_word_b[i] <= 16'd0;
             end
             sprena      <= 8'd0;
             spr_active  <= 8'd0;
@@ -315,18 +411,13 @@ module denise #(
 
             state <= S_IDLE;
             row_idx <= 16'd0;
-            row_bpl_pt[0] <= 32'd0;
-            row_bpl_pt[1] <= 32'd0;
-            row_bpl_pt[2] <= 32'd0;
-            row_bpl_pt[3] <= 32'd0;
-            row_bpl_pt[4] <= 32'd0;
-            row_bpl_pt[5] <= 32'd0;
+            for (i = 0; i < 8; i = i + 1) row_bpl_pt[i] <= 32'd0;
             row_prev_color <= 12'd0;
 
             wg_idx  <= 5'd0;
-            pi_idx  <= 3'd0;
-            for (i = 0; i < 6; i = i + 1) plane_word[i] <= 16'd0;
-            for (i = 0; i < 6; i = i + 1) plane_prev[i] <= 16'd0;
+            pi_idx  <= 4'd0;
+            for (i = 0; i < 8; i = i + 1) plane_word[i] <= 16'd0;
+            for (i = 0; i < 8; i = i + 1) plane_prev[i] <= 16'd0;
             px_idx <= 4'd0;
             pixel_buf <= 128'd0;
             wr_long_idx <= 2'd0;
@@ -340,10 +431,23 @@ module denise #(
         end else begin
             // -------- Slave writes --------
             if (slv_req && slv_we) begin
+                if (slv_addr[8]) begin
+                    // ---- Bank 1 writes ($300..$3FF) ----
+                    case (slv_addr[7:0])
+                        8'h00: bpl_pt[6] <= slv_wdata;
+                        8'h04: bpl_pt[7] <= slv_wdata;
+                        default: begin
+                            if (slv_addr[7] == 1'b1)
+                                colors[{1'b1, slv_addr[6:2]}] <= slv_wdata;
+                        end
+                    endcase
+                end else
                 case (slv_addr[7:0])
                     8'h00: bplcon0   <= slv_wdata;
                     8'h04: bplcon1   <= slv_wdata;
                     8'h08: bplcon2   <= slv_wdata;
+                    8'h0C: diwstrt   <= slv_wdata;
+                    8'h74: diwstop   <= slv_wdata;
                     8'h10: bpl_pt[0] <= slv_wdata;
                     8'h14: bpl_pt[1] <= slv_wdata;
                     8'h18: bpl_pt[2] <= slv_wdata;
@@ -368,6 +472,8 @@ module denise #(
                             row_bpl_pt[3] <= bpl_pt[3];
                             row_bpl_pt[4] <= bpl_pt[4];
                             row_bpl_pt[5] <= bpl_pt[5];
+                            row_bpl_pt[6] <= bpl_pt[6];
+                            row_bpl_pt[7] <= bpl_pt[7];
                             // Initialise sprite running pointers.
                             spr_row_pt[0] <= spr_pt[0];
                             spr_row_pt[1] <= spr_pt[1];
@@ -395,7 +501,7 @@ module denise #(
                     8'h7C: spr_ctl[7] <= slv_wdata;
                     default: begin
                         if (slv_addr[7] == 1'b1)
-                            colors[slv_addr[6:2]] <= slv_wdata;
+                            colors[{1'b0, slv_addr[6:2]}] <= slv_wdata;
                     end
                 endcase
             end
@@ -415,6 +521,8 @@ module denise #(
                     plane_prev[3] <= 16'd0;
                     plane_prev[4] <= 16'd0;
                     plane_prev[5] <= 16'd0;
+                    plane_prev[6] <= 16'd0;
+                    plane_prev[7] <= 16'd0;
                     state <= S_SPR_PREP;
                 end
 
@@ -436,7 +544,10 @@ module denise #(
                         end
                         // Clear stale sprite data so inactive slots don't
                         // bleed last row's pixels into the compositor.
-                        if (!mask[s]) spr_word[s] <= 16'd0;
+                        if (!mask[s]) begin
+                            spr_word_a[s] <= 16'd0;
+                            spr_word_b[s] <= 16'd0;
+                        end
                     end
                     spr_active <= mask;
                     spr_idx    <= 4'd0;
@@ -445,8 +556,10 @@ module denise #(
 
                 S_SPR_FETCH: begin
                     // Walk through sprites 0..7. For each active one, fetch
-                    // its current row word.  After all eight, jump to bitplane
-                    // processing.
+                    // its current row word(s).
+                    //   1bpp: one 16-bit half-word -> data_a, data_b = 0,
+                    //         pointer += 2.
+                    //   2bpp: one 32-bit word -> {data_a, data_b}, pointer += 4.
                     if (spr_idx == 4'd8) begin
                         mst_req_r <= 1'b0;
                         state     <= S_WG_INIT;
@@ -459,10 +572,19 @@ module denise #(
                         mst_be    <= 4'b1111;
                         if (mst_ack) begin
                             mst_req_r <= 1'b0;
-                            spr_word[spr_idx[2:0]] <= spr_row_pt[spr_idx[2:0]][1]
-                                ? mst_rdata[15:0]
-                                : mst_rdata[31:16];
-                            spr_row_pt[spr_idx[2:0]] <= spr_row_pt[spr_idx[2:0]] + 32'd2;
+                            if (spr_ctl[spr_idx[2:0]][6]) begin
+                                // 2bpp: full 32-bit row, A in high half, B in low half.
+                                spr_word_a[spr_idx[2:0]] <= mst_rdata[31:16];
+                                spr_word_b[spr_idx[2:0]] <= mst_rdata[15:0];
+                                spr_row_pt[spr_idx[2:0]] <= spr_row_pt[spr_idx[2:0]] + 32'd4;
+                            end else begin
+                                // 1bpp legacy: 16-bit half-word, data_b = 0.
+                                spr_word_a[spr_idx[2:0]] <= spr_row_pt[spr_idx[2:0]][1]
+                                    ? mst_rdata[15:0]
+                                    : mst_rdata[31:16];
+                                spr_word_b[spr_idx[2:0]] <= 16'd0;
+                                spr_row_pt[spr_idx[2:0]] <= spr_row_pt[spr_idx[2:0]] + 32'd2;
+                            end
                             spr_idx <= spr_idx + 4'd1;
                         end
                     end
@@ -470,7 +592,7 @@ module denise #(
 
                 S_WG_INIT: begin
                     wg_idx <= 5'd0;
-                    pi_idx <= 3'd0;
+                    pi_idx <= 4'd0;
                     px_idx <= 4'd0;
                     pixel_buf <= 128'd0;
                     state <= S_FETCH_P;
@@ -494,42 +616,68 @@ module denise #(
                                 ? mst_rdata[15:0]
                                 : mst_rdata[31:16];
                             row_bpl_pt[pi_idx] <= row_bpl_pt[pi_idx] + 32'd2;
-                            pi_idx <= pi_idx + 3'd1;
+                            pi_idx <= pi_idx + 4'd1;
                         end
                     end
                 end
 
                 S_PROC: begin : proc_block
-                    reg [5:0]  pv;
+                    reg [7:0]  pv;
                     reg [11:0] cur_color;
                     reg [1:0]  ham_ctrl;
-                    reg [3:0]  ham_data;
+                    reg [3:0]  ham_data;        // HAM6
+                    reg [5:0]  ham8_data;       // HAM8 (6-bit channel data)
+                    reg [3:0]  ham8_data4;      // ham8_data quantised to 4-bit
                     reg [2:0]  pf1_idx;
                     reg [2:0]  pf2_idx;
                     reg [3:0]  dpf_idx;
-                    reg [4:0]  palette_idx;
+                    reg [5:0]  palette_idx;
                     reg [11:0] palette_color;
                     reg [7:0]  rgb332;
-                    reg [5:0]  spr_hit;     // {hit, color_idx[4:0]}
-                    reg [7:0]  screen_x;
+                    reg [8:0]  spr_hit;     // {hit, sprite_idx[2:0], color_idx[4:0]}
+                    reg [1:0]  spr_pair;    // pair level (idx >> 1)
+                    reg        spr_front;   // sprite wins over playfield?
+                    reg        pf_is_bg;    // current pixel is the playfield background
+                    reg [8:0]  screen_x;
+                    reg        in_diw;      // (x,y) inside the display window
 
                     pv = pixel_value(px_idx);
-                    screen_x = {wg_idx[3:0], px_idx};
+                    screen_x = {wg_idx[4:0], px_idx};
                     spr_hit  = sprite_pixel(screen_x);
+                    spr_pair = spr_hit[7:6];
+                    in_diw   = ({7'd0, screen_x} >= diw_x0) && ({7'd0, screen_x} < diw_x1) &&
+                               (row_idx        >= diw_y0) && (row_idx        < diw_y1);
+                    // Outside the display window the playfield reverts to
+                    // background (COLOR00); sprites still composite over it.
+                    if (!in_diw) pv = 8'd0;
 
-                    if (ham_en && (nplanes == 3'd6)) begin
+                    if (ham8_en) begin
+                        // HAM8: 6 data bits + 2 control bits.  Control selects
+                        // palette base (64-entry) or modify-R/G/B with 6-bit
+                        // precision; we quantise the new channel to 4 bits.
+                        ham_ctrl  = pv[1:0];                 // BPL1/BPL2 = control
+                        ham8_data = pv[7:2];                 // BPL3..BPL8 = data
+                        ham8_data4 = ham8_data[5:2];         // top 4 bits -> 4-bit ch
+                        case (ham_ctrl)
+                            2'b00: cur_color = colors[ham8_data][11:0];
+                            2'b01: cur_color = {row_prev_color[11:4], ham8_data4};
+                            2'b10: cur_color = {ham8_data4, row_prev_color[7:0]};
+                            2'b11: cur_color = {row_prev_color[11:8], ham8_data4, row_prev_color[3:0]};
+                        endcase
+                        row_prev_color <= cur_color;
+                    end else if (ham6_en) begin
                         ham_ctrl = pv[5:4];
                         ham_data = pv[3:0];
                         case (ham_ctrl)
-                            2'b00: cur_color = colors[{1'b0, ham_data}][11:0];  // use palette[0..15]
-                            2'b01: cur_color = {row_prev_color[11:4], ham_data};            // modify B
-                            2'b10: cur_color = {ham_data, row_prev_color[7:0]};             // modify R
-                            2'b11: cur_color = {row_prev_color[11:8], ham_data, row_prev_color[3:0]}; // modify G
+                            2'b00: cur_color = colors[{2'b00, ham_data}][11:0];  // palette[0..15]
+                            2'b01: cur_color = {row_prev_color[11:4], ham_data};
+                            2'b10: cur_color = {ham_data, row_prev_color[7:0]};
+                            2'b11: cur_color = {row_prev_color[11:8], ham_data, row_prev_color[3:0]};
                         endcase
                         row_prev_color <= cur_color;
                     end else if (ehb_en) begin
                         // 6-plane EHB: bit 5 = half-brite flag, low 5 bits = palette index.
-                        palette_color = colors[pv[4:0]][11:0];
+                        palette_color = colors[{1'b0, pv[4:0]}][11:0];
                         cur_color = pv[5] ? color12_halfbrite(palette_color) : palette_color;
                     end else if (dpf_en) begin
                         // Dual playfield: planes 0,2,4 -> PF1 (low 3 bits),
@@ -548,19 +696,31 @@ module denise #(
                             else if (pf2_idx != 3'd0) dpf_idx = {1'b1, pf2_idx};
                             else                      dpf_idx = 4'd0;
                         end
-                        cur_color = colors[{1'b0, dpf_idx}][11:0];
+                        cur_color = colors[{2'b00, dpf_idx}][11:0];
                     end else begin
-                        // Plain indexed.  Truncate pv to log2(palette size) bits, capped at 5.
-                        palette_idx = {2'd0, pv[2:0]};
-                        if (nplanes >= 3'd4) palette_idx[3] = pv[3];
-                        if (nplanes >= 3'd5) palette_idx[4] = pv[4];
+                        // Plain indexed.  Build the palette index from the
+                        // active plane bits; index width follows nplanes (max 5).
+                        palette_idx = {3'd0, pv[2:0]};
+                        if (nplanes >= 4'd4) palette_idx[3] = pv[3];
+                        if (nplanes >= 4'd5) palette_idx[4] = pv[4];
                         cur_color = colors[palette_idx][11:0];
                     end
 
-                    // Sprite overlay: opaque sprite bits replace the bitplane
-                    // color before the RGB332 conversion.  Sprites always win
-                    // over bitplane (no playfield-vs-sprite priority logic).
-                    if (spr_hit[5]) cur_color = colors[spr_hit[4:0]][11:0];
+                    // Sprite vs. playfield priority.
+                    //   BPLCON2[5:3] = PF1P, BPLCON2[2:0] = PF2P.
+                    //   A sprite-pair with level L wins over playfield X iff
+                    //   L < PFxP.  PFxP == 0 puts the playfield in front of
+                    //   all sprites; PFxP >= 4 puts it behind all sprites
+                    //   (the historical default).  In non-DPF modes only
+                    //   PF1P is consulted; in DPF mode we apply each
+                    //   playfield's threshold independently and let the
+                    //   front-most playfield (per pf2_pri) take precedence
+                    //   only when no sprite would beat it.
+                    pf_is_bg = dpf_en ? (dpf_idx == 4'd0)
+                                      : (pv == 6'd0);
+                    spr_front = spr_hit[8] && ({1'b0, spr_pair} < pf1p);
+                    if (spr_hit[8] && (pf_is_bg || spr_front))
+                        cur_color = colors[{1'b0, spr_hit[4:0]}][11:0];
 
                     rgb332 = color12_to_rgb332(cur_color);
                     // Pack into pixel_buf at slot px_idx (leftmost = slot 0).
@@ -613,7 +773,7 @@ module denise #(
                 end
 
                 S_NEXT_WG: begin
-                    if (wg_idx == 5'd15) begin
+                    if (wg_idx == wg_last) begin
                         state <= S_ROW_END;
                     end else begin
                         // The word we just consumed becomes the "prev" word
@@ -624,8 +784,10 @@ module denise #(
                         plane_prev[3] <= plane_word[3];
                         plane_prev[4] <= plane_word[4];
                         plane_prev[5] <= plane_word[5];
+                        plane_prev[6] <= plane_word[6];
+                        plane_prev[7] <= plane_word[7];
                         wg_idx <= wg_idx + 5'd1;
-                        pi_idx <= 3'd0;
+                        pi_idx <= 4'd0;
                         px_idx <= 4'd0;
                         pixel_buf <= 128'd0;
                         state <= S_FETCH_P;
@@ -634,13 +796,16 @@ module denise #(
 
                 S_ROW_END: begin
                     // Apply per-row modulos.  BPL1MOD is added to all odd
-                    // planes (0-indexed 0, 2, 4); BPL2MOD to even (1, 3, 5).
+                    // 1-indexed planes (0-indexed 0, 2, 4, 6); BPL2MOD to
+                    // even (1, 3, 5, 7).
                     row_bpl_pt[0] <= row_bpl_pt[0] + bpl_mod[0];
                     row_bpl_pt[2] <= row_bpl_pt[2] + bpl_mod[0];
                     row_bpl_pt[4] <= row_bpl_pt[4] + bpl_mod[0];
+                    row_bpl_pt[6] <= row_bpl_pt[6] + bpl_mod[0];
                     row_bpl_pt[1] <= row_bpl_pt[1] + bpl_mod[1];
                     row_bpl_pt[3] <= row_bpl_pt[3] + bpl_mod[1];
                     row_bpl_pt[5] <= row_bpl_pt[5] + bpl_mod[1];
+                    row_bpl_pt[7] <= row_bpl_pt[7] + bpl_mod[1];
                     if (row_idx == FB_H[15:0] - 16'd1) begin
                         state <= S_DONE;
                     end else begin

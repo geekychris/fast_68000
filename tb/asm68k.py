@@ -45,8 +45,8 @@ Labels:
 import sys, re, struct
 
 class Asm:
-    EA_DREG, EA_AREG, EA_AIND, EA_AINC, EA_ADEC, EA_DISP, EA_EXT = 0, 1, 2, 3, 4, 5, 7
-    EA7_ABSW, EA7_ABSL, EA7_IMM = 0, 1, 4
+    EA_DREG, EA_AREG, EA_AIND, EA_AINC, EA_ADEC, EA_DISP, EA_INDEXED, EA_EXT = 0, 1, 2, 3, 4, 5, 6, 7
+    EA7_ABSW, EA7_ABSL, EA7_IMM, EA7_PCREL, EA7_PCIDX = 0, 1, 4, 2, 3
 
     CC = {
         't': 0, 'f': 1, 'hi': 2, 'ls': 3, 'cc': 4, 'cs': 5,
@@ -67,6 +67,8 @@ class Asm:
         if s.startswith('-'):
             neg = True
             s = s[1:]
+        # Allow underscores as digit separators (e.g. $00FE_0400, 1_000).
+        s = s.replace('_', '')
         if s.startswith('$'):
             v = int(s[1:], 16)
         elif s.startswith('0x'):
@@ -89,6 +91,32 @@ class Asm:
             disp = self.parse_int(m.group(1)) & 0xFFFF
             an = int(m.group(2))
             return (self.EA_DISP, an, [disp])
+        # d8(An, Xn.size)  -- indexed addressing, mode 6
+        m = re.fullmatch(
+            r'(-?(?:\$[0-9a-fA-F]+|0x[0-9a-fA-F]+|\d+))?\s*\(\s*A([0-7])\s*,\s*([DA])([0-7])\.([wlWL])\s*\)',
+            tok)
+        if m:
+            disp = (self.parse_int(m.group(1)) & 0xFF) if m.group(1) else 0
+            an = int(m.group(2))
+            xkind = m.group(3).upper()
+            xreg = int(m.group(4))
+            xL = 1 if m.group(5).lower() == 'l' else 0
+            ext = ((1 if xkind == 'A' else 0) << 15) | (xreg << 12) | (xL << 11) | disp
+            return (self.EA_INDEXED, an, [ext])
+        # d16(PC) — PC-relative with 16-bit displacement.  Resolved in pass 2.
+        m = re.fullmatch(r'([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*PC\s*\)', tok, re.I)
+        if m:
+            return (self.EA_EXT, self.EA7_PCREL, [('pcrel16', m.group(1))])
+        # d8(PC, Xn.size) — PC-relative indexed.  Resolved in pass 2.
+        m = re.fullmatch(
+            r'([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*PC\s*,\s*([DA])([0-7])\.([wlWL])\s*\)',
+            tok, re.I)
+        if m:
+            xkind = m.group(2).upper()
+            xreg = int(m.group(3))
+            xL = 1 if m.group(4).lower() == 'l' else 0
+            ext_hdr = ((1 if xkind == 'A' else 0) << 15) | (xreg << 12) | (xL << 11)
+            return (self.EA_EXT, self.EA7_PCIDX, [('pcrel8', m.group(1), ext_hdr)])
         # (Ar)
         m = re.fullmatch(r'\(A([0-7])\)', tok, re.I)
         if m: return (self.EA_AIND, int(m.group(1)), [])
@@ -107,14 +135,14 @@ class Asm:
             v = self.parse_int(inner) & 0xFFFFFFFF
             return (self.EA_EXT, self.EA7_IMM, [(v >> 16) & 0xFFFF, v & 0xFFFF])
         # abs.w
-        m = re.fullmatch(r'\$([0-9a-fA-F]+)\.w', tok, re.I)
+        m = re.fullmatch(r'\$([0-9a-fA-F_]+)\.w', tok, re.I)
         if m:
-            v = int(m.group(1), 16) & 0xFFFF
+            v = int(m.group(1).replace('_',''), 16) & 0xFFFF
             return (self.EA_EXT, self.EA7_ABSW, [v])
         # abs.L
-        m = re.fullmatch(r'\$([0-9a-fA-F]+)', tok)
+        m = re.fullmatch(r'\$([0-9a-fA-F_]+)', tok)
         if m:
-            v = int(m.group(1), 16) & 0xFFFFFFFF
+            v = int(m.group(1).replace('_',''), 16) & 0xFFFFFFFF
             return (self.EA_EXT, self.EA7_ABSL, [(v >> 16) & 0xFFFF, v & 0xFFFF])
         # Label (resolved later as abs.L). Store as ('lbl', name) markers so
         # emit_ea_ext records the fixup PC at the actual emit site.
@@ -130,6 +158,16 @@ class Asm:
         for w in ea[2]:
             if isinstance(w, tuple) and w[0] in ('lbl_hi', 'lbl_lo'):
                 self.fixups.append(('abs32_word', self.pc, w[0], w[1]))
+                self.emit(0)
+            elif isinstance(w, tuple) and w[0] == 'pcrel16':
+                # PC-relative 16-bit displacement.  Real 68k PC for this
+                # access = the address of this extension word.
+                self.fixups.append(('pcrel16', self.pc, w[1]))
+                self.emit(0)
+            elif isinstance(w, tuple) and w[0] == 'pcrel8':
+                # PC-relative 8-bit displacement embedded in the indexed
+                # extension word; high 8 bits already encoded in w[2].
+                self.fixups.append(('pcrel8', self.pc, w[1], w[2]))
                 self.emit(0)
             else:
                 self.emit(w)
@@ -169,9 +207,11 @@ class Asm:
             return
         # Label
         m = re.match(r'([A-Za-z_][A-Za-z0-9_]*):\s*(.*)', line)
+        label_name = None
         if m:
-            self.labels[m.group(1)] = self.pc
+            label_name = m.group(1)
             line = m.group(2).strip()
+            self.labels[label_name] = self.pc
             if not line: return
         # Directives
         if line.startswith('.org'):
@@ -181,7 +221,23 @@ class Asm:
             for tok in [t.strip() for t in line[5:].split(',')]:
                 self.emit(self.parse_int(tok))
             return
+        if line.startswith('.align'):
+            n = self.parse_int(line.split()[1])
+            while self.pc % n:
+                self.emit(0)
+            return
         if line.startswith('.long'):
+            # Auto-align to 4-byte boundary so .long values are long-aligned.
+            # Bump any labels that were set at the pre-aligned PC up to the
+            # aligned PC (so `label:` on the line above resolves to the
+            # actual data position, not the padding bytes).
+            old_pc = self.pc
+            while self.pc % 4:
+                self.emit(0)
+            if self.pc != old_pc:
+                for lbl, lpc in self.labels.items():
+                    if lpc == old_pc:
+                        self.labels[lbl] = self.pc
             for tok in [t.strip() for t in line[5:].split(',')]:
                 try:
                     v = self.parse_int(tok) & 0xFFFFFFFF
@@ -277,15 +333,15 @@ class Asm:
             if src.lower() == 'sr':
                 ea = self.parse_ea(operands[1])
                 self.emit((0b0100_0000 << 8) | (0b11 << 6) | (ea[0] << 3) | ea[1])
-                self.emit_ea_ext(ea)
+                self.emit_ea_ext_sized(ea, 'w')
             elif dst == 'ccr':
                 ea = self.parse_ea(operands[0])
                 self.emit((0b0100_0100 << 8) | (0b11 << 6) | (ea[0] << 3) | ea[1])
-                self.emit_ea_ext(ea)
+                self.emit_ea_ext_sized(ea, 'w')
             elif dst == 'sr':
                 ea = self.parse_ea(operands[0])
                 self.emit((0b0100_0110 << 8) | (0b11 << 6) | (ea[0] << 3) | ea[1])
-                self.emit_ea_ext(ea)
+                self.emit_ea_ext_sized(ea, 'w')
         elif mnem == 'stop':
             imm = self.parse_int(operands[0]) & 0xFFFF
             self.emit(0x4E72)
@@ -320,12 +376,26 @@ class Asm:
             self.emit_ea_ext_sized(src, mnem[-1])
             self.emit_ea_ext_sized(dst, mnem[-1])
         elif mnem in ('add.l', 'sub.l', 'and.l', 'or.l', 'cmp.l'):
-            src = self.parse_ea(operands[0])
-            dn = self.reg(operands[1], 'D')
-            tab = {'add.l': 0b1101, 'sub.l': 0b1001, 'and.l': 0b1100, 'or.l': 0b1000, 'cmp.l': 0b1011}
-            op = (tab[mnem] << 12) | (dn << 9) | (0b010 << 6) | (src[0] << 3) | src[1]
-            self.emit(op)
-            self.emit_ea_ext(src)
+            # If the destination is an An register, real assemblers auto-promote
+            # ADD/SUB/CMP to ADDA/SUBA/CMPA.  AND/OR have no An-dest form.
+            promoted = None
+            if mnem in ('add.l','sub.l','cmp.l') and \
+                  re.fullmatch(r'A[0-7]', operands[1].strip(), re.I):
+                promoted = {'add.l':'adda.l','sub.l':'suba.l','cmp.l':'cmpa.l'}[mnem]
+            if promoted:
+                src = self.parse_ea(operands[0])
+                an  = self.reg(operands[1], 'A')
+                top4 = {'adda.l': 0b1101, 'suba.l': 0b1001, 'cmpa.l': 0b1011}[promoted]
+                op = (top4 << 12) | (an << 9) | (0b111 << 6) | (src[0] << 3) | src[1]
+                self.emit(op)
+                self.emit_ea_ext(src)
+            else:
+                src = self.parse_ea(operands[0])
+                dn = self.reg(operands[1], 'D')
+                tab = {'add.l': 0b1101, 'sub.l': 0b1001, 'and.l': 0b1100, 'or.l': 0b1000, 'cmp.l': 0b1011}
+                op = (tab[mnem] << 12) | (dn << 9) | (0b010 << 6) | (src[0] << 3) | src[1]
+                self.emit(op)
+                self.emit_ea_ext(src)
         elif mnem in ('adda.l', 'suba.l', 'cmpa.l', 'adda.w', 'suba.w', 'cmpa.w'):
             # ADDA/SUBA/CMPA Dn-like-source -> An.  Encoding:
             #   ADDA.W = 1101 ddd 011 mmm rrr ; ADDA.L = 1101 ddd 111 mmm rrr
@@ -378,6 +448,25 @@ class Asm:
             dn = self.reg(operands[0], 'D')
             op = (0b0100_1000_0100_0 << 3) | dn
             self.emit(op)
+        elif mnem == 'exg':
+            a = operands[0].strip().upper()
+            b = operands[1].strip().upper()
+            ma = re.fullmatch(r'([DA])([0-7])', a)
+            mb = re.fullmatch(r'([DA])([0-7])', b)
+            if not ma or not mb:
+                raise SyntaxError(f"exg expects two registers, got {operands!r}")
+            ka, ra = ma.group(1), int(ma.group(2))
+            kb, rb = mb.group(1), int(mb.group(2))
+            if ka == 'D' and kb == 'D':
+                # EXG Dx,Dy: 1100 xxx 1 01000 yyy → 0xC140 base
+                op = 0xC140 | (ra << 9) | rb
+            elif ka == 'A' and kb == 'A':
+                op = 0xC148 | (ra << 9) | rb
+            elif ka == 'D' and kb == 'A':
+                op = 0xC188 | (ra << 9) | rb
+            else:   # exg A, D — canonical form swaps to D, A
+                op = 0xC188 | (rb << 9) | ra
+            self.emit(op)
         elif mnem in ('addi.b', 'addi.w', 'addi.l',
                        'subi.b', 'subi.w', 'subi.l',
                        'andi.b', 'andi.w', 'andi.l',
@@ -385,6 +474,20 @@ class Asm:
                        'eori.b', 'eori.w', 'eori.l',
                        'cmpi.b', 'cmpi.w', 'cmpi.l'):
             family, _, sz_str = mnem.partition('.')
+            # ANDI/ORI/EORI to CCR is always .B; to SR is always .W.  Real
+            # assemblers accept any size suffix when the dst is CCR/SR.
+            if family in ('andi', 'ori', 'eori') and len(operands) == 2:
+                dst = operands[1].strip().lower()
+                if dst in ('ccr', 'sr'):
+                    fam = {'ori':0b0000,'andi':0b0010,'eori':0b1010}[family]
+                    imm = self.parse_int(operands[0])
+                    if dst == 'ccr':
+                        self.emit((0b0000 << 12) | (fam << 8) | 0b0011_1100)
+                        self.emit(imm & 0xFF)
+                    else:
+                        self.emit((0b0000 << 12) | (fam << 8) | 0b0111_1100)
+                        self.emit(imm & 0xFFFF)
+                    return
             ss = {'b': 0b00, 'w': 0b01, 'l': 0b10}[sz_str]
             fam = {'ori':0b0000,'andi':0b0010,'subi':0b0100,'addi':0b0110,'eori':0b1010,'cmpi':0b1100}[family]
             imm = self.parse_int(operands[0])
@@ -566,6 +669,22 @@ class Asm:
                 if disp < -32768 or disp > 32767:
                     raise SyntaxError(f"dbcc disp16 out of range to {target}")
                 self.words[words_by_pc[pc]] = (pc, disp & 0xFFFF)
+            elif fix[0] == 'pcrel16':
+                # PC-relative 16-bit displacement; the 68k PC during the
+                # access points at the extension-word address (pc).
+                _, pc, target = fix
+                tgt = self.labels[target] if target in self.labels else self.parse_int(target)
+                disp = tgt - pc
+                if disp < -32768 or disp > 32767:
+                    raise SyntaxError(f"pcrel16 out of range to {target}")
+                self.words[words_by_pc[pc]] = (pc, disp & 0xFFFF)
+            elif fix[0] == 'pcrel8':
+                _, pc, target, ext_hdr = fix
+                tgt = self.labels[target] if target in self.labels else self.parse_int(target)
+                disp = tgt - pc
+                if disp < -128 or disp > 127:
+                    raise SyntaxError(f"pcrel8 out of range to {target}")
+                self.words[words_by_pc[pc]] = (pc, ext_hdr | (disp & 0xFF))
 
     def to_hex(self, mem_words):
         """Pack 16-bit half-words into 32-bit big-endian memory words."""

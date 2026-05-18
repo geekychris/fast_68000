@@ -37,11 +37,12 @@
         bne   fail
 
         ;------------------------------------------------------------
-        ; RTR: build a frame with CCR (Z=1) and a return PC. RTR should
-        ; restore CCR and jump to the PC, but not change supervisor mode.
+        ; RTR: build a canonical 68000 6-byte frame ([SP+0]=CCR word,
+        ; [SP+2]=PC long).  RTR pops CCR (using low byte) and PC, no SR
+        ; upper-byte change.
         ;------------------------------------------------------------
-        move.l #after_rtr, -(A7)   ; push PC
-        move.l #$0000_0004, -(A7)  ; push CCR=Z=1 (low byte = 0x04)
+        move.l #after_rtr, -(A7)   ; push PC (4 bytes)
+        move.w #$0004, -(A7)       ; push CCR word (Z=1)
         rtr                         ; pop CCR + PC, jump
 
         ; If RTR doesn't work, we keep falling through:

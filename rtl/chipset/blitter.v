@@ -47,7 +47,15 @@
 //   $38  BLTSIZE  [21:6] = height (number of rows / pixels in line mode)
 //                  [5:0]  = width-in-words (max 63; 0 is treated as 64).
 //                  *Writing this register starts a blit.*
-//   $3C  BLTSTAT  RO: bit 0 = BUSY.
+//   $3C  BLTSTAT  RO: bit 0 = BUSY.  Bit 1 = BZERO (set when the entire
+//                  D-channel image written by the most recent blit was
+//                  all-zero; cleared as soon as any non-zero word is
+//                  written, and reset to 1 at the start of each blit).
+//
+// Interrupt: int_o pulses high for one cycle the cycle the blit finishes
+// (transition out of S_DONE).  Wire it to your interrupt controller of
+// choice; it is *not* required for the Copper's WAIT-BLITTER, which uses
+// busy_o.
 
 
 
@@ -77,7 +85,10 @@ module blitter (
     input  wire [31:0] mst_rdata,
 
     // Live busy flag for the Copper (or any other consumer) to sample.
-    output wire        busy_o
+    output wire        busy_o,
+
+    // One-cycle pulse on blit completion (rising edge of !busy_o).
+    output reg         int_o
 );
     reg mst_req_r;
     assign mst_req = mst_req_r && !mst_ack;
@@ -99,6 +110,7 @@ module blitter (
     reg [15:0] blt_width;       // words per row (after BLTSIZE decode)
     reg [15:0] blt_height;      // rows
     reg        blt_busy;
+    reg        blt_bzero;       // tracks "no non-zero D-word written yet"
     assign busy_o = blt_busy;
 
     // Decoded BLTCON fields.
@@ -137,7 +149,7 @@ module blitter (
             4'hC: slv_rdata = bltbdat_pre;
             4'hD: slv_rdata = bltcdat_pre;
             4'hE: slv_rdata = {6'd0, blt_height, blt_width[5:0], 4'd0};
-            4'hF: slv_rdata = {31'd0, blt_busy};
+            4'hF: slv_rdata = {30'd0, blt_bzero, blt_busy};
             default: slv_rdata = 32'd0;
         endcase
         // Single-cycle ack for register accesses.
@@ -331,6 +343,8 @@ module blitter (
             blt_width    <= 16'd0;
             blt_height   <= 16'd0;
             blt_busy     <= 1'b0;
+            blt_bzero    <= 1'b1;
+            int_o        <= 1'b0;
 
             state          <= S_IDLE;
             cur_word       <= 16'd0;
@@ -350,6 +364,10 @@ module blitter (
             mst_wdata <= 32'd0;
             mst_be    <= 4'b0000;
         end else begin
+            // Default: int_o is a single-cycle pulse; clear it every cycle
+            // unless S_DONE sets it this cycle.
+            int_o <= 1'b0;
+
             // -------- Slave writes (CPU programs registers) --------
             if (slv_req && slv_we) begin
                 case (slv_addr[5:2])
@@ -376,6 +394,7 @@ module blitter (
                                           ? 16'd64
                                           : {10'd0, slv_wdata[5:0]};
                             blt_busy   <= 1'b1;
+                            blt_bzero  <= 1'b1;
                             cur_word   <= 16'd0;
                             cur_row    <= 16'd0;
                             a_prev_word <= 16'd0;
@@ -483,6 +502,9 @@ module blitter (
                             b_prev_word <= b_cur_word_q;
                             // Update fill carry from this word's processing.
                             fill_carry  <= filled[16];
+                            // BZERO tracks D-channel output: clear as soon
+                            // as any non-zero word is committed.
+                            if (final_w != 16'd0) blt_bzero <= 1'b0;
                             bltdpt <= bltdpt + (desc ? -32'sd2 : 32'sd2);
                             if (cur_word == (blt_width - 16'd1)) begin
                                 cur_word <= 16'd0;
@@ -534,6 +556,7 @@ module blitter (
                 end
                 S_DONE: begin
                     blt_busy <= 1'b0;
+                    int_o    <= 1'b1;        // one-cycle pulse
                     state    <= S_IDLE;
                 end
 
@@ -549,14 +572,17 @@ module blitter (
                         state <= S_LWRD;
                     end
                 end
-                S_LWRD: begin
+                S_LWRD: begin : lwrd_block
+                    reg [15:0] lw;
+                    lw = line_combine();
                     mst_req_r <= 1'b1;
                     mst_we    <= 1'b1;
                     mst_addr  <= bltdpt;
                     mst_be    <= half_be(bltdpt[1]);
-                    mst_wdata <= put_half(line_combine(), bltdpt[1]);
+                    mst_wdata <= put_half(lw, bltdpt[1]);
                     if (mst_ack) begin
                         mst_req_r <= 1'b0;
+                        if (lw != 16'd0) blt_bzero <= 1'b0;
                         state <= S_LSTEP;
                     end
                 end

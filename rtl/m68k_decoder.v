@@ -211,6 +211,10 @@ module m68k_decoder (
                 dst_ext_words = ea_ext(m3, r0, (m3 == `EA_DREG) ? `SZ_L : `SZ_B);
                 size = (m3 == `EA_DREG) ? `SZ_L : `SZ_B;
                 alu_op = {3'd0, opcode[7:6]};  // 00..11 selects sub-op
+                // For static BIT-op on Dn the dest register is r0; route it
+                // into reg_idx so the EX stage reads the correct Dn.
+                reg_idx = r0;
+                reg_is_a = 1'b0;
             end
 
             // Bit ops dynamic: 0000_ddd_1xx_mm_rrr — uses Dd as bit number.
@@ -258,32 +262,10 @@ module m68k_decoder (
             //         NOP, STOP, MOVE-to/from-SR/CCR, MOVEM, CHK).
             // ----------------------------------------------------------
 
-            // NEGX/CLR/NEG/NOT (xx_ss_mm_rrr)
-            16'b0100_0010_??_??_????: begin  // CLR
-                kind = K_CLR;
-                size = size76(opcode[7:6]);
-                src_mode = m3;
-                src_reg  = r0;
-                src_ext_words = ea_ext(m3, r0, size);
-                alu_op = `ALU_CLR;
-            end
-            16'b0100_0100_??_??_????: begin  // NEG
-                kind = K_NEG;
-                size = size76(opcode[7:6]);
-                src_mode = m3;
-                src_reg  = r0;
-                src_ext_words = ea_ext(m3, r0, size);
-                alu_op = `ALU_NEG;
-            end
-            16'b0100_0110_??_??_????: begin  // NOT
-                kind = K_NOT;
-                size = size76(opcode[7:6]);
-                src_mode = m3;
-                src_reg  = r0;
-                src_ext_words = ea_ext(m3, r0, size);
-                alu_op = `ALU_NOT;
-            end
-
+            // MOVE from SR / MOVE to CCR / MOVE to SR must be matched BEFORE
+            // CLR/NEG/NOT/TST because those broad patterns include bits 7:6 == 11
+            // (which encodes the SR/CCR variants).
+            //
             // MOVE from SR: 0100_0000_11_mm_rrr (W)
             16'b0100_0000_11_??_????: begin
                 kind = K_MOVESR;
@@ -310,6 +292,32 @@ module m68k_decoder (
                 src_mode = m3;
                 src_reg  = r0;
                 src_ext_words = ea_ext(m3, r0, `SZ_W);
+            end
+
+            // NEGX/CLR/NEG/NOT (xx_ss_mm_rrr)
+            16'b0100_0010_??_??_????: begin  // CLR
+                kind = K_CLR;
+                size = size76(opcode[7:6]);
+                src_mode = m3;
+                src_reg  = r0;
+                src_ext_words = ea_ext(m3, r0, size);
+                alu_op = `ALU_CLR;
+            end
+            16'b0100_0100_??_??_????: begin  // NEG
+                kind = K_NEG;
+                size = size76(opcode[7:6]);
+                src_mode = m3;
+                src_reg  = r0;
+                src_ext_words = ea_ext(m3, r0, size);
+                alu_op = `ALU_NEG;
+            end
+            16'b0100_0110_??_??_????: begin  // NOT
+                kind = K_NOT;
+                size = size76(opcode[7:6]);
+                src_mode = m3;
+                src_reg  = r0;
+                src_ext_words = ea_ext(m3, r0, size);
+                alu_op = `ALU_NOT;
             end
 
             // EXT.W Dn: 0100_1000_10_000_rrr
@@ -648,12 +656,12 @@ module m68k_decoder (
                 src_reg  = r0;
                 src_ext_words = ea_ext(m3, r0, `SZ_W);
             end
-            // EXG Dx,Dy: 1100_xxx_101_00_0_yyy
-            // EXG Ax,Ay: 1100_xxx_101_01_0_yyy
-            // EXG Dx,Ay: 1100_xxx_110_00_1_yyy
-            16'b1100_???_101_00_???,
-            16'b1100_???_101_01_???,
-            16'b1100_???_110_00_???: begin
+            // EXG Dx,Dy: 1100_xxx_1_01000_yyy   (opmode field bits 8:3)
+            // EXG Ax,Ay: 1100_xxx_1_01001_yyy
+            // EXG Dx,Ay: 1100_xxx_1_10001_yyy
+            16'b1100_???_101_000_???,
+            16'b1100_???_101_001_???,
+            16'b1100_???_110_001_???: begin
                 kind = K_EXG;
                 size = `SZ_L;
                 reg_idx = r9;  // Rx

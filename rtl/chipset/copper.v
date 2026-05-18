@@ -8,21 +8,27 @@
 // Differences from the real Amiga Copper (intentional):
 //   - 32-bit-friendly instruction encoding: each instruction is 8 bytes
 //     (two longs) instead of the Amiga's two 16-bit words.
-//   - No raster WAIT (we have no Denise / no beam-position counter yet).
-//     WAIT here means "wait for blitter not-busy."
-//   - No SKIP (deferred; the few use cases on Amiga are for blitter
-//     priority and copper-banks, neither of which we model yet).
+//   - Raster WAIT compares against Denise's `row_idx` only (no horizontal
+//     position).  Sufficient for per-scanline palette/register swaps.
 //
 // Instruction encoding (per 8-byte slot):
 //
 //   long 0 = target address (32-bit byte address)
-//   long 1 = data (32-bit, written to target on MOVE)
+//   long 1 = data (32-bit, written to target on MOVE; Y position for
+//                  raster WAIT/SKIP; ignored otherwise)
 //
 //   Special target values:
 //       $FFFF_FFFF : HALT - stop the Copper, COP_BUSY <- 0.
-//       $FFFF_FFFE : WAIT - block until blitter goes busy and then idle.
+//       $FFFF_FFFE : WAIT-BLITTER - block until blitter goes busy then
+//                    idle.
 //       $FFFF_FFFD : SKIP-IF-BLITTER-BUSY - skip the next instruction
 //                    (8 bytes) if the blitter is currently busy.
+//       $FFFF_FFFC : WAIT-RASTER - block until vbeam_i >= data_q[15:0].
+//                    Used to synchronise to Denise's scanline so a
+//                    subsequent MOVE rewrites a Denise register before
+//                    the rasterizer reaches the relevant rows.
+//       $FFFF_FFFB : SKIP-IF-RASTER-PAST - skip the next instruction if
+//                    vbeam_i >= data_q[15:0].
 //       (everything else) : MOVE - write long 1 to the target address.
 //
 //   MOVE writes are 32-bit-wide bus transactions with BE = 4'b1111.
@@ -32,9 +38,11 @@
 //
 // Register map (CPU-facing slave port at $00FE_0040..$00FE_007F):
 //
-//   $00FE_0040 COP1LC   RW   32-bit byte address of the Copper list start
+//   $00FE_0040 COP1LC   RW   32-bit byte address of Copper list 1
 //   $00FE_0044 COPJMP1  W    write any value to (re)start the Copper at COP1LC
 //   $00FE_0048 COPSTAT  RO   bit 0 = COP_BUSY
+//   $00FE_004C COP2LC   RW   32-bit byte address of Copper list 2
+//   $00FE_0050 COPJMP2  W    write any value to (re)start the Copper at COP2LC
 
 
 
@@ -60,10 +68,16 @@ module copper (
     input  wire [31:0] mst_rdata,
 
     // Live blitter-busy signal so we can implement WAIT.
-    input  wire        blt_busy_i
+    input  wire        blt_busy_i,
+
+    // Current Denise raster row (valid while Denise is rasterising; held
+    // at its last value when idle).  Lets the Copper synchronise to the
+    // bitplane pipeline so it can rewrite Denise registers per-scanline.
+    input  wire [15:0] vbeam_i
 );
     // ---------------- Registers programmed by the CPU ----------------
     reg [31:0] cop1lc;
+    reg [31:0] cop2lc;
     reg        cop_busy;
 
     // ---------------- Internal state ---------------------------------
@@ -72,9 +86,10 @@ module copper (
     localparam S_FETCH_D    = 4'd2;   // fetch instruction word 1 (data)
     localparam S_DECODE     = 4'd3;
     localparam S_WRITE      = 4'd4;   // MOVE: write data to target
-    localparam S_WAIT_RISE  = 4'd5;   // WAIT: blitter must go busy first
-    localparam S_WAIT_FALL  = 4'd6;   // WAIT: ...then idle
+    localparam S_WAIT_RISE  = 4'd5;   // WAIT-BLITTER: blitter must go busy first
+    localparam S_WAIT_FALL  = 4'd6;   // WAIT-BLITTER: ...then idle
     localparam S_HALT       = 4'd7;
+    localparam S_WAIT_VBEAM = 4'd8;   // WAIT-RASTER: vbeam_i >= data_q[15:0]
 
     reg [3:0]  state;
     reg [31:0] pc;
@@ -88,10 +103,12 @@ module copper (
 
     // ---------------- CPU slave reads --------------------------------
     always @* begin
-        case (slv_addr[3:2])
-            2'd0: slv_rdata = cop1lc;       // $40 COP1LC
-            2'd1: slv_rdata = 32'd0;        // $44 COPJMP1 (write-only; read returns 0)
-            2'd2: slv_rdata = {31'd0, cop_busy};  // $48 COPSTAT
+        case (slv_addr[4:2])
+            3'd0: slv_rdata = cop1lc;             // $40 COP1LC
+            3'd1: slv_rdata = 32'd0;              // $44 COPJMP1 (write-only)
+            3'd2: slv_rdata = {31'd0, cop_busy};  // $48 COPSTAT
+            3'd3: slv_rdata = cop2lc;             // $4C COP2LC
+            3'd4: slv_rdata = 32'd0;              // $50 COPJMP2 (write-only)
             default: slv_rdata = 32'd0;
         endcase
     end
@@ -100,6 +117,7 @@ module copper (
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             cop1lc    <= 32'd0;
+            cop2lc    <= 32'd0;
             cop_busy  <= 1'b0;
             state     <= S_IDLE;
             pc        <= 32'd0;
@@ -113,11 +131,19 @@ module copper (
         end else begin
             // -------- CPU slave writes --------
             if (slv_req && slv_we) begin
-                case (slv_addr[3:2])
-                    2'd0: cop1lc <= slv_wdata;        // COP1LC
-                    2'd1: begin                        // COPJMP1: strobe-start
+                case (slv_addr[4:2])
+                    3'd0: cop1lc <= slv_wdata;        // COP1LC
+                    3'd1: begin                        // COPJMP1: strobe-start at COP1LC
                         if (!cop_busy) begin
                             pc       <= cop1lc;
+                            cop_busy <= 1'b1;
+                            state    <= S_FETCH_T;
+                        end
+                    end
+                    3'd3: cop2lc <= slv_wdata;        // COP2LC
+                    3'd4: begin                        // COPJMP2: strobe-start at COP2LC
+                        if (!cop_busy) begin
+                            pc       <= cop2lc;
                             cop_busy <= 1'b1;
                             state    <= S_FETCH_T;
                         end
@@ -167,6 +193,14 @@ module copper (
                         // SKIP-IF-BLITTER-BUSY: if busy, skip next 8 bytes.
                         if (blt_busy_i) pc <= pc + 32'd8;
                         state <= S_FETCH_T;
+                    end else if (target_q == 32'hFFFF_FFFC) begin
+                        // WAIT-RASTER: pause until vbeam_i reaches data_q[15:0].
+                        state <= S_WAIT_VBEAM;
+                    end else if (target_q == 32'hFFFF_FFFB) begin
+                        // SKIP-IF-RASTER-PAST-Y: skip next 8 bytes if
+                        // vbeam_i is already at/past the target Y.
+                        if (vbeam_i >= data_q[15:0]) pc <= pc + 32'd8;
+                        state <= S_FETCH_T;
                     end else begin
                         state <= S_WRITE;
                     end
@@ -193,6 +227,10 @@ module copper (
 
                 S_WAIT_FALL: begin
                     if (!blt_busy_i) state <= S_FETCH_T;
+                end
+
+                S_WAIT_VBEAM: begin
+                    if (vbeam_i >= data_q[15:0]) state <= S_FETCH_T;
                 end
 
                 S_HALT: begin

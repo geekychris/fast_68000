@@ -7,7 +7,11 @@ module m68k_top #(
     parameter N_CORES    = 2,
     parameter USE_CACHE  = 1,           // 1 = real L1 caches, 0 = bus passthrough
     parameter MEM_WORDS  = 16384,
-    parameter MEM_HEXFILE = "program.hex"
+    parameter FB_W       = 256,         // chunky framebuffer width (256 lores, 512 hires)
+    parameter MEM_HEXFILE = "program.hex",
+    parameter ROM_WORDS  = 1,            // size of the $F80000+ ROM in 32-bit words
+    parameter MEM_HEXFILE_ROM = "",      // optional Kickstart-style ROM hex
+    parameter OVL_RESET  = 1'b0           // 1 -> CIA-A /OVL active at reset (Amiga-faithful)
 )(
     input  wire clk,
     input  wire rst_n,
@@ -47,7 +51,13 @@ module m68k_top #(
     wire                  snoop_valid;
     wire [31:0]           snoop_addr;
     wire [PID_BITS-1:0]   snoop_src_id;
-    wire [2:0]            irq_level;
+    // The bus drives a memory-mapped IRQ register at $FFFF_FFFC (legacy
+    // test-bench interface used by t15_irq).  Paula's INTREQ/INTENA priority
+    // chain drives `paula_irq_level`.  The CPU should see the higher of the
+    // two.
+    wire [2:0]            bus_irq_level;
+    wire [2:0]            irq_level = (bus_irq_level > paula_irq_level)
+                                      ? bus_irq_level : paula_irq_level;
 
     // Blitter slave wires.
     wire        blt_slv_req;
@@ -68,7 +78,7 @@ module m68k_top #(
     // Denise slave wires.
     wire        den_slv_req;
     wire        den_slv_we;
-    wire [7:0]  den_slv_addr;
+    wire [8:0]  den_slv_addr;
     wire [3:0]  den_slv_be;
     wire [31:0] den_slv_wdata;
     wire [31:0] den_slv_rdata;
@@ -81,13 +91,39 @@ module m68k_top #(
     wire [31:0] pau_slv_wdata;
     wire [31:0] pau_slv_rdata;
 
+    // CIA-A / CIA-B slave wires (8-bit registers).
+    wire        cia_a_slv_req;
+    wire        cia_a_slv_we;
+    wire [3:0]  cia_a_slv_addr;
+    wire [7:0]  cia_a_slv_wdata;
+    wire [7:0]  cia_a_slv_rdata;
+    wire        cia_b_slv_req;
+    wire        cia_b_slv_we;
+    wire [3:0]  cia_b_slv_addr;
+    wire [7:0]  cia_b_slv_wdata;
+    wire [7:0]  cia_b_slv_rdata;
+    wire        cia_a_int;
+    wire        cia_b_int;
+    // CIA-A port A drives /OVL on bit 0 (active low).  The bus clears its
+    // OVL latch when CIA-A actively drives bit 0 low.
+    wire [7:0]  cia_a_pa_out;
+    wire [7:0]  cia_a_pa_oe;
+    wire        ovl_clr = cia_a_pa_oe[0] & ~cia_a_pa_out[0];
+
     // Blitter busy signal exposed to the Copper (for WAIT).
     wire        blt_busy;
+    // One-cycle pulse on each blit completion.  Not currently routed
+    // into an interrupt controller, but exposed so test/demo code or a
+    // future Paula-style int controller can observe it.
+    wire        blt_int;
 
     m68k_bus #(
-        .N_PORTS    (N_PORTS),
-        .MEM_WORDS  (MEM_WORDS),
-        .MEM_HEXFILE(MEM_HEXFILE)
+        .N_PORTS        (N_PORTS),
+        .MEM_WORDS      (MEM_WORDS),
+        .MEM_HEXFILE    (MEM_HEXFILE),
+        .ROM_WORDS      (ROM_WORDS),
+        .MEM_HEXFILE_ROM(MEM_HEXFILE_ROM),
+        .OVL_RESET      (OVL_RESET)
     ) u_bus (
         .clk         (clk),
         .rst_n       (rst_n),
@@ -103,7 +139,7 @@ module m68k_top #(
         .snoop_valid (snoop_valid),
         .snoop_addr  (snoop_addr),
         .snoop_src_id(snoop_src_id),
-        .irq_level   (irq_level),
+        .irq_level   (bus_irq_level),
         .fb_peek_addr(fb_peek_addr),
         .fb_peek_data(fb_peek_data),
         .blt_slv_req (blt_slv_req),
@@ -129,7 +165,56 @@ module m68k_top #(
         .pau_slv_addr(pau_slv_addr),
         .pau_slv_be  (pau_slv_be),
         .pau_slv_wdata(pau_slv_wdata),
-        .pau_slv_rdata(pau_slv_rdata)
+        .pau_slv_rdata(pau_slv_rdata),
+        .cia_a_slv_req  (cia_a_slv_req),
+        .cia_a_slv_we   (cia_a_slv_we),
+        .cia_a_slv_addr (cia_a_slv_addr),
+        .cia_a_slv_wdata(cia_a_slv_wdata),
+        .cia_a_slv_rdata(cia_a_slv_rdata),
+        .cia_b_slv_req  (cia_b_slv_req),
+        .cia_b_slv_we   (cia_b_slv_we),
+        .cia_b_slv_addr (cia_b_slv_addr),
+        .cia_b_slv_wdata(cia_b_slv_wdata),
+        .cia_b_slv_rdata(cia_b_slv_rdata),
+        .ovl_clr_i      (ovl_clr)
+    );
+
+    // CIA-A and CIA-B.  Tick every bus cycle for now (10x real Amiga rate)
+    // -- when we split into chip-clock vs CPU-clock domains we'll gate this.
+    cia u_cia_a (
+        .clk      (clk),
+        .rst_n    (rst_n),
+        .slv_req  (cia_a_slv_req),
+        .slv_we   (cia_a_slv_we),
+        .slv_addr (cia_a_slv_addr),
+        .slv_wdata(cia_a_slv_wdata),
+        .slv_rdata(cia_a_slv_rdata),
+        .tick     (1'b1),
+        .pa_in    (8'd0),
+        .pb_in    (8'd0),
+        .pa_out   (cia_a_pa_out),
+        .pa_oe    (cia_a_pa_oe),
+        .pb_out   (),
+        .pb_oe    (),
+        .int_o    (cia_a_int)
+    );
+
+    cia u_cia_b (
+        .clk      (clk),
+        .rst_n    (rst_n),
+        .slv_req  (cia_b_slv_req),
+        .slv_we   (cia_b_slv_we),
+        .slv_addr (cia_b_slv_addr),
+        .slv_wdata(cia_b_slv_wdata),
+        .slv_rdata(cia_b_slv_rdata),
+        .tick     (1'b1),
+        .pa_in    (8'd0),
+        .pb_in    (8'd0),
+        .pa_out   (),
+        .pa_oe    (),
+        .pb_out   (),
+        .pb_oe    (),
+        .int_o    (cia_b_int)
     );
 
     // Blitter instance.  Its master port plugs into the bus at index
@@ -159,7 +244,8 @@ module m68k_top #(
         .mst_be       (blt_mst_be),
         .mst_ack      (blt_mst_ack),
         .mst_rdata    (blt_mst_rdata),
-        .busy_o       (blt_busy)
+        .busy_o       (blt_busy),
+        .int_o        (blt_int)
     );
 
     // Wire the blitter master into the arbiter at BLT_PORT.
@@ -197,7 +283,8 @@ module m68k_top #(
         .mst_be     (cop_mst_be),
         .mst_ack    (cop_mst_ack),
         .mst_rdata  (cop_mst_rdata),
-        .blt_busy_i (blt_busy)
+        .blt_busy_i (blt_busy),
+        .vbeam_i    (vbeam)
     );
 
     // Wire the Copper master into the arbiter at COP_PORT.
@@ -210,6 +297,10 @@ module m68k_top #(
     assign cop_mst_ack   = p_resp_valid[COP_PORT];
     assign cop_mst_rdata = p_resp_data;
 
+    // Live Denise raster row, fed into the Copper's vbeam_i for
+    // raster-aligned MOVEs.
+    wire [15:0] vbeam;
+
     // Denise master wires.
     wire        den_mst_req;
     wire        den_mst_we;
@@ -219,7 +310,7 @@ module m68k_top #(
     wire        den_mst_ack;
     wire [31:0] den_mst_rdata;
 
-    denise u_den (
+    denise #(.FB_W(FB_W)) u_den (
         .clk        (clk),
         .rst_n      (rst_n),
         .slv_req    (den_slv_req),
@@ -234,7 +325,8 @@ module m68k_top #(
         .mst_wdata  (den_mst_wdata),
         .mst_be     (den_mst_be),
         .mst_ack    (den_mst_ack),
-        .mst_rdata  (den_mst_rdata)
+        .mst_rdata  (den_mst_rdata),
+        .vbeam_o    (vbeam)
     );
 
     assign p_req  [DEN_PORT]                  = den_mst_req;
@@ -255,6 +347,8 @@ module m68k_top #(
     wire        pau_mst_ack;
     wire [31:0] pau_mst_rdata;
 
+    wire [2:0] paula_irq_level;
+
     paula u_pau (
         .clk        (clk),
         .rst_n      (rst_n),
@@ -272,7 +366,13 @@ module m68k_top #(
         .mst_ack    (pau_mst_ack),
         .mst_rdata  (pau_mst_rdata),
         .audio_l_o  (audio_l),
-        .audio_r_o  (audio_r)
+        .audio_r_o  (audio_r),
+        .cia_a_int_i (cia_a_int),
+        .cia_b_int_i (cia_b_int),
+        .blt_int_i   (blt_int),
+        .cop_int_i   (1'b0),           // copper int not wired yet
+        .vblank_int_i(1'b0),           // denise vblank pulse not yet exposed
+        .irq_level_o (paula_irq_level)
     );
 
     assign p_req  [PAU_PORT]                  = pau_mst_req;

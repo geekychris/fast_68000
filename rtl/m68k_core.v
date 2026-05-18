@@ -109,10 +109,12 @@ module m68k_core #(
     localparam S_LOAD          = 4'd1;
     localparam S_STORE         = 4'd2;
     localparam S_TASW          = 4'd3;
+    // Canonical 68000 exception frame: 6 bytes total, [SP+0]=SR (word),
+    // [SP+2]=PC (long).  We push PC first (long), then SR (word).
     localparam S_EXC_PUSH_PC   = 4'd4;  // push 32-bit PC at (SSP-4)
-    localparam S_EXC_PUSH_SR   = 4'd5;  // push 32-bit {0,SR} at (SSP-4)
+    localparam S_EXC_PUSH_SR   = 4'd5;  // push 16-bit SR  at (SSP-2)
     localparam S_EXC_FETCH     = 4'd6;  // read 32-bit vector from (vec*4)
-    localparam S_RTE_POP_SR    = 4'd7;  // pop 32-bit SR (low 16 used)
+    localparam S_RTE_POP_SR    = 4'd7;  // pop 16-bit SR/CCR word
     localparam S_RTE_POP_PC    = 4'd8;  // pop 32-bit PC
     localparam S_RMW_W         = 4'd9;  // RMW write phase (NEG/NOT to memory)
     localparam S_MOVEM         = 4'd10; // MOVEM register-list iterator
@@ -462,7 +464,27 @@ module m68k_core #(
             default:                             id_rb_idx = 4'd0;
         endcase
     end
-    wire [3:0] id_rc_idx = 4'd15;  // A7 / SP always available on third port
+    // Third regfile read port: usually A7 (so the EX stage can use the SP for
+    // JSR/BSR/RTS/LINK/UNLK/exception stack handling).  When the current
+    // instruction uses EA_IDX as its src effective address, repurpose this
+    // port to read the index register (D/A xreg encoded in the brief
+    // extension word) so we can compute An + Xn + d8 in the EX stage.
+    // EA_IDX as dst is rare in practice; we route the port to src's X reg
+    // when src uses EA_IDX, else to dst's X reg, else to A7.
+    // Repurpose the rc port only when the assembler actually emitted an
+    // EA_IDX extension word.  Some opcodes (RTS, RTE, ...) leave src_mode at
+    // the default-decoded m3 = opcode[5:3] which can equal EA_IDX (3'd6)
+    // even though there's no EA in play.  Gating on src_ext_words avoids
+    // hijacking rc and breaking SP-using kinds.
+    wire        id_src_is_idx = (idec_src_mode == `EA_IDX) && (idec_src_ext_words != 2'd0);
+    wire        id_dst_is_idx = (idec_dst_mode == `EA_IDX) && (idec_dst_ext_words != 2'd0);
+    wire [15:0] id_src_ext0 = id_ext[0];
+    wire [15:0] id_dst_ext0 = id_ext[idec_src_ext_words];
+    wire [3:0]  id_src_xreg = {id_src_ext0[15], id_src_ext0[14:12]};
+    wire [3:0]  id_dst_xreg = {id_dst_ext0[15], id_dst_ext0[14:12]};
+    wire [3:0] id_rc_idx = id_src_is_idx ? id_src_xreg
+                         : id_dst_is_idx ? id_dst_xreg
+                         : 4'd15;
 
     wire [31:0] rf_ra_data, rf_rb_data, rf_rc_data;
 
@@ -650,10 +672,28 @@ module m68k_core #(
                 src_ea = ex_ra + ex_src_imm32;
                 src_needs_mem = 1'b1;
             end
+            `EA_IDX: begin
+                // d8(An, Xn.size): brief extension word in low 16 bits of
+                // ex_src_imm32.  ex_sp was muxed to read the index register
+                // during ID so its value is available here.
+                src_ea = ex_ra
+                       + (ex_src_imm32[11] ? ex_sp
+                                           : {{16{ex_sp[15]}}, ex_sp[15:0]})
+                       + {{24{ex_src_imm32[7]}}, ex_src_imm32[7:0]};
+                src_needs_mem = 1'b1;
+            end
             `EA_EXT: begin
                 case (ex_src_reg)
                     `EA7_ABSW, `EA7_ABSL: begin src_ea = ex_src_imm32; src_needs_mem = 1'b1; end
                     `EA7_PCDISP:          begin src_ea = ex_pc + 32'd2 + ex_src_imm32; src_needs_mem = 1'b1; end
+                    `EA7_PCIDX: begin
+                        // d8(PC, Xn.size): same as EA_IDX but base = PC + 2.
+                        src_ea = ex_pc + 32'd2
+                               + (ex_src_imm32[11] ? ex_sp
+                                                   : {{16{ex_sp[15]}}, ex_sp[15:0]})
+                               + {{24{ex_src_imm32[7]}}, ex_src_imm32[7:0]};
+                        src_needs_mem = 1'b1;
+                    end
                     `EA7_IMM:             src_operand = ex_src_imm32;
                     default: ;
                 endcase
@@ -684,6 +724,16 @@ module m68k_core #(
             end
             `EA_DISP: begin
                 dst_ea = ex_rb + ex_dst_imm32;
+                dst_is_mem = 1'b1;
+            end
+            `EA_IDX: begin
+                // Same as src EA_IDX, but uses ex_rb (dst An base).  When dst
+                // is EA_IDX we mux rc to dst's xreg, so ex_sp holds the index
+                // value here.
+                dst_ea = ex_rb
+                       + (ex_dst_imm32[11] ? ex_sp
+                                           : {{16{ex_sp[15]}}, ex_sp[15:0]})
+                       + {{24{ex_dst_imm32[7]}}, ex_dst_imm32[7:0]};
                 dst_is_mem = 1'b1;
             end
             `EA_EXT: begin
@@ -881,7 +931,8 @@ module m68k_core #(
     wire load_starts_rmw = (ex_kind == K_NEG) || (ex_kind == K_NOT);
     wire is_settled_after_load = (ex_state == S_LOAD)  && dc_ack &&
                                  ex_valid && !halted && (ex_kind != K_TAS) &&
-                                 !(load_starts_rmw && (ex_src_mode != `EA_DREG));
+                                 !(load_starts_rmw && (ex_src_mode != `EA_DREG)) &&
+                                 !(ex_kind == K_MOVE && dst_is_mem);
     wire is_settled_after_store= (ex_state == S_STORE) && dc_ack && ex_valid && !halted;
     wire is_settled_after_tasw = (ex_state == S_TASW)  && dc_ack && ex_valid && !halted;
     wire is_settled_after_exc  = (ex_state == S_EXC_FETCH) && dc_ack && ex_valid && !halted;
@@ -987,9 +1038,12 @@ module m68k_core #(
                         want_be = 4'b1111;
                     end
                     K_LEA: begin
+                        // src_ea is computed correctly for every memory-shaped
+                        // source mode, including absolute, PC-relative, and
+                        // PC-indexed.
                         wb_main_we_c = 1'b1;
                         wb_main_idx_c = ex_reg_idx_full;
-                        wb_main_data_c = (ex_src_mode == `EA_EXT) ? ex_src_imm32 : src_ea;
+                        wb_main_data_c = src_ea;
                     end
                     K_MOVEQ: begin
                         wb_main_we_c = 1'b1;
@@ -1007,8 +1061,20 @@ module m68k_core #(
                         end else if (dst_is_mem) begin
                             want_mem = 1'b1; want_we = 1'b1;
                             want_addr = dst_ea;
-                            want_wdata = src_operand;
-                            want_be = 4'b1111;
+                            case (ex_size)
+                                `SZ_B: begin
+                                    want_be    = be_for_byte(dst_ea[1:0]);
+                                    want_wdata = byte_into_word(src_operand[7:0], dst_ea[1:0]);
+                                end
+                                `SZ_W: begin
+                                    want_be    = be_for_word(dst_ea[1]);
+                                    want_wdata = word_into_word(src_operand[15:0], dst_ea[1]);
+                                end
+                                default: begin
+                                    want_be    = 4'b1111;
+                                    want_wdata = src_operand;
+                                end
+                            endcase
                         end else begin
                             wb_main_we_c = 1'b1;
                             wb_main_idx_c = (ex_dst_mode == `EA_AREG) ? {1'b1, ex_dst_reg}
@@ -1640,9 +1706,13 @@ module m68k_core #(
                 case (ex_kind)
                     K_MOVE: begin
                         // For memory-to-memory moves the destination is not a
-                        // register, so suppress register writeback.  The
-                        // sequential block chains a store to dst_ea after the
-                        // load completes.
+                        // register, so suppress register writeback for the
+                        // loaded value.  The sequential block chains a store
+                        // to dst_ea after the load completes; src_an / dst_an
+                        // commits are emitted by the S_STORE K_MOVE handler
+                        // when the instruction settles, NOT here -- otherwise
+                        // wb_we drives the regfile while the chained store
+                        // is still in flight.
                         if (!dst_is_mem) begin
                             wb_main_we_c = 1'b1;
                             wb_main_idx_c = (ex_dst_mode == `EA_AREG) ? {1'b1, ex_dst_reg}
@@ -1666,11 +1736,11 @@ module m68k_core #(
                                 end
                             endcase
                             cc_we_c = (ex_dst_mode == `EA_DREG);
-                        end
-                        if (src_an_update) begin
-                            wb_aux_we_c = 1'b1;
-                            wb_aux_idx_c = {1'b1, ex_src_reg};
-                            wb_aux_data_c = src_an_next;
+                            if (src_an_update) begin
+                                wb_aux_we_c = 1'b1;
+                                wb_aux_idx_c = {1'b1, ex_src_reg};
+                                wb_aux_data_c = src_an_next;
+                            end
                         end
                     end
                     K_ALU: begin
@@ -1814,6 +1884,17 @@ module m68k_core #(
                             wb_aux_idx_c = {1'b1, ex_dst_reg};
                             wb_aux_data_c = dst_an_next;
                         end
+                        // For mem-to-mem moves the src An post-inc/pre-dec
+                        // must also commit at this settle (the S_LOAD case
+                        // emitted it on wb_aux, but wb_aux is now claimed by
+                        // dst An).  Route src An through wb_main, which is
+                        // unused since K_MOVE with dst_is_mem has no data
+                        // register writeback.
+                        if (src_an_update) begin
+                            wb_main_we_c   = 1'b1;
+                            wb_main_idx_c  = {1'b1, ex_src_reg};
+                            wb_main_data_c = src_an_next;
+                        end
                     end
                     K_JSR: begin
                         wb_aux_we_c = 1'b1;
@@ -1862,6 +1943,10 @@ module m68k_core #(
             default: ;
         endcase
     end
+
+    // (No early An commit during mem-to-mem K_MOVE chained S_LOAD->S_STORE.
+    //  Both src An and dst An updates ride along at S_STORE settle now
+    //  that the S_STORE K_MOVE handler emits both.)
 
     // Drive wb_* combinationally.
     always @* begin
@@ -2160,13 +2245,19 @@ module m68k_core #(
                 end
                 S_EXC_PUSH_PC: begin
                     if (dc_ack) begin
-                        // PC pushed. Now push SR at (working_sp - 4).
-                        working_sp <= working_sp - 32'd4;
+                        // PC pushed at working_sp.  Push 16-bit SR next at
+                        // (working_sp - 2): the canonical 68000 frame puts SR
+                        // immediately below PC, total 6 bytes.  With the SP
+                        // aligned, the SR word lands in bytes 2-3 of the
+                        // 32-bit aligned word at working_sp - 4, so the byte
+                        // enables are 4'b0011 and the value goes in
+                        // dc_wdata[15:0].
+                        working_sp <= working_sp - 32'd2;
                         dc_req_r <= 1'b1;
                         dc_we    <= 1'b1;
-                        dc_addr  <= working_sp - 32'd4;
+                        dc_addr  <= working_sp - 32'd2;
                         dc_wdata <= {16'd0, ex_exc_saved_sr};
-                        dc_be    <= 4'b1111;
+                        dc_be    <= 4'b0011;
                         ex_state <= S_EXC_PUSH_SR;
                     end
                 end
@@ -2198,8 +2289,11 @@ module m68k_core #(
                 end
                 S_RTE_POP_SR: begin
                     if (dc_ack) begin
-                        // Top word popped. For RTE, it's a full SR word; for
-                        // RTR, only the CCR (low byte) is restored.
+                        // The cache returns the full 32-bit aligned word that
+                        // contains the SR.  With working_sp[1:0] == 10 (the
+                        // canonical 6-byte frame), SR lives in bytes 2-3 of
+                        // the aligned word -> dc_rdata[15:0].  Restore CCR
+                        // always; restore the upper SR byte only for RTE.
                         ex_exc_saved_sr <= dc_rdata[15:0];
                         if (ex_kind == K_RTE) begin
                             sr_t <= dc_rdata[`SR_T];
@@ -2211,10 +2305,10 @@ module m68k_core #(
                         cc_z <= dc_rdata[`SR_Z];
                         cc_v <= dc_rdata[`SR_V];
                         cc_c <= dc_rdata[`SR_C];
-                        working_sp <= working_sp + 32'd4;
+                        working_sp <= working_sp + 32'd2;
                         dc_req_r <= 1'b1;
                         dc_we    <= 1'b0;
-                        dc_addr  <= working_sp + 32'd4;
+                        dc_addr  <= working_sp + 32'd2;
                         dc_be    <= 4'b1111;
                         ex_state <= S_RTE_POP_PC;
                     end

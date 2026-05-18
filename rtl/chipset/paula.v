@@ -45,7 +45,20 @@ module paula (
 
     // Audio output: signed 16-bit stereo, updated continuously.
     output reg signed [15:0] audio_l_o,
-    output reg signed [15:0] audio_r_o
+    output reg signed [15:0] audio_r_o,
+
+    // External interrupt source pins (level-sensitive).  Rising edges latch
+    // into INTREQ; the corresponding bits also auto-load from internal audio
+    // channel completion (not implemented yet — defer).
+    input  wire        cia_a_int_i,    // PORTS  (bit 3,  IPL 2)
+    input  wire        cia_b_int_i,    // EXTER  (bit 13, IPL 6)
+    input  wire        blt_int_i,      // BLIT   (bit 6,  IPL 3)
+    input  wire        cop_int_i,      // COPER  (bit 4,  IPL 3)
+    input  wire        vblank_int_i,   // VERTB  (bit 5,  IPL 3)
+
+    // 3-bit IPL output for the CPU's IRQ controller.  Computed from the
+    // priority of INTREQ & INTENA bits when INTEN (intena[14]) is set.
+    output reg  [2:0]  irq_level_o
 );
     // --------------- Registers ---------------
     reg [3:0]  audena;                 // channel enables
@@ -54,6 +67,63 @@ module paula (
     reg [15:0] aud_per  [0:3];
     reg [6:0]  aud_vol  [0:3];
     reg        aud_oneshot [0:3];      // AUDxLEN bit 31: don't auto-loop
+
+    // --------------- Interrupt controller ---------------
+    // INTREQ bit assignments (Amiga canonical):
+    //   0  TBE      1  DSKBLK    2  SOFT     3  PORTS (CIA-A)
+    //   4  COPER    5  VERTB     6  BLIT     7..10 AUD0..3
+    //   11 RBF      12 DSKSYN    13 EXTER (CIA-B)
+    //   bit 14 (INTREQ) reserved; bit 14 of INTENA is INTEN (master enable).
+    reg [13:0] intreq;
+    reg [14:0] intena;
+
+    // Edge-detect external pins; the rising-edge OR into INTREQ.
+    reg cia_a_int_last, cia_b_int_last, blt_int_last, cop_int_last, vblank_int_last;
+    wire cia_a_edge  = cia_a_int_i  & ~cia_a_int_last;
+    wire cia_b_edge  = cia_b_int_i  & ~cia_b_int_last;
+    wire blt_edge    = blt_int_i    & ~blt_int_last;
+    wire cop_edge    = cop_int_i    & ~cop_int_last;
+    wire vblank_edge = vblank_int_i & ~vblank_int_last;
+
+    wire [13:0] intreq_hw_set = {
+        cia_b_edge,           // 13 EXTER
+        1'b0,                 // 12 DSKSYN
+        1'b0,                 // 11 RBF
+        1'b0,                 // 10 AUD3
+        1'b0,                 // 9 AUD2
+        1'b0,                 // 8 AUD1
+        1'b0,                 // 7 AUD0
+        blt_edge,             // 6 BLIT
+        vblank_edge,          // 5 VERTB
+        cop_edge,             // 4 COPER
+        cia_a_edge,           // 3 PORTS
+        1'b0,                 // 2 SOFT
+        1'b0,                 // 1 DSKBLK
+        1'b0                  // 0 TBE
+    };
+
+    // 16-bit read views (bit 15 always 0).
+    wire [15:0] intenar_w = {1'b0, intena};
+    wire [15:0] intreqr_w = {2'b00, intreq};
+
+    // Combined pending & enabled. Mask off INTEN (bit 14) since intreq has
+    // no bit 14, and INTENA bit 14 is the master enable, not a source.
+    wire [13:0] combined = intreq & intena[13:0];
+    always @* begin
+        if (!intena[14])                       irq_level_o = 3'd0;
+        else if (combined[13])                 irq_level_o = 3'd6;
+        else if (combined[12] | combined[11])  irq_level_o = 3'd5;
+        else if (|combined[10:7])              irq_level_o = 3'd4;
+        else if (|combined[6:4])               irq_level_o = 3'd3;
+        else if (combined[3])                  irq_level_o = 3'd2;
+        else if (|combined[2:0])               irq_level_o = 3'd1;
+        else                                   irq_level_o = 3'd0;
+    end
+
+    // Pick the 16-bit half of slv_wdata that the access targets.  Even byte
+    // offsets at lane 0 take the upper half of the 32-bit word; offset 2
+    // takes the lower half.  Matches the CPU's 68k big-endian word lane.
+    wire [15:0] wdata_w = slv_addr[1] ? slv_wdata[15:0] : slv_wdata[31:16];
 
     // --------------- Per-channel state ---------------
     reg [31:0] ch_cur_addr   [0:3];    // running fetch address
@@ -72,23 +142,34 @@ module paula (
     always @* begin
         slv_rdata = 32'd0;
         case (slv_addr[7:0])
+            // INTENAR ($1C) and INTREQR ($1E) live in the same 32-bit word.
+            // Pack INTENAR in the upper half (read at $1C) and INTREQR in
+            // the lower half (read at $1E); a .L read at $1C gets both.
+            // Interrupt control reads.
+            8'h1C, 8'h1E: slv_rdata = {intenar_w, intreqr_w};
+            // AUDENA (artificial; real Amiga uses DMACON bits 0..3).
             8'h00: slv_rdata = {28'd0, audena};
-            8'h10: slv_rdata = aud_lc[0];
-            8'h14: slv_rdata = {16'd0, aud_len[0]};
-            8'h18: slv_rdata = {16'd0, aud_per[0]};
-            8'h1C: slv_rdata = {25'd0, aud_vol[0]};
-            8'h20: slv_rdata = aud_lc[1];
-            8'h24: slv_rdata = {16'd0, aud_len[1]};
-            8'h28: slv_rdata = {16'd0, aud_per[1]};
-            8'h2C: slv_rdata = {25'd0, aud_vol[1]};
-            8'h30: slv_rdata = aud_lc[2];
-            8'h34: slv_rdata = {16'd0, aud_len[2]};
-            8'h38: slv_rdata = {16'd0, aud_per[2]};
-            8'h3C: slv_rdata = {25'd0, aud_vol[2]};
-            8'h40: slv_rdata = aud_lc[3];
-            8'h44: slv_rdata = {16'd0, aud_len[3]};
-            8'h48: slv_rdata = {16'd0, aud_per[3]};
-            8'h4C: slv_rdata = {25'd0, aud_vol[3]};
+            // Audio channel regs at Amiga-canonical offsets:
+            //   AUDxLC  .L  at $A0 + 0x10*x
+            //   AUDxLEN .W  at +$4
+            //   AUDxPER .W  at +$6
+            //   AUDxVOL .W  at +$8
+            8'hA0: slv_rdata = aud_lc[0];
+            8'hA4: slv_rdata = {16'd0, aud_len[0]};
+            8'hA6: slv_rdata = {16'd0, aud_per[0]};
+            8'hA8: slv_rdata = {25'd0, aud_vol[0]};
+            8'hB0: slv_rdata = aud_lc[1];
+            8'hB4: slv_rdata = {16'd0, aud_len[1]};
+            8'hB6: slv_rdata = {16'd0, aud_per[1]};
+            8'hB8: slv_rdata = {25'd0, aud_vol[1]};
+            8'hC0: slv_rdata = aud_lc[2];
+            8'hC4: slv_rdata = {16'd0, aud_len[2]};
+            8'hC6: slv_rdata = {16'd0, aud_per[2]};
+            8'hC8: slv_rdata = {25'd0, aud_vol[2]};
+            8'hD0: slv_rdata = aud_lc[3];
+            8'hD4: slv_rdata = {16'd0, aud_len[3]};
+            8'hD6: slv_rdata = {16'd0, aud_per[3]};
+            8'hD8: slv_rdata = {25'd0, aud_vol[3]};
             default: slv_rdata = 32'd0;
         endcase
     end
@@ -148,27 +229,63 @@ module paula (
             mst_addr  <= 32'd0;
             mst_wdata <= 32'd0;
             mst_be    <= 4'b0000;
+            intreq <= 14'd0;
+            intena <= 15'd0;
+            cia_a_int_last  <= 1'b0;
+            cia_b_int_last  <= 1'b0;
+            blt_int_last    <= 1'b0;
+            cop_int_last    <= 1'b0;
+            vblank_int_last <= 1'b0;
         end else begin
+            // Latch external interrupt-source pins one cycle for edge detect.
+            cia_a_int_last  <= cia_a_int_i;
+            cia_b_int_last  <= cia_b_int_i;
+            blt_int_last    <= blt_int_i;
+            cop_int_last    <= cop_int_i;
+            vblank_int_last <= vblank_int_i;
+
+            // Hardware sources rising-edge OR into INTREQ every cycle.  A
+            // simultaneous software write below can further set/clear bits;
+            // the SET wave (sw OR hw) wins over CLR in the same cycle since
+            // SET is OR'd in after the AND-mask.
+            intreq <= intreq | intreq_hw_set;
+
             // ---- slave writes ----
             if (slv_req && slv_we) begin
                 case (slv_addr[7:0])
+                    // INTENA at $9A.  Word access lives in the lower half of
+                    // the 32-bit word at $98 (slv_addr[1]=1, wdata_w from low
+                    // half).  Bit 15 of the 16-bit value = SET/CLR; bits 14:0
+                    // are the bits to affect (bit 14 = INTEN).
+                    8'h9A: begin
+                        if (wdata_w[15]) intena <= intena | wdata_w[14:0];
+                        else             intena <= intena & ~wdata_w[14:0];
+                    end
+                    // INTREQ at $9C.  Upper half of word at $9C.  Only bits
+                    // 13:0 are real sources; bit 14 of the 16-bit value is
+                    // reserved on INTREQ.
+                    8'h9C: begin
+                        if (wdata_w[15]) intreq <= (intreq | wdata_w[13:0]) | intreq_hw_set;
+                        else             intreq <= (intreq & ~wdata_w[13:0]) | intreq_hw_set;
+                    end
                     8'h00: audena <= slv_wdata[3:0];
-                    8'h10: aud_lc[0]  <= slv_wdata;
-                    8'h14: begin aud_len[0] <= slv_wdata[15:0]; aud_oneshot[0] <= slv_wdata[31]; end
-                    8'h18: aud_per[0] <= slv_wdata[15:0];
-                    8'h1C: aud_vol[0] <= slv_wdata[6:0];
-                    8'h20: aud_lc[1]  <= slv_wdata;
-                    8'h24: begin aud_len[1] <= slv_wdata[15:0]; aud_oneshot[1] <= slv_wdata[31]; end
-                    8'h28: aud_per[1] <= slv_wdata[15:0];
-                    8'h2C: aud_vol[1] <= slv_wdata[6:0];
-                    8'h30: aud_lc[2]  <= slv_wdata;
-                    8'h34: begin aud_len[2] <= slv_wdata[15:0]; aud_oneshot[2] <= slv_wdata[31]; end
-                    8'h38: aud_per[2] <= slv_wdata[15:0];
-                    8'h3C: aud_vol[2] <= slv_wdata[6:0];
-                    8'h40: aud_lc[3]  <= slv_wdata;
-                    8'h44: begin aud_len[3] <= slv_wdata[15:0]; aud_oneshot[3] <= slv_wdata[31]; end
-                    8'h48: aud_per[3] <= slv_wdata[15:0];
-                    8'h4C: aud_vol[3] <= slv_wdata[6:0];
+                    // Audio channels at canonical Amiga offsets.
+                    8'hA0: aud_lc[0]  <= slv_wdata;
+                    8'hA4: begin aud_len[0] <= slv_wdata[15:0]; aud_oneshot[0] <= slv_wdata[31]; end
+                    8'hA6: aud_per[0] <= slv_wdata[15:0];
+                    8'hA8: aud_vol[0] <= slv_wdata[6:0];
+                    8'hB0: aud_lc[1]  <= slv_wdata;
+                    8'hB4: begin aud_len[1] <= slv_wdata[15:0]; aud_oneshot[1] <= slv_wdata[31]; end
+                    8'hB6: aud_per[1] <= slv_wdata[15:0];
+                    8'hB8: aud_vol[1] <= slv_wdata[6:0];
+                    8'hC0: aud_lc[2]  <= slv_wdata;
+                    8'hC4: begin aud_len[2] <= slv_wdata[15:0]; aud_oneshot[2] <= slv_wdata[31]; end
+                    8'hC6: aud_per[2] <= slv_wdata[15:0];
+                    8'hC8: aud_vol[2] <= slv_wdata[6:0];
+                    8'hD0: aud_lc[3]  <= slv_wdata;
+                    8'hD4: begin aud_len[3] <= slv_wdata[15:0]; aud_oneshot[3] <= slv_wdata[31]; end
+                    8'hD6: aud_per[3] <= slv_wdata[15:0];
+                    8'hD8: aud_vol[3] <= slv_wdata[6:0];
                     default: ;
                 endcase
             end

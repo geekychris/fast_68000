@@ -124,6 +124,42 @@ int main(int argc, char** argv) {
     return rc;
 }
 
+// ----- Memory-mailbox console ----------------------------------------------
+// C demos (see runtime/io.h) post bytes to a 256-byte ring in main memory:
+//   0x0000F000   head index   (CPU writes, monotonic)
+//   0x0000F010   ring base    (head & 0xFF indexes into 256 bytes)
+// We poll the head index every CONSOLE_POLL cycles and drain any pending
+// chars to stdout.  fb_peek bypasses the cache and sees write-through
+// stores immediately, so this is race-free with respect to the CPU.
+static constexpr uint32_t CONSOLE_HEAD_ADDR = 0x0000F000;
+static constexpr uint32_t CONSOLE_RING_ADDR = 0x0000F010;
+static constexpr uint32_t CONSOLE_RING_MASK = 0xFFu;
+static constexpr uint64_t CONSOLE_POLL      = 32;
+
+static uint32_t mem_peek_word(Vm68k_top* top, uint32_t byte_addr) {
+    top->fb_peek_addr = byte_addr & ~3u;
+    top->eval();
+    return top->fb_peek_data;
+}
+
+static void drain_console(Vm68k_top* top, uint32_t& host_tail) {
+    uint32_t head = mem_peek_word(top, CONSOLE_HEAD_ADDR);
+    if (host_tail == head) return;
+    if (std::getenv("CONSOLE_DBG"))
+        std::fprintf(stderr, "[drain] head=%u tail=%u\n", head, host_tail);
+    while (host_tail != head) {
+        uint32_t a = CONSOLE_RING_ADDR + (host_tail & CONSOLE_RING_MASK);
+        uint32_t w = mem_peek_word(top, a);
+        uint32_t shift = (3u - (a & 3u)) * 8u;
+        uint8_t  ch = (w >> shift) & 0xFFu;
+        if (std::getenv("CONSOLE_DBG"))
+            std::fprintf(stderr, "[drain]   t=%u a=0x%x w=0x%08x sh=%u ch=0x%02x '%c'\n",
+                         host_tail, a, w, shift, ch, (ch >= 0x20 && ch < 0x7F) ? ch : '?');
+        std::fputc(ch, stdout);
+        host_tail++;
+    }
+}
+
 static int run_regression(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
     auto all_halted = [&]() {
         for (int c = 0; c < n_cores; c++) {
@@ -132,12 +168,16 @@ static int run_regression(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
         return true;
     };
 
+    uint32_t host_tail = 0;
     uint64_t cycle = 0;
     while (cycle < max_cycles && !all_halted()) {
         top->clk = 0; top->eval();
         top->clk = 1; top->eval();
         cycle++;
+        if ((cycle & (CONSOLE_POLL - 1)) == 0) drain_console(top, host_tail);
     }
+    drain_console(top, host_tail);
+    std::fflush(stdout);
 
     bool halted_all = all_halted();
     int rc = 0;
@@ -159,7 +199,11 @@ static int run_regression(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
         printf("[sim] core%d halted=%d code=0x%04x retired=%u ipc=%.3f\n",
                c, h, code, (unsigned)retired, ipc);
         if (!h) rc = rc ? rc : 0xFFFF;
-        else if (code != 0 && rc == 0) rc = code;
+        else if (code != 0 && rc == 0) {
+            // Shell exit codes are 8 bits.  Ensure the low byte is non-zero
+            // so a halt code like 0xBB00 doesn't masquerade as success.
+            rc = (code & 0xFF) ? (int)code : ((int)code | 1);
+        }
     }
     if (!halted_all) {
         printf("[sim] TIMEOUT after %llu cycles\n", (unsigned long long)cycle);

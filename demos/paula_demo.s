@@ -19,11 +19,11 @@ pos:    move.l  #$7F7F7F7F, (A0)+
 neg:    move.l  #$80808080, (A0)+
         dbra    D0, neg
 
-        ; Program Paula channel 0.
-        move.l  #$00005000, $00FE0210  ; AUD0LC
-        move.l  #50,         $00FE0214 ; AUD0LEN (words)
-        move.l  #100,        $00FE0218 ; AUD0PER (sim clocks/sample)
-        move.l  #50,         $00FE021C ; AUD0VOL (out of 64)
+        ; Program Paula channel 0 (canonical Amiga offsets).
+        move.l  #$00005000, $00FE02A0  ; AUD0LC
+        move.l  #50,         $00FE02A4 ; AUD0LEN (words)
+        move.l  #100,        $00FE02A6 ; AUD0PER (sim clocks/sample)
+        move.l  #50,         $00FE02A8 ; AUD0VOL (out of 64)
 
         ; Enable channel 0.
         move.l  #$00000001, $00FE0200  ; AUDENA bit 0
