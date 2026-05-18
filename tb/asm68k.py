@@ -699,15 +699,24 @@ class Asm:
 
 
 def main():
-    if len(sys.argv) != 3:
-        print("usage: asm68k.py <in.s> <out.hex>", file=sys.stderr)
+    args = sys.argv[1:]
+    mem_words = 16384
+    while args and args[0].startswith('--'):
+        flag = args.pop(0)
+        if flag == '--mem-words':
+            mem_words = int(args.pop(0), 0)
+        else:
+            print(f"unknown flag: {flag}", file=sys.stderr)
+            sys.exit(2)
+    if len(args) != 2:
+        print("usage: asm68k.py [--mem-words N] <in.s> <out.hex>", file=sys.stderr)
         sys.exit(1)
-    with open(sys.argv[1]) as f:
+    with open(args[0]) as f:
         src = f.read()
     a = Asm()
     a.assemble(src)
-    with open(sys.argv[2], 'w') as f:
-        f.write(a.to_hex(16384))
+    with open(args[1], 'w') as f:
+        f.write(a.to_hex(mem_words))
 
 if __name__ == '__main__':
     main()

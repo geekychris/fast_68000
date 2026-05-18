@@ -11,7 +11,9 @@ module m68k_top #(
     parameter MEM_HEXFILE = "program.hex",
     parameter ROM_WORDS  = 1,            // size of the $F80000+ ROM in 32-bit words
     parameter MEM_HEXFILE_ROM = "",      // optional Kickstart-style ROM hex
-    parameter OVL_RESET  = 1'b0           // 1 -> CIA-A /OVL active at reset (Amiga-faithful)
+    parameter OVL_RESET  = 1'b0,         // 1 -> CIA-A /OVL active at reset (Amiga-faithful)
+    parameter DISK_WORDS = 1,            // memory-backed disk image at $00400000
+    parameter DISK_HEXFILE = ""          // optional disk image hex (one .adf etc.)
 )(
     input  wire clk,
     input  wire rst_n,
@@ -123,7 +125,9 @@ module m68k_top #(
         .MEM_HEXFILE    (MEM_HEXFILE),
         .ROM_WORDS      (ROM_WORDS),
         .MEM_HEXFILE_ROM(MEM_HEXFILE_ROM),
-        .OVL_RESET      (OVL_RESET)
+        .OVL_RESET      (OVL_RESET),
+        .DISK_WORDS     (DISK_WORDS),
+        .DISK_HEXFILE   (DISK_HEXFILE)
     ) u_bus (
         .clk         (clk),
         .rst_n       (rst_n),

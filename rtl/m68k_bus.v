@@ -27,7 +27,16 @@ module m68k_bus #(
     // (no vector fetch) and don't want low-RAM reads remapped, so OVL
     // defaults off.  A bring-up harness that loads a real Kickstart ROM
     // overrides this to 1.
-    parameter OVL_RESET = 1'b0
+    parameter OVL_RESET = 1'b0,
+    // Optional memory-backed block device (think SD-card / hardfile).
+    // When DISK_WORDS > 0 the bus exposes a read-only disk image at
+    // $00400000..$00400000 + DISK_WORDS*4 - 1 and a 4-register block-
+    // device control port at $00FE_8000 (BLKSRC / BLKDST / BLKCNT / BLKCMD).
+    // Writing 1 to BLKCMD streams BLKCNT*512 bytes from disk[BLKSRC*512]
+    // to mem[BLKDST] one word per host clock; BLKCMD reads back 0 when
+    // the transfer is done.
+    parameter DISK_WORDS = 1,
+    parameter DISK_HEXFILE = ""
 )(
     input  wire                 clk,
     input  wire                 rst_n,
@@ -182,10 +191,73 @@ module m68k_bus #(
         for (mi = 0; mi < ROM_WORDS; mi = mi + 1) rom[mi] = 32'd0;
         if (MEM_HEXFILE_ROM != "")
             $readmemh(MEM_HEXFILE_ROM, rom);
+        for (mi = 0; mi < DISK_WORDS; mi = mi + 1) disk[mi] = 32'd0;
+        if (DISK_HEXFILE != "")
+            $readmemh(DISK_HEXFILE, disk);
     end
+
+    // ----- Disk image (read-only) ----------------------------------
+    // 32-bit words; address $00400000 + word_idx*4.
+    localparam DISK_IDX_BITS = $clog2(DISK_WORDS > 1 ? DISK_WORDS : 2);
+    reg [31:0] disk [0:DISK_WORDS-1];
+    localparam [31:0] DISK_BASE = 32'h0040_0000;
+    localparam [31:0] DISK_END  = 32'h0040_0000 + (DISK_WORDS << 2) - 1;
+
+    // ----- Block-device control registers --------------------------
+    localparam [31:0] BLK_BASE  = 32'h00FE_8000;
+    localparam [31:0] BLKSRC_AD = 32'h00FE_8000;   // source sector # (32-bit)
+    localparam [31:0] BLKDST_AD = 32'h00FE_8004;   // dest mem byte addr (32-bit)
+    localparam [31:0] BLKCNT_AD = 32'h00FE_8008;   // # sectors (32-bit; sector = 512 B)
+    localparam [31:0] BLKCMD_AD = 32'h00FE_800C;   // write 1 = go; read 0 when done
+    reg [31:0] blk_src;     // sector index
+    reg [31:0] blk_dst;     // destination byte addr in mem[]
+    reg [31:0] blk_cnt;     // sectors remaining
+    reg        blk_busy;
+    reg [31:0] blk_cur_off; // current disk word offset
+    reg [31:0] blk_cur_dst; // current dest byte addr
 
     // OVL latch: set on reset, cleared the first time CIA-A drives /OVL low.
     reg ovl_active;
+
+    // ----- Agnus stub (minimal) ---------------------------------------
+    // Real Agnus owns $DFF000-$DFF03F (DMA + beam) and shares $DFF080-$DFF09F
+    // with the copper/interrupt block.  This stub implements just the four
+    // registers needed for early-boot ROM code:
+    //   $DFF002  DMACONR  RO  -- DMA control read mirror
+    //   $DFF004  VPOSR    RO  -- {LOF, ID2..ID0, V8, 8'd0} | top bits of beam V
+    //   $DFF006  VHPOSR   RO  -- {V[7:0], H[7:0]}
+    //   $DFF096  DMACON   WO  -- SET/CLR semantics, same shape as INTENA
+    // The beam counter increments every host clock; H wraps at 226 (227-cycle
+    // PAL line), V wraps at 311 (312-line PAL frame).  No relationship to
+    // wall-clock NTSC/PAL — this is just monotonic for boot-time polling.
+    localparam [9:0]  AGNUS_H_LAST = 10'd226;
+    localparam [9:0]  AGNUS_V_LAST = 10'd311;
+    reg [9:0] agnus_h;
+    reg [9:0] agnus_v;
+    reg [15:0] dmacon;
+    // Beam tick.  Increment H every clock; on wrap, increment V; on V wrap,
+    // back to 0.  In a real Amiga the H tick is one bus cycle (8 master
+    // clocks); here we tick once per system clock so the counter advances
+    // visibly under cycle-accurate cross-check.
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            agnus_h <= 10'd0;
+            agnus_v <= 10'd0;
+            dmacon  <= 16'd0;
+        end else begin
+            if (agnus_h == AGNUS_H_LAST) begin
+                agnus_h <= 10'd0;
+                if (agnus_v == AGNUS_V_LAST) agnus_v <= 10'd0;
+                else                          agnus_v <= agnus_v + 10'd1;
+            end else begin
+                agnus_h <= agnus_h + 10'd1;
+            end
+        end
+    end
+    localparam [31:0] DMACONR_ADDR = 32'h00DF_F002;
+    localparam [31:0] VPOSR_ADDR   = 32'h00DF_F004;
+    localparam [31:0] VHPOSR_ADDR  = 32'h00DF_F006;
+    localparam [31:0] DMACON_ADDR  = 32'h00DF_F096;
 
     // Unflatten inputs.
     wire [31:0] addr  [0:N_PORTS-1];
@@ -281,6 +353,13 @@ module m68k_bus #(
 
     wire [AIDX_BITS-1:0] mem_idx = addr[winner][AIDX_BITS+1:2];
     wire is_irq_reg = (addr[winner] == IRQ_REG_ADDR);
+    wire is_disk_read = (addr[winner] >= DISK_BASE) && (addr[winner] <= DISK_END);
+    wire [DISK_IDX_BITS-1:0] disk_idx =
+        addr[winner][DISK_IDX_BITS+1:2] - DISK_BASE[DISK_IDX_BITS+1:2];
+    wire is_blk_reg = (addr[winner] == BLKSRC_AD) ||
+                      (addr[winner] == BLKDST_AD) ||
+                      (addr[winner] == BLKCNT_AD) ||
+                      (addr[winner] == BLKCMD_AD);
     wire is_blt_reg = (addr[winner] >= BLT_BASE) && (addr[winner] <= BLT_END);
     wire is_cop_reg = (addr[winner] >= COP_BASE) && (addr[winner] <= COP_END);
     wire is_den_legacy = ((addr[winner] >= DEN_BASE)  && (addr[winner] <= DEN_END)) ||
@@ -291,7 +370,14 @@ module m68k_bus #(
     wire den_bank   = ((addr[winner] >= DEN2_BASE)       && (addr[winner] <= DEN2_END)) ||
                       ((addr[winner] >= DEN2_AMIGA_BASE) && (addr[winner] <= DEN2_AMIGA_END));
     wire is_pau_legacy = (addr[winner] >= PAU_BASE) && (addr[winner] <= PAU_END);
-    wire is_pau_amiga  = (addr[winner] >= PAU_AMIGA_BASE) && (addr[winner] <= PAU_AMIGA_END);
+    // Agnus stub steals four addresses out of the Paula window.  Strip them
+    // here so they don't reach the Paula slave.
+    wire is_agnus_reg  = (addr[winner] == DMACONR_ADDR) ||
+                          (addr[winner] == VPOSR_ADDR)   ||
+                          (addr[winner] == VHPOSR_ADDR)  ||
+                          (addr[winner] == DMACON_ADDR);
+    wire is_pau_amiga  = (addr[winner] >= PAU_AMIGA_BASE) && (addr[winner] <= PAU_AMIGA_END)
+                         && !is_agnus_reg;
     wire is_pau_reg  = is_pau_legacy | is_pau_amiga;
     wire is_ciaa_legacy = (addr[winner] >= CIAA_BASE) && (addr[winner] <= CIAA_END);
     wire is_ciab_legacy = (addr[winner] >= CIAB_BASE) && (addr[winner] <= CIAB_END);
@@ -416,13 +502,55 @@ module m68k_bus #(
             granted_rom_data_q <= 32'd0;
             ovl_active <= OVL_RESET;
             irq_level <= 3'd0;
+            blk_src   <= 32'd0;
+            blk_dst   <= 32'd0;
+            blk_cnt   <= 32'd0;
+            blk_busy  <= 1'b0;
+            blk_cur_off <= 32'd0;
+            blk_cur_dst <= 32'd0;
         end else begin
+            // Block-device DMA tick: while busy, copy one disk word to mem
+            // per clock.  Two cycles of pre-arbiter access is fine — we
+            // bypass the bus arbiter entirely (this is a "ghost" master that
+            // writes mem[] directly, simulating an off-CPU controller).
+            if (blk_busy) begin
+                if (blk_cur_dst >= blk_dst + (blk_cnt << 9)) begin
+                    blk_busy <= 1'b0;
+                end else begin
+                    mem[blk_cur_dst[AIDX_BITS+1:2]] <= disk[blk_cur_off[DISK_IDX_BITS+1:2]];
+                    blk_cur_off <= blk_cur_off + 32'd4;
+                    blk_cur_dst <= blk_cur_dst + 32'd4;
+                end
+            end
             // Writes to the IRQ register update irq_level (sticky) and do NOT
             // commit to main memory. Writes to the blitter register region
             // are handled by the combinational slave port (no memory write).
             // Writes anywhere else update memory.
             if (winner_valid && we[winner] && is_irq_reg) begin
                 if (be[winner][0]) irq_level <= wdata[winner][2:0];
+            end else if (winner_valid && we[winner] && is_blk_reg) begin
+                // Block-device control register write.  BLKCMD with bit 0
+                // set starts the DMA from disk[] -> mem[].
+                case (addr[winner])
+                    BLKSRC_AD: blk_src <= wdata[winner];
+                    BLKDST_AD: blk_dst <= wdata[winner];
+                    BLKCNT_AD: blk_cnt <= wdata[winner];
+                    BLKCMD_AD: if (wdata[winner][0] && !blk_busy) begin
+                        blk_busy    <= 1'b1;
+                        blk_cur_off <= blk_src << 9;   // sector * 512
+                        blk_cur_dst <= blk_dst;
+                    end
+                    default: ;
+                endcase
+            end else if (winner_valid && we[winner] && is_agnus_reg) begin
+                // DMACON write: bit 15 = SET (1) / CLR (0), bits 14..0 = mask.
+                if (addr[winner] == DMACON_ADDR) begin
+                    if (wdata[winner][15])
+                        dmacon <= dmacon | {1'b0, wdata[winner][14:0]};
+                    else
+                        dmacon <= dmacon & ~{1'b0, wdata[winner][14:0]};
+                end
+                // DMACONR/VPOSR/VHPOSR are read-only; writes silently drop.
             end else if (winner_valid && we[winner] && is_blt_reg) begin
                 // Handled via blt_slv_we combinationally; nothing to do here.
             end else if (winner_valid && we[winner] && is_cop_reg) begin
@@ -437,6 +565,8 @@ module m68k_bus #(
                 // Handled via cia_b_slv_we combinationally; nothing to do here.
             end else if (winner_valid && we[winner] && is_rom_window) begin
                 // ROM region is read-only; silently drop the write.
+            end else if (winner_valid && we[winner] && is_disk_read) begin
+                // Disk image is read-only; silently drop the write.
             end else if (winner_valid && we[winner]) begin
                 if (be[winner][3]) mem[mem_idx][31:24] <= wdata[winner][31:24];
                 if (be[winner][2]) mem[mem_idx][23:16] <= wdata[winner][23:16];
@@ -528,16 +658,63 @@ module m68k_bus #(
     // Output response (1 cycle after grant). Reads of the IRQ register return
     // {29'b0, irq_level}; reads of the blitter region return blt_slv_rdata;
     // everything else reads from main memory.
+    // Latch which Agnus register the granted access was for, so we can
+    // route the read response one cycle later from the live counters.
+    reg granted_is_agnus_q;
+    reg [1:0] granted_agnus_sel_q;   // 0 = DMACONR, 1 = VPOSR, 2 = VHPOSR
+    reg granted_is_disk_q;
+    reg [31:0] granted_disk_data_q;
+    reg granted_is_blk_q;
+    reg [1:0] granted_blk_sel_q;     // 0 SRC 1 DST 2 CNT 3 CMD
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            granted_is_agnus_q  <= 1'b0;
+            granted_agnus_sel_q <= 2'd0;
+            granted_is_disk_q   <= 1'b0;
+            granted_disk_data_q <= 32'd0;
+            granted_is_blk_q    <= 1'b0;
+            granted_blk_sel_q   <= 2'd0;
+        end else begin
+            granted_is_agnus_q  <= winner_valid && !we[winner] && is_agnus_reg
+                                   && (addr[winner] != DMACON_ADDR);
+            granted_agnus_sel_q <= (addr[winner] == VHPOSR_ADDR) ? 2'd2
+                                 : (addr[winner] == VPOSR_ADDR)  ? 2'd1
+                                 : 2'd0;
+            granted_is_disk_q   <= winner_valid && !we[winner] && is_disk_read;
+            granted_disk_data_q <= disk[disk_idx];
+            granted_is_blk_q    <= winner_valid && !we[winner] && is_blk_reg;
+            granted_blk_sel_q   <= (addr[winner] == BLKDST_AD) ? 2'd1
+                                 : (addr[winner] == BLKCNT_AD) ? 2'd2
+                                 : (addr[winner] == BLKCMD_AD) ? 2'd3
+                                 : 2'd0;
+        end
+    end
+    wire [31:0] blk_resp_w = (granted_blk_sel_q == 2'd0) ? blk_src
+                           : (granted_blk_sel_q == 2'd1) ? blk_dst
+                           : (granted_blk_sel_q == 2'd2) ? blk_cnt
+                           : {31'd0, blk_busy};
+    wire [31:0] agnus_resp_w = (granted_agnus_sel_q == 2'd2)
+                                  // VHPOSR: {V[7:0], H[7:0]} in low 16
+                                  ? {16'd0, agnus_v[7:0], agnus_h[7:0]}
+                              : (granted_agnus_sel_q == 2'd1)
+                                  // VPOSR: bit 0 of high byte = V[8]
+                                  ? {16'd0, 7'd0, agnus_v[8], 8'd0}
+                                  // DMACONR
+                                  : {16'd0, dmacon};
+
     always @* begin
         resp_valid = {N_PORTS{1'b0}};
-        resp_data  = granted_is_irq_q  ? {29'd0, irq_level}
-                   : granted_is_blt_q  ? granted_blt_rdata_q
-                   : granted_is_cop_q  ? granted_cop_rdata_q
-                   : granted_is_den_q  ? granted_den_rdata_q
-                   : granted_is_pau_q  ? granted_pau_rdata_q
-                   : granted_is_ciaa_q ? ciaa_resp_w
-                   : granted_is_ciab_q ? ciab_resp_w
-                   : granted_is_rom_q  ? granted_rom_data_q
+        resp_data  = granted_is_irq_q   ? {29'd0, irq_level}
+                   : granted_is_agnus_q ? agnus_resp_w
+                   : granted_is_disk_q  ? granted_disk_data_q
+                   : granted_is_blk_q   ? blk_resp_w
+                   : granted_is_blt_q   ? granted_blt_rdata_q
+                   : granted_is_cop_q   ? granted_cop_rdata_q
+                   : granted_is_den_q   ? granted_den_rdata_q
+                   : granted_is_pau_q   ? granted_pau_rdata_q
+                   : granted_is_ciaa_q  ? ciaa_resp_w
+                   : granted_is_ciab_q  ? ciab_resp_w
+                   : granted_is_rom_q   ? granted_rom_data_q
                    : mem[granted_idx_q];
         if (granted_valid_q) resp_valid[granted_port_q] = 1'b1;
     end

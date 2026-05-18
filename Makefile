@@ -31,14 +31,14 @@ RTL_SRCS := $(RTL_DIR)/m68k_alu.v \
 
 # Tests in the default `make test` suite.  t61_ovl needs a special build
 # (OVL_RESET=1 + a tiny ROM); it has its own `test-ovl` target.
-TESTS  := $(filter-out $(TESTS_DIR)/t61_ovl.s,$(wildcard $(TESTS_DIR)/*.s))
+TESTS  := $(filter-out $(TESTS_DIR)/t61_ovl.s $(TESTS_DIR)/t63_boot_rom.s $(TESTS_DIR)/t65_blockdev.s,$(wildcard $(TESTS_DIR)/*.s))
 BENCHES:= $(wildcard $(BENCH_DIR)/*.s)
 
 N_CORES   ?= 2
 MEM_WORDS ?= 65536
 BUILD     ?= build
 
-.PHONY: all build test test-ovl test-all bench clean demo demo-fb demo-os demo-blt demo-cop demo-den demo-pau demo-poly demo-spr demo-morph demo-ham demo-coprainbow demo-showcase demo-hires fetch-musashi musashi crosscheck fetch-fx68k fx68k crosscheck-fx68k crosscheck-all demos-c demos-c-build cc68k-image
+.PHONY: all build test test-ovl test-all test-boot-rom test-blockdev bench clean demo demo-fb demo-os demo-blt demo-cop demo-den demo-pau demo-poly demo-spr demo-morph demo-ham demo-coprainbow demo-showcase demo-hires fetch-musashi musashi crosscheck fetch-fx68k fx68k crosscheck-fx68k crosscheck-all demos-c demos-c-build cc68k-image fetch-minimig minimig crosscheck-minimig
 
 all: test
 
@@ -59,6 +59,8 @@ $(BUILD)/Vm68k_top: $(RTL_SRCS) $(TB_DIR)/sim_main.cpp
 	    $(if $(ROM_WORDS),-GROM_WORDS=$(ROM_WORDS),) \
 	    $(if $(ROM_HEXFILE),-GMEM_HEXFILE_ROM=\"$(ROM_HEXFILE)\",) \
 	    $(if $(OVL_RESET),-GOVL_RESET=$(OVL_RESET),) \
+	    $(if $(DISK_WORDS),-GDISK_WORDS=$(DISK_WORDS),) \
+	    $(if $(DISK_HEXFILE),-GDISK_HEXFILE=\"$(DISK_HEXFILE)\",) \
 	    -I$(RTL_DIR) \
 	    --top-module m68k_top \
 	    -Mdir $(BUILD) \
@@ -273,6 +275,42 @@ test-ovl:
 	else echo "FAIL t61_ovl rc=$$rc"; tail -n 6 build_ovl/t61_ovl.log | sed 's/^/      /'; exit 1; fi
 
 # ---------------------------------------------------------------------------
+# MiniMig (FPGA Amiga clone) chipset register cross-check.  Clones the
+# upstream MiniMig RTL into external/minimig/, builds a Verilator harness
+# that instantiates *both* MiniMig's paula_intcontroller and our paula
+# side-by-side, drives an identical write sequence into both, and asserts
+# read-back parity on INTENA/INTREQ semantics.
+# ---------------------------------------------------------------------------
+MINIMIG_REPO  := https://github.com/rkrajnc/minimig-mist.git
+MINIMIG_DIR   := external/minimig
+MINIMIG_BUILD := build_minimig
+
+fetch-minimig: $(MINIMIG_DIR)/rtl/minimig/paula_intcontroller.v
+$(MINIMIG_DIR)/rtl/minimig/paula_intcontroller.v:
+	@mkdir -p external
+	git clone --depth 1 --branch master $(MINIMIG_REPO) $(MINIMIG_DIR)
+
+minimig: $(MINIMIG_BUILD)/Vminimig_xcheck_top
+$(MINIMIG_BUILD)/Vminimig_xcheck_top: $(MINIMIG_DIR)/rtl/minimig/paula_intcontroller.v \
+                                      $(TB_DIR)/minimig_xcheck_top.sv \
+                                      $(TB_DIR)/minimig_xcheck.cpp \
+                                      $(RTL_DIR)/chipset/paula.v
+	@mkdir -p $(MINIMIG_BUILD)
+	$(VERILATOR) -Wno-fatal --cc --exe --build \
+	    --noassert -CFLAGS "-std=c++17 -O1" \
+	    -I$(RTL_DIR) -I$(MINIMIG_DIR)/rtl/minimig \
+	    --top-module minimig_xcheck_top \
+	    -Mdir $(MINIMIG_BUILD) \
+	    -o Vminimig_xcheck_top \
+	    $(TB_DIR)/minimig_xcheck_top.sv \
+	    $(RTL_DIR)/chipset/paula.v \
+	    $(MINIMIG_DIR)/rtl/minimig/paula_intcontroller.v \
+	    $(TB_DIR)/minimig_xcheck.cpp
+
+crosscheck-minimig: $(MINIMIG_BUILD)/Vminimig_xcheck_top
+	@(cd $(MINIMIG_BUILD) && ./Vminimig_xcheck_top) | tee $(MINIMIG_BUILD)/last.log
+
+# ---------------------------------------------------------------------------
 # C multicore demos.  Each demos/c/*.c is compiled inside the m68k-elf-gcc
 # Docker image (tools/cc68k/) and run through the default 2-core build.
 # Each demo halts every core with a halt code (0 = pass).
@@ -312,6 +350,43 @@ demos-c: demos-c-build
 	echo ""; \
 	echo "C demos: $$pass passed, $$fail failed"; \
 	[ $$fail -eq 0 ]
+
+# ---------------------------------------------------------------------------
+# Boot-from-ROM test.  Assembles roms/boot_rom.s into a ROM hex loaded at
+# $F80000-$FFFFFF, runs tests/t63_boot_rom.s as the $400 trampoline.  OVL=1
+# at reset routes data reads at $0/$4 through to ROM offsets 0/4 (the reset
+# SSP+PC vector), so the trampoline can pick them up and jump in.  After
+# the ROM code clears OVL via CIA-A, normal RAM addressing resumes.
+# ---------------------------------------------------------------------------
+test-boot-rom:
+	@mkdir -p build_boot
+	$(PYTHON) $(TB_DIR)/asm68k.py --mem-words 4096 roms/boot_rom.s build_boot/boot_rom.hex
+	@$(MAKE) --no-print-directory build BUILD=build_boot N_CORES=2 USE_CACHE=1 \
+	    MEM_WORDS=65536 ROM_WORDS=4096 ROM_HEXFILE=boot_rom.hex OVL_RESET=1 \
+	    >build_boot/_build.log 2>&1
+	$(PYTHON) $(TB_DIR)/asm68k.py tests/t63_boot_rom.s build_boot/program.hex
+	@(cd build_boot && ./Vm68k_top 1000000) > build_boot/t63.log 2>&1; \
+	rc=$$?; \
+	if [ $$rc -eq 0 ]; then echo "PASS t63_boot_rom"; \
+	else echo "FAIL t63_boot_rom rc=$$rc"; tail -n 6 build_boot/t63.log | sed 's/^/      /'; exit 1; fi
+
+# ---------------------------------------------------------------------------
+# Block-device DMA test.  Builds with a tiny disk image (tests/disk_test.hex)
+# loaded into the bus's disk[] array, runs tests/t65_blockdev.s which
+# programs BLKSRC/BLKDST/BLKCNT/BLKCMD to copy sector 0 to RAM and verifies
+# the magic words.
+# ---------------------------------------------------------------------------
+test-blockdev:
+	@mkdir -p build_blk
+	cp tests/disk_test.hex build_blk/disk_test.hex
+	@$(MAKE) --no-print-directory build BUILD=build_blk N_CORES=2 USE_CACHE=1 \
+	    MEM_WORDS=65536 DISK_WORDS=2048 DISK_HEXFILE=disk_test.hex \
+	    >build_blk/_build.log 2>&1
+	$(PYTHON) $(TB_DIR)/asm68k.py tests/t65_blockdev.s build_blk/program.hex
+	@(cd build_blk && ./Vm68k_top 1000000) > build_blk/t65.log 2>&1; \
+	rc=$$?; \
+	if [ $$rc -eq 0 ]; then echo "PASS t65_blockdev"; \
+	else echo "FAIL t65_blockdev rc=$$rc"; tail -n 6 build_blk/t65.log | sed 's/^/      /'; exit 1; fi
 
 # Benchmarks: build a "fast" (pipelined + caches) and "slow" (passthrough)
 # 1-core simulator, run every program on both, and print a comparison.

@@ -145,7 +145,62 @@ make demos-c           # build the docker image, compile and run every demo
 Halt-code convention is the same as for the assembly tests: 0 = PASS,
 non-zero = FAIL.  The harness asserts halt 0 for every demo.
 
-## 6. All cross-validation — `make crosscheck-all`
+## 6. Boot-from-ROM end-to-end — `make test-boot-rom`
+
+Assembles `roms/boot_rom.s` into a hex loaded at $F80000 (with the
+68000 reset vector at offsets 0/4 inside the ROM) and runs
+`tests/t63_boot_rom.s` as a $400-resident trampoline that picks up
+the SSP+PC from $0/$4 (OVL routes those reads to ROM) and jumps into
+the ROM image.  The ROM code then writes Paula INTENA, clears OVL
+via CIA-A, reads memory back, and halts with 0.
+
+Proves the boot chain: OVL → reset vector fetch → trampoline → ROM
+entry → chipset MMIO → live RAM after OVL clear.
+
+```
+make test-boot-rom
+```
+
+## 7. Memory-backed block device — `make test-blockdev`
+
+Builds the sim with a tiny disk image (`tests/disk_test.hex`) loaded
+into the bus's `disk[]` array (parameter `DISK_HEXFILE`), runs
+`tests/t65_blockdev.s` which programs the four block-device control
+registers at $00FE_8000 (BLKSRC / BLKDST / BLKCNT / BLKCMD) and
+verifies that a single 512-byte sector DMAs to RAM correctly.
+
+The block-device interface stands in for an A590-style hardfile or
+SD-card autoconfig device.  CPU programs sector + dest + count, sets
+the go bit, polls until BLKCMD reads back 0.  Hex-loadable from any
+.adf / hardfile image.
+
+```
+make test-blockdev
+```
+
+## 8. Chipset register cross-check vs MiniMig — `make crosscheck-minimig`
+
+Clones the MiniMig (FPGA Amiga clone) RTL into `external/minimig/`
+and builds a Verilator harness that instantiates *both* MiniMig's
+`paula_intcontroller` and our `paula` side-by-side, drives an
+identical sequence of INTENA/INTREQ writes into both, and asserts
+read-back parity on INTENAR/INTREQR.
+
+```
+make fetch-minimig          # one-time clone
+make crosscheck-minimig     # build + run
+```
+
+Result: PASS with 2 documented soft divergences.
+
+The soft divergences both come from MiniMig keeping bit 14 of
+INTREQ as a writable storage cell that ORs into the INTREQR
+read-back; the Amiga HRM reserves bit 14 of INTREQ and our paula
+masks it off.  These are real differences in chipset semantics —
+the cross-check finds them automatically and surfaces them as
+expected-divergence lines in the output, not failures.
+
+## 9. All cross-validation — `make crosscheck-all`
 
 Runs both `crosscheck` (Musashi) and `crosscheck-fx68k` back-to-back.
 
