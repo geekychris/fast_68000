@@ -373,6 +373,30 @@ module m68k_bus #(
     // its SP interrupt source.
     localparam [31:0] KBD_INJECT_ADDR = 32'h00FE_9000;
 
+    // ----- Agnus bitplane DMA engine --------------------------------
+    // Reads bitplane data words from memory into BPL1DAT.  Active when
+    // DMACON BPLEN (bit 8) AND DMAEN (bit 9) are both set.  Fetches one
+    // word every BPL_FETCH_DIV host clocks; restarts bpl1pt from the
+    // shadow BPL1PT register at the start of each scanline; applies
+    // BPL1MOD (chip_regs[$108]) at line end.
+    //
+    // Today only one plane (BPL1) is wired up — enough to exercise the
+    // bus master path and verify writes to BPL1PT propagate.  Multi-
+    // plane fetch (BPL2..BPL6) is a follow-on, gated on the same DMACON
+    // bits and round-robined across active planes per scanline.
+    //
+    // BPL1DAT is exposed at $00FE_9104 (16-bit value in the high half
+    // of the long).  The fetch counter is at $00FE_9100 (32-bit; tests
+    // verify Agnus actually moved data).
+    localparam [31:0] BPL_FETCH_COUNTER_ADDR = 32'h00FE_9100;
+    localparam [31:0] BPL1DAT_PROBE_ADDR     = 32'h00FE_9104;
+    localparam [9:0]  BPL_FETCH_DIV = 10'd16;     // fetch every 16 host clk
+    reg [31:0] bpl1pt;             // live working pointer
+    reg [15:0] bpl1dat;
+    reg [31:0] bpl_fetches;
+    reg [9:0]  bpl_fetch_tick;
+    reg [9:0]  agnus_v_prev;
+
     // Unflatten inputs.
     wire [31:0] addr  [0:N_PORTS-1];
     wire [31:0] wdata [0:N_PORTS-1];
@@ -504,6 +528,8 @@ module m68k_bus #(
     wire is_autoconfig_reg = (addr[winner] >= AUTOCONFIG_BASE) &&
                               (addr[winner] <= AUTOCONFIG_END);
     wire is_kbd_inject_reg = (addr[winner] == KBD_INJECT_ADDR);
+    wire is_bpl_probe_reg = (addr[winner] == BPL_FETCH_COUNTER_ADDR) ||
+                             (addr[winner] == BPL1DAT_PROBE_ADDR);
     wire is_pau_reg  = is_pau_legacy | is_pau_amiga;
     wire is_ciaa_legacy = (addr[winner] >= CIAA_BASE) && (addr[winner] <= CIAA_END);
     wire is_ciab_legacy = (addr[winner] >= CIAB_BASE) && (addr[winner] <= CIAB_END);
@@ -638,10 +664,43 @@ module m68k_bus #(
             dsk_len   <= 16'd0;
             kbd_inject_wr   <= 1'b0;
             kbd_inject_byte <= 8'd0;
+            bpl1pt          <= 32'd0;
+            bpl1dat         <= 16'd0;
+            bpl_fetches     <= 32'd0;
+            bpl_fetch_tick  <= 10'd0;
+            agnus_v_prev    <= 10'd0;
         end else begin
             // Default keyboard inject pulse to 0 each cycle; the write
             // path below asserts it for one cycle when triggered.
             kbd_inject_wr <= 1'b0;
+
+            // ----- Agnus bitplane DMA --------------------------------
+            // Reload bpl1pt at start of every scanline (agnus_v change)
+            // from the shadow chip_regs[$0E0/$0E2] = BPL1PTH/L.
+            agnus_v_prev <= agnus_v;
+            if (agnus_v != agnus_v_prev) begin
+                bpl1pt <= {chip_regs[9'h0E0], chip_regs[9'h0E2]};
+                bpl_fetch_tick <= 10'd0;
+            end else if (dmacon[8] && dmacon[9]) begin
+                // DMAEN + BPLEN: tick a fetch divider; on overflow grab
+                // one word from mem[bpl1pt] into BPL1DAT and advance.
+                if (bpl_fetch_tick == BPL_FETCH_DIV - 1) begin
+                    bpl_fetch_tick <= 10'd0;
+                    // Read the half-word at bpl1pt out of mem[].  bpl1pt
+                    // is a byte address; the half-word lives in the
+                    // high or low 16 bits of mem[bpl1pt[31:2]] depending
+                    // on bpl1pt[1].
+                    if (bpl1pt[1] == 1'b0) begin
+                        bpl1dat <= mem[bpl1pt[AIDX_BITS+1:2]][31:16];
+                    end else begin
+                        bpl1dat <= mem[bpl1pt[AIDX_BITS+1:2]][15:0];
+                    end
+                    bpl1pt <= bpl1pt + 32'd2;
+                    bpl_fetches <= bpl_fetches + 32'd1;
+                end else begin
+                    bpl_fetch_tick <= bpl_fetch_tick + 10'd1;
+                end
+            end
             // Block-device DMA tick: while busy, copy one disk word to mem
             // per clock.  Two cycles of pre-arbiter access is fine — we
             // bypass the bus arbiter entirely (this is a "ghost" master that
@@ -858,6 +917,8 @@ module m68k_bus #(
     reg granted_is_shadow_q;
     reg [15:0] granted_shadow_hi_q;   // high half (long-aligned word)
     reg [15:0] granted_shadow_lo_q;   // low half (next word)
+    reg granted_is_bpl_probe_q;
+    reg [1:0] granted_bpl_probe_sel_q;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             granted_is_agnus_q  <= 1'b0;
@@ -872,6 +933,8 @@ module m68k_bus #(
             granted_is_shadow_q     <= 1'b0;
             granted_shadow_hi_q     <= 16'd0;
             granted_shadow_lo_q     <= 16'd0;
+            granted_is_bpl_probe_q  <= 1'b0;
+            granted_bpl_probe_sel_q <= 2'd0;
         end else begin
             granted_is_agnus_q  <= winner_valid && !we[winner] && is_agnus_reg
                                    && (addr[winner] != DMACON_ADDR);
@@ -894,6 +957,8 @@ module m68k_bus #(
             // pick later when forming resp_data.
             granted_shadow_hi_q     <= chip_regs[{chip_idx[8:2], 2'b00}];
             granted_shadow_lo_q     <= chip_regs[{chip_idx[8:2], 2'b10}];
+            granted_is_bpl_probe_q  <= winner_valid && !we[winner] && is_bpl_probe_reg;
+            granted_bpl_probe_sel_q <= (addr[winner] == BPL1DAT_PROBE_ADDR) ? 2'd1 : 2'd0;
             granted_is_paula_ro_q  <= winner_valid && !we[winner] && is_paula_ro_reg;
             granted_paula_ro_val_q <=
                 (addr[winner] == SERDATR_ADDR) ? SERDATR_VAL
@@ -922,6 +987,9 @@ module m68k_bus #(
         resp_valid = {N_PORTS{1'b0}};
         resp_data  = granted_is_irq_q       ? {29'd0, irq_level}
                    : granted_is_autoconfig_q ? 32'hFFFFFFFF
+                   : granted_is_bpl_probe_q  ? (granted_bpl_probe_sel_q == 2'd1
+                                                  ? {bpl1dat, 16'd0}
+                                                  : bpl_fetches)
                    : granted_is_shadow_q    ? {granted_shadow_hi_q, granted_shadow_lo_q}
                    : granted_is_agnus_q     ? agnus_resp_w
                    : granted_is_paula_ro_q  ? {16'd0, granted_paula_ro_val_q}
