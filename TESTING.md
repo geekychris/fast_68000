@@ -197,6 +197,34 @@ the sim for 10 M cycles and dumps the tail of stdout / [sim]
 output — so even when the ROM doesn't reach a clean halt, you can
 see how far it got and which chipset registers it last touched.
 
+### 6d. Fake Kickstart stub — `make test-fake-kickstart`
+
+`roms/fake_kickstart.s` mirrors what a real Kickstart 1.x does in its
+first thousand instructions, in order:
+
+  1. read VHPOSR (Agnus alive)
+  2. DMACON CLR all
+  3. INTENA CLR all
+  4. INTREQ CLR all
+  5. clear OVL via CIA-A
+  6. AUDENA = 0
+  7. INTREQ SET DSKBLK + verify INTREQR bit
+  8. Zorro autoconfig probe at $E80000 (must read $FF = no card)
+  9. (vector table skipped — already zero)
+ 10. INTENA SET master + DSKBLK + verify INTENAR bit
+ 11. CIA-A TOD advance
+ 12. CIA-A timer A program (continuous-mode 8000-cycle reload)
+ 13. VHPOSR moved
+ 14. halt 0
+
+If any step fails the halt code is $BAD7..$BADB so the failing step
+is identifiable.  This is the closest thing we have to "did a real
+Kickstart make it past early init", short of running one.
+
+```
+make test-fake-kickstart
+```
+
 ## 7. Memory-backed block device — `make test-blockdev`
 
 Builds the sim with a tiny disk image (`tests/disk_test.hex`) loaded
@@ -213,6 +241,33 @@ the go bit, polls until BLKCMD reads back 0.  Hex-loadable from any
 ```
 make test-blockdev
 ```
+
+### 7b. Floppy DSKLEN DMA — `make test-floppy`
+
+Same disk[] backing as `test-blockdev` but driven by the canonical
+floppy register protocol: write DSKPT, write DSKLEN with bit 15 =
+DMAEN, poll for completion.  Re-uses the block-device engine under
+the hood; the BLKSRC register at $00FE_8000 acts as a non-canonical
+"head position" stand-in.  `trackdisk.device`-style code that hits
+the canonical DSKLEN registers will work; we just don't fully
+emulate the MFM stream / read-gate / sync-word state machine.
+
+```
+make test-floppy
+```
+
+### 7c. Keyboard byte injection — `make test` (`tests/t70_kbd_inject.s`)
+
+CPU writes a scan code byte to $00FE_9000.  The bus pulses
+`cia_a_kbd_wr` for one cycle with the byte, which CIA-A latches into
+its SDR (register $0C) and sets ICR bit 3 (SP-source-pending).  An
+ICR read returns the pending mask with bit 3 set AND clears it via
+the canonical CIA "read-and-clear" semantics.  A subsequent SDR
+read returns the injected byte.
+
+This is how a real Amiga keyboard delivers scan codes — the
+keyboard MCU shifts a byte over the CIA-A SP line, CIA-A raises an
+interrupt, the OS reads SDR.
 
 ## 8. Chipset register cross-check vs MiniMig — `make crosscheck-minimig`
 

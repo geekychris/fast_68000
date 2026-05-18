@@ -52,6 +52,14 @@ module cia (
     // Timer tick.  Assert for one bus cycle per timer phi.
     input  wire        tick,
 
+    // Keyboard (or any other serial) byte inject.  Assert kbd_wr for
+    // one cycle along with kbd_byte; the byte lands in SDR and bit 3
+    // of ICR (SP-flag = "serial complete") goes pending, raising the
+    // CIA interrupt.  Reading SDR (register $C) clears the pending bit
+    // via the normal ICR-read-clear path.
+    input  wire        kbd_wr,
+    input  wire [7:0]  kbd_byte,
+
     // Port A / B inputs (peripheral side).
     input  wire [7:0]  pa_in,
     input  wire [7:0]  pb_in,
@@ -71,8 +79,11 @@ module cia (
     reg [7:0]  tb_lo_reload, tb_hi_reload;
     reg [15:0] ta_cnt, tb_cnt;
     reg [7:0]  cra, crb;
-    reg [4:0]  icr_pending;          // bits 0..4 in real CIA; we use 0,1
-    reg [4:0]  icr_mask;             // bits 0..4
+    // Serial data register.  Receives kbd_byte; reads clear the SP
+    // interrupt source via the icr_read_clear path.
+    reg [7:0]  sdr;
+    reg [4:0]  icr_pending;          // bits 0=TA, 1=TB, 3=SP
+    reg [4:0]  icr_mask;
 
     // ---------------- TOD: 24-bit time-of-day -----------------------
     // Real Amiga drives TOD from Agnus VSYNC (50 Hz PAL / 60 Hz NTSC).
@@ -114,7 +125,7 @@ module cia (
             4'h9: slv_rdata = tod[15:8];    // TOD mid
             4'hA: slv_rdata = tod[23:16];   // TOD hi
             4'hB: slv_rdata = 8'd0;
-            4'hC: slv_rdata = 8'd0;   // SDR
+            4'hC: slv_rdata = sdr;
             4'hD: slv_rdata = {int_o, 2'd0, icr_pending};
             4'hE: slv_rdata = cra;
             4'hF: slv_rdata = crb;
@@ -142,7 +153,13 @@ module cia (
             icr_read_clear <= 1'b0;
             tod <= 24'd0;
             tod_prescale <= 10'd0;
+            sdr <= 8'd0;
         end else begin
+            // Serial byte arrives from external (keyboard scancode).
+            if (kbd_wr) begin
+                sdr <= kbd_byte;
+                icr_pending[3] <= 1'b1;       // SP interrupt source
+            end
             // TOD tick (free-running 50 Hz-ish counter).
             if (tod_prescale == 10'd1023) begin
                 tod_prescale <= 10'd0;

@@ -125,7 +125,10 @@ module m68k_bus #(
     // reads in $0-$7FFFF redirect to $F80000-$FFFFFF (ROM).  Software clears
     // it by driving CIA-A PRA bit 0 low (input on the dedicated /OVL line).
     // We accept that as `ovl_clr_i`; once asserted, OVL stays cleared.
-    input  wire                           ovl_clr_i
+    input  wire                           ovl_clr_i,
+    // Keyboard byte injection (testbench-driven).
+    output reg                            kbd_inject_wr,
+    output reg  [7:0]                     kbd_inject_byte
 );
     localparam [31:0] IRQ_REG_ADDR  = 32'hFFFF_FFFC;
     localparam [31:0] BLT_BASE      = 32'h00FE_0000;
@@ -259,6 +262,21 @@ module m68k_bus #(
     localparam [31:0] VHPOSR_ADDR  = 32'h00DF_F006;
     localparam [31:0] DMACON_ADDR  = 32'h00DF_F096;
 
+    // ----- Floppy DSKLEN-style DMA -----------------------------------
+    // Real Amiga floppy DMA: write DSKPT (32-bit byte addr), write DSKLEN
+    // (length + bit15 DMAEN) twice (the second write actually starts the
+    // transfer in real hw).  We accept the first write as a "start" too.
+    // Source is disk[] starting at offset (blk_src << 9), i.e. we re-use
+    // the block-device BLKSRC register at $00FE_8000 to set the disk
+    // position.  On completion we set INTREQ DSKBLK (bit 1) via an
+    // internal pulse fed into Paula's irq input wires (TODO; today we
+    // only set the busy flag and the boot ROM polls).
+    localparam [31:0] DSKPTH_ADDR  = 32'h00DF_F020;   // high half of DSKPT
+    localparam [31:0] DSKPTL_ADDR  = 32'h00DF_F022;   // low half
+    localparam [31:0] DSKLEN_ADDR  = 32'h00DF_F024;   // length + DMAEN bit15
+    reg [31:0] dsk_pt;
+    reg [15:0] dsk_len;
+
     // ----- Paula peripheral input stubs (read-only) -----------------
     // Real Kickstart pokes SERDATR (bit 13 TBE = "transmit empty";
     // bit 14 TSRE = "transmit shift register empty") and POTGOR
@@ -325,11 +343,17 @@ module m68k_bus #(
     //   $DFF090-$DFF094   (DIWSTRT/STOP, DDFSTRT)
     //   $DFF098 (CLXCON)
     //   $DFF0E0-$DFF0FF   (BPLxPT)
+    // DSKPTH/L/DSKLEN are handled by their own logic below; carve them
+    // out of the shadow region so writes hit the floppy state machine.
+    wire is_dsk_reg = (addr[winner] == DSKPTH_ADDR) ||
+                      (addr[winner] == DSKPTL_ADDR) ||
+                      (addr[winner] == DSKLEN_ADDR);
     wire is_shadow_reg =
-        (addr[winner] >= 32'h00DF_F020 && addr[winner] <= 32'h00DF_F02E) ||
-        (addr[winner] >= 32'h00DF_F080 && addr[winner] <= 32'h00DF_F094) ||
-        (addr[winner] == 32'h00DF_F098)                                  ||
-        (addr[winner] >= 32'h00DF_F0E0 && addr[winner] <= 32'h00DF_F0FF);
+        ((addr[winner] >= 32'h00DF_F020 && addr[winner] <= 32'h00DF_F02E) ||
+         (addr[winner] >= 32'h00DF_F080 && addr[winner] <= 32'h00DF_F094) ||
+         (addr[winner] == 32'h00DF_F098)                                  ||
+         (addr[winner] >= 32'h00DF_F0E0 && addr[winner] <= 32'h00DF_F0FF))
+        && !is_dsk_reg;
 
     // ----- Zorro II autoconfig stub --------------------------------
     // Real Amiga probes $E80000..$E8007F for autoconfig boards.  Each
@@ -342,6 +366,12 @@ module m68k_bus #(
     // window returns $FF, no writes have effect.
     localparam [31:0] AUTOCONFIG_BASE = 32'h00E8_0000;
     localparam [31:0] AUTOCONFIG_END  = 32'h00E8_FFFF;
+
+    // ----- Keyboard byte injection register -------------------------
+    // CPU writes a scan-code byte to $00FE_9000.  Pulses kbd_inject_wr
+    // for one cycle with the byte; CIA-A latches it into SDR and fires
+    // its SP interrupt source.
+    localparam [31:0] KBD_INJECT_ADDR = 32'h00FE_9000;
 
     // Unflatten inputs.
     wire [31:0] addr  [0:N_PORTS-1];
@@ -473,6 +503,7 @@ module m68k_bus #(
                          && !is_agnus_reg && !is_paula_ro_reg && !is_shadow_reg;
     wire is_autoconfig_reg = (addr[winner] >= AUTOCONFIG_BASE) &&
                               (addr[winner] <= AUTOCONFIG_END);
+    wire is_kbd_inject_reg = (addr[winner] == KBD_INJECT_ADDR);
     wire is_pau_reg  = is_pau_legacy | is_pau_amiga;
     wire is_ciaa_legacy = (addr[winner] >= CIAA_BASE) && (addr[winner] <= CIAA_END);
     wire is_ciab_legacy = (addr[winner] >= CIAB_BASE) && (addr[winner] <= CIAB_END);
@@ -603,7 +634,14 @@ module m68k_bus #(
             blk_busy  <= 1'b0;
             blk_cur_off <= 32'd0;
             blk_cur_dst <= 32'd0;
+            dsk_pt    <= 32'd0;
+            dsk_len   <= 16'd0;
+            kbd_inject_wr   <= 1'b0;
+            kbd_inject_byte <= 8'd0;
         end else begin
+            // Default keyboard inject pulse to 0 each cycle; the write
+            // path below asserts it for one cycle when triggered.
+            kbd_inject_wr <= 1'b0;
             // Block-device DMA tick: while busy, copy one disk word to mem
             // per clock.  Two cycles of pre-arbiter access is fine — we
             // bypass the bus arbiter entirely (this is a "ghost" master that
@@ -621,8 +659,46 @@ module m68k_bus #(
             // commit to main memory. Writes to the blitter register region
             // are handled by the combinational slave port (no memory write).
             // Writes anywhere else update memory.
-            if (winner_valid && we[winner] && is_irq_reg) begin
+            if (winner_valid && we[winner] && is_kbd_inject_reg) begin
+                // Pick the byte in whatever lane the CPU drove; for a
+                // canonical move.b dest the byte sits in be[0]..be[3]
+                // depending on address.  Use the first non-zero lane.
+                if (be[winner][3]) kbd_inject_byte <= wdata[winner][31:24];
+                else if (be[winner][2]) kbd_inject_byte <= wdata[winner][23:16];
+                else if (be[winner][1]) kbd_inject_byte <= wdata[winner][15:8];
+                else if (be[winner][0]) kbd_inject_byte <= wdata[winner][7:0];
+                kbd_inject_wr <= 1'b1;
+            end else if (winner_valid && we[winner] && is_irq_reg) begin
                 if (be[winner][0]) irq_level <= wdata[winner][2:0];
+            end else if (winner_valid && we[winner] && is_dsk_reg) begin
+                // Floppy DSKPT/DSKLEN writes.  Most accesses are 16-bit,
+                // landing in either high or low half of the 32-bit word.
+                // DSKPTH at $20 (word-aligned long): top 16 bits of DSKPT.
+                // DSKPTL at $22: bottom 16 bits.  DSKLEN at $24 (high half
+                // of long $24): length + DMAEN bit.
+                if (addr[winner] == DSKPTH_ADDR) begin
+                    // Upper half of 32-bit DSKPT
+                    dsk_pt[31:16] <= wdata[winner][31:16];
+                end else if (addr[winner] == DSKPTL_ADDR) begin
+                    dsk_pt[15:0]  <= wdata[winner][15:0];
+                end else if (addr[winner] == DSKLEN_ADDR) begin
+                    // Word write at $24 — value in high half of 32-bit
+                    // word (since $24 is long-aligned, addr[1]=0).
+                    dsk_len <= wdata[winner][31:16];
+                    // DMAEN bit 15: start transfer.  Re-use block-DMA
+                    // engine: source = blk_src*512, dest = dsk_pt,
+                    // count = (dsk_len & $3FFF) words = dsk_len*2 bytes.
+                    if (wdata[winner][31] && !blk_busy) begin
+                        blk_busy    <= 1'b1;
+                        blk_cur_off <= blk_src << 9;          // sector*512
+                        blk_cur_dst <= dsk_pt;
+                        // Use dsk_len (in words) as the transfer length
+                        // in bytes/4 longs.  Set blk_cnt such that
+                        // blk_dst + (blk_cnt << 9) = dsk_pt + dsk_len*2:
+                        blk_dst     <= dsk_pt;
+                        blk_cnt     <= {16'd0, wdata[winner][29:16]} >> 8;
+                    end
+                end
             end else if (winner_valid && we[winner] && is_blk_reg) begin
                 // Block-device control register write.  BLKCMD with bit 0
                 // set starts the DMA from disk[] -> mem[].

@@ -31,14 +31,14 @@ RTL_SRCS := $(RTL_DIR)/m68k_alu.v \
 
 # Tests in the default `make test` suite.  t61_ovl needs a special build
 # (OVL_RESET=1 + a tiny ROM); it has its own `test-ovl` target.
-TESTS  := $(filter-out $(TESTS_DIR)/t61_ovl.s $(TESTS_DIR)/t63_boot_rom.s $(TESTS_DIR)/t65_blockdev.s $(TESTS_DIR)/t66_boot_rom_ext.s,$(wildcard $(TESTS_DIR)/*.s))
+TESTS  := $(filter-out $(TESTS_DIR)/t61_ovl.s $(TESTS_DIR)/t63_boot_rom.s $(TESTS_DIR)/t65_blockdev.s $(TESTS_DIR)/t66_boot_rom_ext.s $(TESTS_DIR)/t68_floppy_dsklen.s $(TESTS_DIR)/t69_fake_kickstart.s,$(wildcard $(TESTS_DIR)/*.s))
 BENCHES:= $(wildcard $(BENCH_DIR)/*.s)
 
 N_CORES   ?= 2
 MEM_WORDS ?= 65536
 BUILD     ?= build
 
-.PHONY: all build test test-ovl test-all test-boot-rom test-boot-rom-ext test-blockdev test-boot-rom-bin bench clean demo demo-fb demo-os demo-blt demo-cop demo-den demo-pau demo-poly demo-spr demo-morph demo-ham demo-coprainbow demo-showcase demo-hires fetch-musashi musashi crosscheck fetch-fx68k fx68k crosscheck-fx68k crosscheck-all demos-c demos-c-build cc68k-image fetch-minimig minimig crosscheck-minimig
+.PHONY: all build test test-ovl test-all test-boot-rom test-boot-rom-ext test-blockdev test-floppy test-boot-rom-bin test-fake-kickstart bench clean demo demo-fb demo-os demo-blt demo-cop demo-den demo-pau demo-poly demo-spr demo-morph demo-ham demo-coprainbow demo-showcase demo-hires fetch-musashi musashi crosscheck fetch-fx68k fx68k crosscheck-fx68k crosscheck-all demos-c demos-c-build cc68k-image fetch-minimig minimig crosscheck-minimig
 
 all: test
 
@@ -371,6 +371,25 @@ test-boot-rom:
 	else echo "FAIL t63_boot_rom rc=$$rc"; tail -n 6 build_boot/t63.log | sed 's/^/      /'; exit 1; fi
 
 # ---------------------------------------------------------------------------
+# Fake-Kickstart test.  Runs roms/fake_kickstart.s, which walks through
+# what a real Kickstart 1.x does in its first thousand instructions
+# (DMACON/INTENA clear, OVL clear, INTREQ SET, autoconfig probe, TOD,
+# CIA-A timer, VHPOSR advance).  PASS = nothing hangs all the way to
+# halt 0.  Per-step failures land on $BAD7..$BADB.
+# ---------------------------------------------------------------------------
+test-fake-kickstart:
+	@mkdir -p build_fake_kick
+	$(PYTHON) $(TB_DIR)/asm68k.py --mem-words 4096 roms/fake_kickstart.s build_fake_kick/fake_kickstart.hex
+	@$(MAKE) --no-print-directory build BUILD=build_fake_kick N_CORES=1 USE_CACHE=1 \
+	    MEM_WORDS=65536 ROM_WORDS=4096 ROM_HEXFILE=fake_kickstart.hex OVL_RESET=1 \
+	    >build_fake_kick/_build.log 2>&1
+	$(PYTHON) $(TB_DIR)/asm68k.py tests/t69_fake_kickstart.s build_fake_kick/program.hex
+	@(cd build_fake_kick && ./Vm68k_top 5000000) > build_fake_kick/t69.log 2>&1; \
+	rc=$$?; \
+	if [ $$rc -eq 0 ]; then echo "PASS t69_fake_kickstart"; \
+	else echo "FAIL t69_fake_kickstart rc=$$rc"; tail -n 6 build_fake_kick/t69.log | sed 's/^/      /'; exit 1; fi
+
+# ---------------------------------------------------------------------------
 # Extended boot-ROM test.  Exercises Agnus beam, DMACON SET/CLR,
 # SERDATR/POTGOR canned values, CIA-A TOD advance, and a small blitter
 # copy — all under the OVL → trampoline → ROM-entry path.  Halt 0 = PASS,
@@ -435,6 +454,20 @@ test-blockdev:
 	rc=$$?; \
 	if [ $$rc -eq 0 ]; then echo "PASS t65_blockdev"; \
 	else echo "FAIL t65_blockdev rc=$$rc"; tail -n 6 build_blk/t65.log | sed 's/^/      /'; exit 1; fi
+
+# Floppy DSKLEN-style DMA test.  Same disk[] backing as test-blockdev,
+# but driven by the canonical floppy register protocol (DSKPT + DSKLEN).
+test-floppy:
+	@mkdir -p build_flp
+	cp tests/disk_test.hex build_flp/disk_test.hex
+	@$(MAKE) --no-print-directory build BUILD=build_flp N_CORES=2 USE_CACHE=1 \
+	    MEM_WORDS=65536 DISK_WORDS=2048 DISK_HEXFILE=disk_test.hex \
+	    >build_flp/_build.log 2>&1
+	$(PYTHON) $(TB_DIR)/asm68k.py tests/t68_floppy_dsklen.s build_flp/program.hex
+	@(cd build_flp && ./Vm68k_top 1000000) > build_flp/t68.log 2>&1; \
+	rc=$$?; \
+	if [ $$rc -eq 0 ]; then echo "PASS t68_floppy_dsklen"; \
+	else echo "FAIL t68_floppy_dsklen rc=$$rc"; tail -n 6 build_flp/t68.log | sed 's/^/      /'; exit 1; fi
 
 # Benchmarks: build a "fast" (pipelined + caches) and "slow" (passthrough)
 # 1-core simulator, run every program on both, and print a comparison.

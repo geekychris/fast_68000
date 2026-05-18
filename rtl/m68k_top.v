@@ -111,6 +111,10 @@ module m68k_top #(
     wire [7:0]  cia_a_pa_out;
     wire [7:0]  cia_a_pa_oe;
     wire        ovl_clr = cia_a_pa_oe[0] & ~cia_a_pa_out[0];
+    // Keyboard byte injection.  Bus exposes a write port at $00FE9000
+    // that pulses cia_a_kbd_wr for one cycle with the written byte.
+    wire        cia_a_kbd_wr;
+    wire [7:0]  cia_a_kbd_byte;
 
     // Blitter busy signal exposed to the Copper (for WAIT).
     wire        blt_busy;
@@ -180,7 +184,9 @@ module m68k_top #(
         .cia_b_slv_addr (cia_b_slv_addr),
         .cia_b_slv_wdata(cia_b_slv_wdata),
         .cia_b_slv_rdata(cia_b_slv_rdata),
-        .ovl_clr_i      (ovl_clr)
+        .ovl_clr_i      (ovl_clr),
+        .kbd_inject_wr  (cia_a_kbd_wr),
+        .kbd_inject_byte(cia_a_kbd_byte)
     );
 
     // CIA-A and CIA-B.  Tick every bus cycle for now (10x real Amiga rate)
@@ -194,6 +200,8 @@ module m68k_top #(
         .slv_wdata(cia_a_slv_wdata),
         .slv_rdata(cia_a_slv_rdata),
         .tick     (1'b1),
+        .kbd_wr   (cia_a_kbd_wr),
+        .kbd_byte (cia_a_kbd_byte),
         .pa_in    (8'd0),
         .pb_in    (8'd0),
         .pa_out   (cia_a_pa_out),
@@ -212,6 +220,8 @@ module m68k_top #(
         .slv_wdata(cia_b_slv_wdata),
         .slv_rdata(cia_b_slv_rdata),
         .tick     (1'b1),
+        .kbd_wr   (1'b0),
+        .kbd_byte (8'd0),
         .pa_in    (8'd0),
         .pb_in    (8'd0),
         .pa_out   (),
