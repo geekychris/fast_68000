@@ -147,15 +147,23 @@ non-zero = FAIL.  The harness asserts halt 0 for every demo.
 
 ## 6. Boot-from-ROM end-to-end — `make test-boot-rom`
 
-Assembles `roms/boot_rom.s` into a hex loaded at $F80000 (with the
-68000 reset vector at offsets 0/4 inside the ROM) and runs
-`tests/t63_boot_rom.s` as a $400-resident trampoline that picks up
-the SSP+PC from $0/$4 (OVL routes those reads to ROM) and jumps into
-the ROM image.  The ROM code then writes Paula INTENA, clears OVL
-via CIA-A, reads memory back, and halts with 0.
+Assembles `roms/boot_rom.s` into a hex loaded at $F80000 with:
+  - the 68000 reset vector at offsets 0/4 inside the ROM
+  - a reset trampoline at offset $400
+  - the real boot code at offset 8
 
-Proves the boot chain: OVL → reset vector fetch → trampoline → ROM
-entry → chipset MMIO → live RAM after OVL clear.
+At reset OVL=1 routes every read at $0-$7FFFF through to the ROM,
+so the CPU's first IF fetch at PC=$400 hits the in-ROM trampoline
+(*not* the mem[$400] hex), which does the canonical reset-vector
+fetch: `move.l $0,A7; move.l $4,A0; jmp (A0)`.  The boot code at
+$F80008 then clears OVL via CIA-A, exercises chipset MMIO, and
+halts with 0.
+
+This is the closest thing to a real 68000 reset-vector fetch we can
+do without modifying the core's hard-coded RESET_PC.  The boot
+sequence on a real Amiga (read SSP, read PC, jump) is implemented in
+software inside ROM rather than in the CPU's reset microcode, which
+is functionally equivalent.
 
 ```
 make test-boot-rom

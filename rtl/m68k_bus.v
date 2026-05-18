@@ -279,6 +279,70 @@ module m68k_bus #(
     localparam [15:0] JOY_DAT_VAL  = 16'h0000;
     localparam [15:0] ADKCONR_VAL  = 16'h0000;
 
+    // ----- Agnus bitplane / control register STORAGE ---------------
+    // Kickstart writes a lot of bitplane setup state before kicking
+    // the system: BPLxPTH/L (bitplane DMA pointers), BPLxMOD (modulo),
+    // BPLCON0..3 (control), DIWSTRT/DIWSTOP, DDFSTRT/DDFSTOP, COLOR00..31,
+    // COPxLCH/L (copper list pointers).  Our Denise reads bitplanes
+    // through its own master port today; for compat we just *store* the
+    // values so reads back match writes (Kickstart sometimes re-reads).
+    //
+    // Storage layout: 9-bit byte-address space ($000..$1FF) inside the
+    // $DFF000..$DFF1FF Paula+Denise window.  We carve out the storage
+    // ranges below and shadow the writes into chip_regs[].
+    //
+    // Ranges shadowed:
+    //   $DFF080..$DFF08F     COPxLCH/L (8 bytes per pointer)
+    //   $DFF08E              COPJMP1/2 (handled as RW storage)
+    //   $DFF092..$DFF093     DDFSTRT/DDFSTOP
+    //   $DFF08A..$DFF08D     DSKLEN family (no DMA, just storage)
+    //   $DFF0E0..$DFF0F7     BPL1PT..BPL6PT  (32-bit each)
+    //   $DFF100..$DFF107     BPLCON0..BPLCON3
+    //   $DFF108..$DFF10B     BPL1MOD/BPL2MOD
+    //   $DFF180..$DFF1BF     COLOR00..COLOR31
+    //
+    // We let the existing Denise/Copper slaves continue to own their
+    // canonical ranges where they have real implementations; this
+    // storage region is for the rest.
+    reg [15:0] chip_regs [0:511];
+    integer ci;
+    initial begin
+        for (ci = 0; ci < 512; ci = ci + 1) chip_regs[ci] = 16'd0;
+    end
+    wire [8:0] chip_idx = addr[winner][8:0];
+    // The "shadow" set is anything in $DFF000-$DFF1FF that isn't already
+    // owned by Agnus/Paula-RO/Paula-amiga/Denise-amiga slaves.  Easier:
+    // explicitly carve out the COPxLCH/L, BPLxPT, BPLCONx, BPLxMOD,
+    // DDF/DIW ranges.
+    // Shadow region: ONLY chipset addresses that no other slave already
+    // owns.  Carefully excludes:
+    //   $DFF096 / $DFF09A / $DFF09C / $DFF09E   (Agnus + Paula)
+    //   $DFF100-$DFF1FF / $DFF300-$DFF3FF      (Denise)
+    //   $DFF000-$DFF07F (mostly)                (DMA reads from Paula)
+    // Includes:
+    //   $DFF020-$DFF02E   (DSK*)         storage-only
+    //   $DFF080-$DFF08F   (COP1/2LCH/L, COPJMP1/2, COPCON)
+    //   $DFF090-$DFF094   (DIWSTRT/STOP, DDFSTRT)
+    //   $DFF098 (CLXCON)
+    //   $DFF0E0-$DFF0FF   (BPLxPT)
+    wire is_shadow_reg =
+        (addr[winner] >= 32'h00DF_F020 && addr[winner] <= 32'h00DF_F02E) ||
+        (addr[winner] >= 32'h00DF_F080 && addr[winner] <= 32'h00DF_F094) ||
+        (addr[winner] == 32'h00DF_F098)                                  ||
+        (addr[winner] >= 32'h00DF_F0E0 && addr[winner] <= 32'h00DF_F0FF);
+
+    // ----- Zorro II autoconfig stub --------------------------------
+    // Real Amiga probes $E80000..$E8007F for autoconfig boards.  Each
+    // byte addresses a nibble (high nibble in [7:4]).  Empty (no card)
+    // is signalled by the type-byte's two high bits being 11 — i.e.
+    // any read returns $FF.  Kickstart reads the type byte at $E80000;
+    // seeing $FF means "no Zorro card here" and it moves on.
+    //
+    // We provide one byte of address decoding: every address in the
+    // window returns $FF, no writes have effect.
+    localparam [31:0] AUTOCONFIG_BASE = 32'h00E8_0000;
+    localparam [31:0] AUTOCONFIG_END  = 32'h00E8_FFFF;
+
     // Unflatten inputs.
     wire [31:0] addr  [0:N_PORTS-1];
     wire [31:0] wdata [0:N_PORTS-1];
@@ -406,7 +470,9 @@ module m68k_bus #(
                            (addr[winner] == JOY0DAT_ADDR) ||
                            (addr[winner] == JOY1DAT_ADDR);
     wire is_pau_amiga  = (addr[winner] >= PAU_AMIGA_BASE) && (addr[winner] <= PAU_AMIGA_END)
-                         && !is_agnus_reg && !is_paula_ro_reg;
+                         && !is_agnus_reg && !is_paula_ro_reg && !is_shadow_reg;
+    wire is_autoconfig_reg = (addr[winner] >= AUTOCONFIG_BASE) &&
+                              (addr[winner] <= AUTOCONFIG_END);
     wire is_pau_reg  = is_pau_legacy | is_pau_amiga;
     wire is_ciaa_legacy = (addr[winner] >= CIAA_BASE) && (addr[winner] <= CIAA_END);
     wire is_ciab_legacy = (addr[winner] >= CIAB_BASE) && (addr[winner] <= CIAB_END);
@@ -573,6 +639,19 @@ module m68k_bus #(
                 endcase
             end else if (winner_valid && we[winner] && is_paula_ro_reg) begin
                 // Paula read-only stubs swallow writes silently.
+            end else if (winner_valid && we[winner] && is_autoconfig_reg) begin
+                // Autoconfig "shut up" writes (Kickstart writes a sentinel
+                // to step past a card) — we have no cards so just drop.
+            end else if (winner_valid && we[winner] && is_shadow_reg) begin
+                // Shadow-store any chipset register Kickstart writes that
+                // we don't have a functional slave for.  16-bit writes
+                // come from one or the other half of the 32-bit wdata;
+                // for a long write, store BOTH halves into consecutive
+                // chip_reg slots.
+                if (be[winner][3] | be[winner][2])
+                    chip_regs[{chip_idx[8:2], 2'b00}] <= wdata[winner][31:16];
+                if (be[winner][1] | be[winner][0])
+                    chip_regs[{chip_idx[8:2], 2'b10}] <= wdata[winner][15:0];
             end else if (winner_valid && we[winner] && is_agnus_reg) begin
                 // DMACON write: bit 15 = SET (1) / CLR (0), bits 14..0 = mask.
                 if (addr[winner] == DMACON_ADDR) begin
@@ -699,6 +778,10 @@ module m68k_bus #(
     reg [1:0] granted_blk_sel_q;     // 0 SRC 1 DST 2 CNT 3 CMD
     reg granted_is_paula_ro_q;
     reg [15:0] granted_paula_ro_val_q;
+    reg granted_is_autoconfig_q;
+    reg granted_is_shadow_q;
+    reg [15:0] granted_shadow_hi_q;   // high half (long-aligned word)
+    reg [15:0] granted_shadow_lo_q;   // low half (next word)
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             granted_is_agnus_q  <= 1'b0;
@@ -709,6 +792,10 @@ module m68k_bus #(
             granted_blk_sel_q   <= 2'd0;
             granted_is_paula_ro_q  <= 1'b0;
             granted_paula_ro_val_q <= 16'd0;
+            granted_is_autoconfig_q <= 1'b0;
+            granted_is_shadow_q     <= 1'b0;
+            granted_shadow_hi_q     <= 16'd0;
+            granted_shadow_lo_q     <= 16'd0;
         end else begin
             granted_is_agnus_q  <= winner_valid && !we[winner] && is_agnus_reg
                                    && (addr[winner] != DMACON_ADDR);
@@ -722,6 +809,15 @@ module m68k_bus #(
                                  : (addr[winner] == BLKCNT_AD) ? 2'd2
                                  : (addr[winner] == BLKCMD_AD) ? 2'd3
                                  : 2'd0;
+            granted_is_autoconfig_q <= winner_valid && !we[winner] && is_autoconfig_reg;
+            granted_is_shadow_q     <= winner_valid && !we[winner] && is_shadow_reg;
+            // For a 32-bit read at long-aligned address X, return
+            // {chip_regs[X], chip_regs[X+2]}.  For a 16-bit read at
+            // an odd-word offset (chip_idx[1]=1), the value is in the
+            // low half of the 32-bit result.  Compute both halves and
+            // pick later when forming resp_data.
+            granted_shadow_hi_q     <= chip_regs[{chip_idx[8:2], 2'b00}];
+            granted_shadow_lo_q     <= chip_regs[{chip_idx[8:2], 2'b10}];
             granted_is_paula_ro_q  <= winner_valid && !we[winner] && is_paula_ro_reg;
             granted_paula_ro_val_q <=
                 (addr[winner] == SERDATR_ADDR) ? SERDATR_VAL
@@ -749,6 +845,8 @@ module m68k_bus #(
     always @* begin
         resp_valid = {N_PORTS{1'b0}};
         resp_data  = granted_is_irq_q       ? {29'd0, irq_level}
+                   : granted_is_autoconfig_q ? 32'hFFFFFFFF
+                   : granted_is_shadow_q    ? {granted_shadow_hi_q, granted_shadow_lo_q}
                    : granted_is_agnus_q     ? agnus_resp_w
                    : granted_is_paula_ro_q  ? {16'd0, granted_paula_ro_val_q}
                    : granted_is_disk_q      ? granted_disk_data_q

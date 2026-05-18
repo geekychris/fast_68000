@@ -1,7 +1,7 @@
 ; boot_rom_ext.s — extended Kickstart-style stub.
 ;
-; Loaded at $F80000 with reset SSP/PC at offsets 0/4.  Companion
-; test (tests/t66_boot_rom_ext.s) is the same $400 trampoline.
+; Loaded at $F80000 with reset SSP/PC at offsets 0/4.  Reset trampoline
+; lives at ROM offset $400 (= the CPU's reset PC, routed through OVL).
 ;
 ; Walks the chipset more thoroughly than the basic boot_rom.s:
 ;
@@ -72,7 +72,10 @@ spin1:  subq.l  #1, D7
         moveq   #0, D5
         moveq   #0, D6
         move.b  $00BFE801, D5           ; TOD-LO sample 0
-        moveq   #100, D7
+        ; TOD prescaler is 1024 host cycles; spin long enough to
+        ; see at least one tick.  4000-iter loop at ~2 cyc/iter
+        ; = ~8000 cycles is plenty.
+        move.l  #4000, D7
 spin2:  subq.l  #1, D7
         bne     spin2
         move.b  $00BFE801, D6           ; TOD-LO sample 1
@@ -121,3 +124,15 @@ fail_tod:     stop #$BAD5
               bra  fail_tod
 fail_blt:     stop #$BAD6
               bra  fail_blt
+
+;------------------------------------------------------------------
+; Reset trampoline at ROM offset $400.  CPU starts here under OVL.
+;------------------------------------------------------------------
+        .org $400
+reset_trampoline:
+        move.l  $00000000, A7
+        move.l  $00000004, A0
+        jmp     (A0)
+trampoline_dead:
+        stop    #$BADF
+        bra     trampoline_dead
