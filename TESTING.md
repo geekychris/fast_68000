@@ -161,6 +161,34 @@ entry → chipset MMIO → live RAM after OVL clear.
 make test-boot-rom
 ```
 
+### 6b. Extended boot-ROM test — `make test-boot-rom-ext`
+
+Same trampoline mechanism as `test-boot-rom`, but the ROM image walks
+a wider slice of the chipset before halting: VHPOSR beam advance,
+DMACON SET/CLR via the Agnus block, SERDATR/POTGOR canned values,
+CIA-A TOD counter advance, and a 4-word blitter copy with BLTSTAT
+poll.  Any failure halts with $BAD1..$BAD6 so the failing step is
+identifiable.
+
+```
+make test-boot-rom-ext
+```
+
+### 6c. Boot from an arbitrary binary ROM — `make test-boot-rom-bin`
+
+Same trampoline + ROM-region build, but loads a user-supplied
+binary file (e.g. a Kickstart .rom).  No legal binary is checked in.
+
+```
+make test-boot-rom-bin ROMFILE=roms/my_kickstart.rom ROMSIZE_WORDS=65536
+```
+
+`tools/bin2rom.py` converts the binary to the bus's $readmemh
+format, padded to ROMSIZE_WORDS (= 256 KB for Kickstart 1.x).  Runs
+the sim for 10 M cycles and dumps the tail of stdout / [sim]
+output — so even when the ROM doesn't reach a clean halt, you can
+see how far it got and which chipset registers it last touched.
+
 ## 7. Memory-backed block device — `make test-blockdev`
 
 Builds the sim with a tiny disk image (`tests/disk_test.hex`) loaded

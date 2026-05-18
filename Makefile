@@ -31,14 +31,14 @@ RTL_SRCS := $(RTL_DIR)/m68k_alu.v \
 
 # Tests in the default `make test` suite.  t61_ovl needs a special build
 # (OVL_RESET=1 + a tiny ROM); it has its own `test-ovl` target.
-TESTS  := $(filter-out $(TESTS_DIR)/t61_ovl.s $(TESTS_DIR)/t63_boot_rom.s $(TESTS_DIR)/t65_blockdev.s,$(wildcard $(TESTS_DIR)/*.s))
+TESTS  := $(filter-out $(TESTS_DIR)/t61_ovl.s $(TESTS_DIR)/t63_boot_rom.s $(TESTS_DIR)/t65_blockdev.s $(TESTS_DIR)/t66_boot_rom_ext.s,$(wildcard $(TESTS_DIR)/*.s))
 BENCHES:= $(wildcard $(BENCH_DIR)/*.s)
 
 N_CORES   ?= 2
 MEM_WORDS ?= 65536
 BUILD     ?= build
 
-.PHONY: all build test test-ovl test-all test-boot-rom test-blockdev bench clean demo demo-fb demo-os demo-blt demo-cop demo-den demo-pau demo-poly demo-spr demo-morph demo-ham demo-coprainbow demo-showcase demo-hires fetch-musashi musashi crosscheck fetch-fx68k fx68k crosscheck-fx68k crosscheck-all demos-c demos-c-build cc68k-image fetch-minimig minimig crosscheck-minimig
+.PHONY: all build test test-ovl test-all test-boot-rom test-boot-rom-ext test-blockdev test-boot-rom-bin bench clean demo demo-fb demo-os demo-blt demo-cop demo-den demo-pau demo-poly demo-spr demo-morph demo-ham demo-coprainbow demo-showcase demo-hires fetch-musashi musashi crosscheck fetch-fx68k fx68k crosscheck-fx68k crosscheck-all demos-c demos-c-build cc68k-image fetch-minimig minimig crosscheck-minimig
 
 all: test
 
@@ -369,6 +369,54 @@ test-boot-rom:
 	rc=$$?; \
 	if [ $$rc -eq 0 ]; then echo "PASS t63_boot_rom"; \
 	else echo "FAIL t63_boot_rom rc=$$rc"; tail -n 6 build_boot/t63.log | sed 's/^/      /'; exit 1; fi
+
+# ---------------------------------------------------------------------------
+# Extended boot-ROM test.  Exercises Agnus beam, DMACON SET/CLR,
+# SERDATR/POTGOR canned values, CIA-A TOD advance, and a small blitter
+# copy — all under the OVL → trampoline → ROM-entry path.  Halt 0 = PASS,
+# $BAD1..$BAD6 = specific step that failed.
+# ---------------------------------------------------------------------------
+test-boot-rom-ext:
+	@mkdir -p build_boot_ext
+	$(PYTHON) $(TB_DIR)/asm68k.py --mem-words 4096 roms/boot_rom_ext.s build_boot_ext/boot_rom_ext.hex
+	@$(MAKE) --no-print-directory build BUILD=build_boot_ext N_CORES=2 USE_CACHE=1 \
+	    MEM_WORDS=65536 ROM_WORDS=4096 ROM_HEXFILE=boot_rom_ext.hex OVL_RESET=1 \
+	    >build_boot_ext/_build.log 2>&1
+	$(PYTHON) $(TB_DIR)/asm68k.py tests/t66_boot_rom_ext.s build_boot_ext/program.hex
+	@(cd build_boot_ext && ./Vm68k_top 5000000) > build_boot_ext/t66.log 2>&1; \
+	rc=$$?; \
+	if [ $$rc -eq 0 ]; then echo "PASS t66_boot_rom_ext"; \
+	else echo "FAIL t66_boot_rom_ext rc=$$rc"; tail -n 6 build_boot_ext/t66.log | sed 's/^/      /'; exit 1; fi
+
+# ---------------------------------------------------------------------------
+# Boot from an arbitrary binary ROM image (e.g. a Kickstart .rom).
+# Caller supplies ROMFILE=path/to/rom.bin; converted to hex via
+# tools/bin2rom.py and loaded as the $F80000 ROM with OVL_RESET=1.
+# The $400 trampoline at tests/t63_boot_rom.s picks up the binary's
+# reset vector (SSP at offset 0, PC at offset 4 inside the ROM).
+#
+# Defaults to ROMFILE=roms/boot_rom.bin (which doesn't exist out of
+# the box; the user provides their own).  ROM size in words via
+# ROMSIZE_WORDS (default 65536 = 256 KB, matches Kickstart 1.x).
+# ---------------------------------------------------------------------------
+ROMFILE         ?= roms/boot_rom.bin
+ROMSIZE_WORDS   ?= 65536
+
+test-boot-rom-bin:
+	@if [ ! -f "$(ROMFILE)" ]; then \
+	    echo "ROMFILE=$(ROMFILE) does not exist."; \
+	    echo "Drop a Kickstart .rom (or any 256 KB raw 68k boot image)"; \
+	    echo "in roms/ and re-run: make test-boot-rom-bin ROMFILE=roms/your.rom"; \
+	    exit 1; \
+	fi
+	@mkdir -p build_rom_bin
+	$(PYTHON) tools/bin2rom.py --mem-words $(ROMSIZE_WORDS) $(ROMFILE) build_rom_bin/rom.hex
+	@$(MAKE) --no-print-directory build BUILD=build_rom_bin N_CORES=1 USE_CACHE=1 \
+	    MEM_WORDS=131072 ROM_WORDS=$(ROMSIZE_WORDS) ROM_HEXFILE=rom.hex OVL_RESET=1 \
+	    >build_rom_bin/_build.log 2>&1
+	$(PYTHON) $(TB_DIR)/asm68k.py tests/t63_boot_rom.s build_rom_bin/program.hex
+	@echo "Running $(ROMFILE) for up to 10M cycles..."
+	@(cd build_rom_bin && ./Vm68k_top 10000000) | tail -40
 
 # ---------------------------------------------------------------------------
 # Block-device DMA test.  Builds with a tiny disk image (tests/disk_test.hex)

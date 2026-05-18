@@ -74,6 +74,14 @@ module cia (
     reg [4:0]  icr_pending;          // bits 0..4 in real CIA; we use 0,1
     reg [4:0]  icr_mask;             // bits 0..4
 
+    // ---------------- TOD: 24-bit time-of-day -----------------------
+    // Real Amiga drives TOD from Agnus VSYNC (50 Hz PAL / 60 Hz NTSC).
+    // We approximate it with a fixed prescaler so any code polling TOD
+    // sees it advance.  TOD_PRESCALER=1024 gives plenty of resolution
+    // for boot-time clock reads without slowing things down.
+    reg [23:0] tod;
+    reg [9:0]  tod_prescale;
+
     // Derived control bits.
     wire ta_start    = cra[0];
     wire ta_runmode  = cra[3];       // 0 = continuous, 1 = one-shot
@@ -102,9 +110,9 @@ module cia (
             4'h5: slv_rdata = ta_cnt[15:8];
             4'h6: slv_rdata = tb_cnt[7:0];
             4'h7: slv_rdata = tb_cnt[15:8];
-            4'h8: slv_rdata = 8'd0;   // TOD low (stub)
-            4'h9: slv_rdata = 8'd0;   // TOD mid
-            4'hA: slv_rdata = 8'd0;   // TOD hi
+            4'h8: slv_rdata = tod[7:0];     // TOD low
+            4'h9: slv_rdata = tod[15:8];    // TOD mid
+            4'hA: slv_rdata = tod[23:16];   // TOD hi
             4'hB: slv_rdata = 8'd0;
             4'hC: slv_rdata = 8'd0;   // SDR
             4'hD: slv_rdata = {int_o, 2'd0, icr_pending};
@@ -132,7 +140,16 @@ module cia (
             ta_just_underflowed <= 1'b0;
             tb_just_underflowed <= 1'b0;
             icr_read_clear <= 1'b0;
+            tod <= 24'd0;
+            tod_prescale <= 10'd0;
         end else begin
+            // TOD tick (free-running 50 Hz-ish counter).
+            if (tod_prescale == 10'd1023) begin
+                tod_prescale <= 10'd0;
+                tod          <= tod + 24'd1;
+            end else begin
+                tod_prescale <= tod_prescale + 10'd1;
+            end
             ta_just_underflowed <= 1'b0;
             tb_just_underflowed <= 1'b0;
             icr_read_clear <= 1'b0;

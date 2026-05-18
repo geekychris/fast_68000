@@ -259,6 +259,26 @@ module m68k_bus #(
     localparam [31:0] VHPOSR_ADDR  = 32'h00DF_F006;
     localparam [31:0] DMACON_ADDR  = 32'h00DF_F096;
 
+    // ----- Paula peripheral input stubs (read-only) -----------------
+    // Real Kickstart pokes SERDATR (bit 13 TBE = "transmit empty";
+    // bit 14 TSRE = "transmit shift register empty") and POTGOR
+    // (joystick / mouse / paddle button bits, active-low) during
+    // early init.  We pin SERDATR to "idle, no data" and POTGOR to
+    // "all buttons up, all pots floating high" so Kickstart's loops
+    // don't trip on garbage.
+    localparam [31:0] SERDATR_ADDR = 32'h00DF_F018;   // serial data + status
+    localparam [31:0] POTGOR_ADDR  = 32'h00DF_F016;   // pot/joy buttons + pull-ups
+    localparam [31:0] ADKCONR_ADDR = 32'h00DF_F010;   // audio/disk control read
+    localparam [31:0] POT0DAT_ADDR = 32'h00DF_F012;   // pot 0 sample
+    localparam [31:0] POT1DAT_ADDR = 32'h00DF_F014;   // pot 1 sample
+    localparam [31:0] JOY0DAT_ADDR = 32'h00DF_F00A;
+    localparam [31:0] JOY1DAT_ADDR = 32'h00DF_F00C;
+    localparam [15:0] SERDATR_VAL  = 16'h6000;        // TSRE | TBE
+    localparam [15:0] POTGOR_VAL   = 16'hFFFF;
+    localparam [15:0] POT_DAT_VAL  = 16'h0000;
+    localparam [15:0] JOY_DAT_VAL  = 16'h0000;
+    localparam [15:0] ADKCONR_VAL  = 16'h0000;
+
     // Unflatten inputs.
     wire [31:0] addr  [0:N_PORTS-1];
     wire [31:0] wdata [0:N_PORTS-1];
@@ -376,8 +396,17 @@ module m68k_bus #(
                           (addr[winner] == VPOSR_ADDR)   ||
                           (addr[winner] == VHPOSR_ADDR)  ||
                           (addr[winner] == DMACON_ADDR);
+    // Read-only stubs (SERDATR / POTGOR / etc.) — return canned values
+    // suitable for early Kickstart probes.  Writes are silently dropped.
+    wire is_paula_ro_reg = (addr[winner] == SERDATR_ADDR) ||
+                           (addr[winner] == POTGOR_ADDR)  ||
+                           (addr[winner] == ADKCONR_ADDR) ||
+                           (addr[winner] == POT0DAT_ADDR) ||
+                           (addr[winner] == POT1DAT_ADDR) ||
+                           (addr[winner] == JOY0DAT_ADDR) ||
+                           (addr[winner] == JOY1DAT_ADDR);
     wire is_pau_amiga  = (addr[winner] >= PAU_AMIGA_BASE) && (addr[winner] <= PAU_AMIGA_END)
-                         && !is_agnus_reg;
+                         && !is_agnus_reg && !is_paula_ro_reg;
     wire is_pau_reg  = is_pau_legacy | is_pau_amiga;
     wire is_ciaa_legacy = (addr[winner] >= CIAA_BASE) && (addr[winner] <= CIAA_END);
     wire is_ciab_legacy = (addr[winner] >= CIAB_BASE) && (addr[winner] <= CIAB_END);
@@ -542,6 +571,8 @@ module m68k_bus #(
                     end
                     default: ;
                 endcase
+            end else if (winner_valid && we[winner] && is_paula_ro_reg) begin
+                // Paula read-only stubs swallow writes silently.
             end else if (winner_valid && we[winner] && is_agnus_reg) begin
                 // DMACON write: bit 15 = SET (1) / CLR (0), bits 14..0 = mask.
                 if (addr[winner] == DMACON_ADDR) begin
@@ -666,6 +697,8 @@ module m68k_bus #(
     reg [31:0] granted_disk_data_q;
     reg granted_is_blk_q;
     reg [1:0] granted_blk_sel_q;     // 0 SRC 1 DST 2 CNT 3 CMD
+    reg granted_is_paula_ro_q;
+    reg [15:0] granted_paula_ro_val_q;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             granted_is_agnus_q  <= 1'b0;
@@ -674,6 +707,8 @@ module m68k_bus #(
             granted_disk_data_q <= 32'd0;
             granted_is_blk_q    <= 1'b0;
             granted_blk_sel_q   <= 2'd0;
+            granted_is_paula_ro_q  <= 1'b0;
+            granted_paula_ro_val_q <= 16'd0;
         end else begin
             granted_is_agnus_q  <= winner_valid && !we[winner] && is_agnus_reg
                                    && (addr[winner] != DMACON_ADDR);
@@ -687,6 +722,15 @@ module m68k_bus #(
                                  : (addr[winner] == BLKCNT_AD) ? 2'd2
                                  : (addr[winner] == BLKCMD_AD) ? 2'd3
                                  : 2'd0;
+            granted_is_paula_ro_q  <= winner_valid && !we[winner] && is_paula_ro_reg;
+            granted_paula_ro_val_q <=
+                (addr[winner] == SERDATR_ADDR) ? SERDATR_VAL
+              : (addr[winner] == POTGOR_ADDR)  ? POTGOR_VAL
+              : (addr[winner] == ADKCONR_ADDR) ? ADKCONR_VAL
+              : (addr[winner] == POT0DAT_ADDR) ? POT_DAT_VAL
+              : (addr[winner] == POT1DAT_ADDR) ? POT_DAT_VAL
+              : (addr[winner] == JOY0DAT_ADDR) ? JOY_DAT_VAL
+              :                                  JOY_DAT_VAL;
         end
     end
     wire [31:0] blk_resp_w = (granted_blk_sel_q == 2'd0) ? blk_src
@@ -704,11 +748,12 @@ module m68k_bus #(
 
     always @* begin
         resp_valid = {N_PORTS{1'b0}};
-        resp_data  = granted_is_irq_q   ? {29'd0, irq_level}
-                   : granted_is_agnus_q ? agnus_resp_w
-                   : granted_is_disk_q  ? granted_disk_data_q
-                   : granted_is_blk_q   ? blk_resp_w
-                   : granted_is_blt_q   ? granted_blt_rdata_q
+        resp_data  = granted_is_irq_q       ? {29'd0, irq_level}
+                   : granted_is_agnus_q     ? agnus_resp_w
+                   : granted_is_paula_ro_q  ? {16'd0, granted_paula_ro_val_q}
+                   : granted_is_disk_q      ? granted_disk_data_q
+                   : granted_is_blk_q       ? blk_resp_w
+                   : granted_is_blt_q       ? granted_blt_rdata_q
                    : granted_is_cop_q   ? granted_cop_rdata_q
                    : granted_is_den_q   ? granted_den_rdata_q
                    : granted_is_pau_q   ? granted_pau_rdata_q
