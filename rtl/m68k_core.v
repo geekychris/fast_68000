@@ -929,9 +929,14 @@ module m68k_core #(
     wire is_settled_in_run     = (ex_state == S_RUN) && !want_mem && !run_launches_exc &&
                                  ex_valid && !halted;
     wire load_starts_rmw = (ex_kind == K_NEG) || (ex_kind == K_NOT);
+    // Memory-destination bit ops that need RMW (BCHG/BCLR/BSET): alu_op != 0
+    // (alu_op == 0 is BTST, which only reads).
+    wire bit_mem_writes  = (ex_kind == K_BIT) && (ex_dst_mode != `EA_DREG) &&
+                           (ex_alu_op != 5'd0);
     wire is_settled_after_load = (ex_state == S_LOAD)  && dc_ack &&
                                  ex_valid && !halted && (ex_kind != K_TAS) &&
                                  !(load_starts_rmw && (ex_src_mode != `EA_DREG)) &&
+                                 !bit_mem_writes &&
                                  !(ex_kind == K_MOVE && dst_is_mem);
     wire is_settled_after_store= (ex_state == S_STORE) && dc_ack && ex_valid && !halted;
     wire is_settled_after_tasw = (ex_state == S_TASW)  && dc_ack && ex_valid && !halted;
@@ -1496,9 +1501,21 @@ module m68k_core #(
                                     default: wb_main_data_c = bit_dest_val;
                                 endcase
                             end
+                        end else begin
+                            // Memory destination: byte-sized RMW.  The EA
+                            // lives at different positions in the
+                            // src/dst-ea machinery for static vs dynamic
+                            // (src_mode==EA_EXT/IMM in static carries the
+                            // bit-count immediate, so the dest EA is in
+                            // dst_ea; for dynamic src_mode==m3 carries the
+                            // mem EA in src_ea while rb is the bit-count
+                            // Dn).  Pick the right one.
+                            want_mem  = 1'b1;
+                            want_we   = 1'b0;
+                            want_lock = (ex_alu_op != 5'd0);
+                            want_addr = ex_shift_dyn ? src_ea : dst_ea;
+                            want_be   = be_for_byte(want_addr[1:0]);
                         end
-                        // Memory bit ops: would need RMW for BCHG/BCLR/BSET (or simple
-                        // load for BTST); not implemented.
                     end
                     K_SCC: begin
                         // Scc <ea>.B: write 0xFF if cond true, else 0x00. We support Dn dest.
@@ -1677,29 +1694,47 @@ module m68k_core #(
             // commit CCR from that value (size-aware).
             S_RMW_W: begin
                 if (dc_ack) begin
-                    cc_we_c   = 1'b1;
-                    cc_v_c    = 1'b0;
-                    cc_x_we_c = (ex_kind == K_NEG);
-                    case (ex_size)
-                        `SZ_B: begin
-                            cc_n_c = ex_tas_word[7];
-                            cc_z_c = (ex_tas_word[7:0] == 8'd0);
-                            cc_c_c = (ex_kind == K_NEG) ? (ex_tas_word[7:0] != 8'd0) : 1'b0;
-                            cc_x_c = cc_c_c;
+                    if (ex_kind == K_BIT) begin
+                        // Mem-dest BCHG/BCLR/BSET.  ex_tas_word holds the
+                        // ORIGINAL word read in S_LOAD; Z reflects the
+                        // pre-modify bit value.  Other CCR bits unchanged.
+                        cc_we_c = 1'b1;
+                        cc_n_c  = cc_n; cc_v_c = cc_v; cc_c_c = cc_c;
+                        cc_z_c  = !byte_at(ex_tas_word, dc_addr[1:0])[bit_n[2:0]];
+                        if (ex_shift_dyn && src_an_update) begin
+                            wb_aux_we_c   = 1'b1;
+                            wb_aux_idx_c  = {1'b1, ex_src_reg};
+                            wb_aux_data_c = src_an_next;
+                        end else if (!ex_shift_dyn && dst_an_update) begin
+                            wb_aux_we_c   = 1'b1;
+                            wb_aux_idx_c  = {1'b1, ex_dst_reg};
+                            wb_aux_data_c = dst_an_next;
                         end
-                        `SZ_W: begin
-                            cc_n_c = ex_tas_word[15];
-                            cc_z_c = (ex_tas_word[15:0] == 16'd0);
-                            cc_c_c = (ex_kind == K_NEG) ? (ex_tas_word[15:0] != 16'd0) : 1'b0;
-                            cc_x_c = cc_c_c;
-                        end
-                        default: begin
-                            cc_n_c = ex_tas_word[31];
-                            cc_z_c = (ex_tas_word == 32'd0);
-                            cc_c_c = (ex_kind == K_NEG) ? (ex_tas_word != 32'd0) : 1'b0;
-                            cc_x_c = cc_c_c;
-                        end
-                    endcase
+                    end else begin
+                        cc_we_c   = 1'b1;
+                        cc_v_c    = 1'b0;
+                        cc_x_we_c = (ex_kind == K_NEG);
+                        case (ex_size)
+                            `SZ_B: begin
+                                cc_n_c = ex_tas_word[7];
+                                cc_z_c = (ex_tas_word[7:0] == 8'd0);
+                                cc_c_c = (ex_kind == K_NEG) ? (ex_tas_word[7:0] != 8'd0) : 1'b0;
+                                cc_x_c = cc_c_c;
+                            end
+                            `SZ_W: begin
+                                cc_n_c = ex_tas_word[15];
+                                cc_z_c = (ex_tas_word[15:0] == 16'd0);
+                                cc_c_c = (ex_kind == K_NEG) ? (ex_tas_word[15:0] != 16'd0) : 1'b0;
+                                cc_x_c = cc_c_c;
+                            end
+                            default: begin
+                                cc_n_c = ex_tas_word[31];
+                                cc_z_c = (ex_tas_word == 32'd0);
+                                cc_c_c = (ex_kind == K_NEG) ? (ex_tas_word != 32'd0) : 1'b0;
+                                cc_x_c = cc_c_c;
+                            end
+                        endcase
+                    end
                 end
             end
             S_LOAD: begin
@@ -1826,6 +1861,28 @@ module m68k_core #(
                         wb_aux_we_c    = 1'b1;
                         wb_aux_idx_c   = 4'd15;
                         wb_aux_data_c  = ex_ra + 32'd4;
+                    end
+                    K_BIT: begin
+                        // Memory-dest BTST settles here (no write).  Pull the
+                        // byte addressed by dc_addr[1:0] out of the loaded
+                        // word and set CCR Z from bit n.  Modifying ops
+                        // (BCHG/BCLR/BSET) fall through to S_RMW_W and don't
+                        // settle here -- see is_settled_after_load.
+                        cc_we_c = 1'b1;
+                        cc_n_c  = cc_n; cc_v_c = cc_v; cc_c_c = cc_c;
+                        cc_z_c  = !byte_at(dc_rdata, dc_addr[1:0])[bit_n[2:0]];
+                        // An post-inc / pre-dec commit.  Static uses dst-side
+                        // (rb points at A[r0]); dynamic uses src-side (ra
+                        // points at A[r0], rb is the bit-count Dn).
+                        if (ex_shift_dyn && src_an_update) begin
+                            wb_aux_we_c   = 1'b1;
+                            wb_aux_idx_c  = {1'b1, ex_src_reg};
+                            wb_aux_data_c = src_an_next;
+                        end else if (!ex_shift_dyn && dst_an_update) begin
+                            wb_aux_we_c   = 1'b1;
+                            wb_aux_idx_c  = {1'b1, ex_dst_reg};
+                            wb_aux_data_c = dst_an_next;
+                        end
                     end
                     K_MULU, K_MULS: begin
                         cc_we_c = 1'b1;
@@ -2173,6 +2230,30 @@ module m68k_core #(
                             endcase
                             // dc_addr already set from the read.
                             ex_state <= S_RMW_W;
+                        end else if (bit_mem_writes) begin
+                            // Memory BCHG/BCLR/BSET: capture the original
+                            // word (S_RMW_W planning reads bit n from it to
+                            // commit CCR Z), then issue the byte write with
+                            // bit n flipped/cleared/set.
+                            ex_tas_word <= dc_rdata;
+                            dc_req_r <= 1'b1;
+                            dc_we    <= 1'b1;
+                            dc_be    <= be_for_byte(dc_addr[1:0]);
+                            case (ex_alu_op[1:0])
+                                2'b01: dc_wdata <= byte_into_word(
+                                    byte_at(dc_rdata, dc_addr[1:0]) ^ (8'd1 << bit_n[2:0]),
+                                    dc_addr[1:0]);                                // BCHG
+                                2'b10: dc_wdata <= byte_into_word(
+                                    byte_at(dc_rdata, dc_addr[1:0]) & ~(8'd1 << bit_n[2:0]),
+                                    dc_addr[1:0]);                                // BCLR
+                                2'b11: dc_wdata <= byte_into_word(
+                                    byte_at(dc_rdata, dc_addr[1:0]) |  (8'd1 << bit_n[2:0]),
+                                    dc_addr[1:0]);                                // BSET
+                                default: dc_wdata <= byte_into_word(
+                                    byte_at(dc_rdata, dc_addr[1:0]),
+                                    dc_addr[1:0]);
+                            endcase
+                            ex_state <= S_RMW_W;
                         end else if (ex_kind == K_MOVE && dst_is_mem) begin
                             // Memory-to-memory MOVE: chain a store of the
                             // loaded data to dst_ea.  For .B/.W, slot the byte
@@ -2221,6 +2302,7 @@ module m68k_core #(
                 S_RMW_W: begin
                     if (dc_ack) begin
                         dc_req_r <= 1'b0;
+                        dc_lock  <= 1'b0;
                         ex_state <= S_RUN;
                     end
                 end

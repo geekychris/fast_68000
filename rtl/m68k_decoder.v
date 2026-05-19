@@ -211,10 +211,10 @@ module m68k_decoder (
                 dst_ext_words = ea_ext(m3, r0, (m3 == `EA_DREG) ? `SZ_L : `SZ_B);
                 size = (m3 == `EA_DREG) ? `SZ_L : `SZ_B;
                 alu_op = {3'd0, opcode[7:6]};  // 00..11 selects sub-op
-                // For static BIT-op on Dn the dest register is r0; route it
-                // into reg_idx so the EX stage reads the correct Dn.
+                // For Dn dst the dest value is read via rb (D[r0]); for
+                // mem dst rb feeds the EA computation, so route rb to A[r0].
                 reg_idx = r0;
-                reg_is_a = 1'b0;
+                reg_is_a = (m3 != `EA_DREG);
             end
 
             // Bit ops dynamic: 0000_ddd_1xx_mm_rrr — uses Dd as bit number.
