@@ -437,10 +437,10 @@ module m68k_decoder (
 
             // Reserved-but-implemented control opcodes (0100_1110_0111_xxxx).
             16'b0100_1110_0111_0001: kind = K_NOP;
-            16'b0100_1110_0111_0011: begin kind = K_RTE; privileged = 1'b1; end
-            16'b0100_1110_0111_0101: kind = K_RTS;
+            16'b0100_1110_0111_0011: begin kind = K_RTE; size = `SZ_L; privileged = 1'b1; end
+            16'b0100_1110_0111_0101: begin kind = K_RTS; size = `SZ_L; end
             16'b0100_1110_0111_0110: kind = K_TRAPV;
-            16'b0100_1110_0111_0111: kind = K_RTR;
+            16'b0100_1110_0111_0111: begin kind = K_RTR; size = `SZ_L; end
             16'b0100_1110_0111_0010: begin
                 kind = K_STOP;
                 src_mode = `EA_EXT;

@@ -47,6 +47,7 @@ module m68k_bus #(
     input  wire [32*N_PORTS-1:0]   addr_flat,
     input  wire [32*N_PORTS-1:0]   wdata_flat,
     input  wire [4*N_PORTS-1:0]    be_flat,
+    input  wire [N_PORTS-1:0]      is_long_flat,
     output reg  [N_PORTS-1:0]      grant,
     output reg  [N_PORTS-1:0]      resp_valid,
     output reg  [31:0]             resp_data,
@@ -479,12 +480,14 @@ module m68k_bus #(
     wire [31:0] addr  [0:N_PORTS-1];
     wire [31:0] wdata [0:N_PORTS-1];
     wire [3:0]  be    [0:N_PORTS-1];
+    wire        is_long [0:N_PORTS-1];
     genvar g;
     generate
         for (g = 0; g < N_PORTS; g = g + 1) begin : unflat
-            assign addr[g]  = addr_flat[32*g +: 32];
-            assign wdata[g] = wdata_flat[32*g +: 32];
-            assign be[g]    = be_flat[4*g +: 4];
+            assign addr[g]    = addr_flat[32*g +: 32];
+            assign wdata[g]   = wdata_flat[32*g +: 32];
+            assign be[g]      = be_flat[4*g +: 4];
+            assign is_long[g] = is_long_flat[g];
         end
     endgenerate
 
@@ -535,6 +538,7 @@ module m68k_bus #(
     reg                 granted_valid_q;
     reg [PID_BITS-1:0]  granted_port_q;
     reg                 granted_we_q;
+    reg                 granted_is_long_q;
     reg [AIDX_BITS-1:0] granted_idx_q;
     reg [31:0]          granted_addr_q;
     reg                 granted_is_irq_q;
@@ -950,6 +954,7 @@ module m68k_bus #(
             granted_valid_q <= 1'b0;
             granted_port_q  <= {PID_BITS{1'b0}};
             granted_we_q    <= 1'b0;
+            granted_is_long_q <= 1'b0;
             granted_idx_q   <= {AIDX_BITS{1'b0}};
             granted_addr_q  <= 32'd0;
             granted_is_irq_q <= 1'b0;
@@ -1252,6 +1257,7 @@ module m68k_bus #(
             granted_valid_q <= winner_valid;
             granted_port_q  <= winner;
             granted_we_q    <= winner_valid && we[winner];
+            granted_is_long_q <= is_long[winner];
             granted_idx_q   <= mem_idx;
             granted_addr_q  <= addr[winner];
             granted_is_irq_q <= winner_valid && is_irq_reg;
@@ -1469,7 +1475,13 @@ module m68k_bus #(
                    : granted_is_ciaa_q  ? ciaa_resp_w
                    : granted_is_ciab_q  ? ciab_resp_w
                    : granted_is_rom_q   ? granted_rom_data_q
-                   : mem[granted_idx_q];
+                   // Unaligned .L read: caller signals genuine .L via
+                   // granted_is_long_q.  Assemble from low half of mem[idx]
+                   // and high half of mem[idx+1] -- matches the 68000's
+                   // internal two-word read for unaligned .L.
+                   : (granted_is_long_q && granted_addr_q[1:0] == 2'b10)
+                       ? {mem[granted_idx_q][15:0], mem[granted_idx_q + 1][31:16]}
+                       : mem[granted_idx_q];
         if (granted_valid_q) resp_valid[granted_port_q] = 1'b1;
     end
 

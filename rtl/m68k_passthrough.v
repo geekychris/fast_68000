@@ -19,6 +19,7 @@ module m68k_passthrough #(
     input  wire [31:0] cpu_addr,
     input  wire [31:0] cpu_wdata,
     input  wire [3:0]  cpu_be,
+    input  wire        cpu_is_long,
     output wire        cpu_ack,
     output wire [31:0] cpu_rdata,
 
@@ -28,6 +29,7 @@ module m68k_passthrough #(
     output reg  [31:0] bus_addr,
     output reg  [31:0] bus_wdata,
     output reg  [3:0]  bus_be,
+    output reg         bus_is_long,
     input  wire        bus_grant,
     input  wire        bus_resp_valid,
     input  wire [31:0] bus_resp_data,
@@ -64,6 +66,7 @@ module m68k_passthrough #(
             bus_addr <= 32'd0;
             bus_wdata <= 32'd0;
             bus_be <= 4'b0;
+            bus_is_long <= 1'b0;
         end else begin
             case (state)
                 S_IDLE: begin
@@ -74,6 +77,7 @@ module m68k_passthrough #(
                         bus_addr <= cpu_addr;
                         bus_wdata <= cpu_wdata;
                         bus_be <= cpu_be;
+                        bus_is_long <= cpu_is_long;
                         state <= S_WAIT;
                     end
                 end

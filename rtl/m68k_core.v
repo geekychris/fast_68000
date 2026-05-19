@@ -47,6 +47,13 @@ module m68k_core #(
     output reg  [31:0] dc_addr,
     output reg  [31:0] dc_wdata,
     output reg  [3:0]  dc_be,
+    // 1 when the data access is a genuine 32-bit (.L) operation.
+    // dc_be is always 4'b1111 for .L but the CPU also sets be=1111 for
+    // sub-longword reads (it does its own byte extraction from cpu_rdata),
+    // so be=1111 alone can't tell the bus "this is .L".  dc_is_long
+    // disambiguates so the bus's unaligned-.L assembly path can fire only
+    // when truly needed.
+    output reg         dc_is_long,
     input  wire        dc_ack,
     input  wire [31:0] dc_rdata,
 
@@ -2345,6 +2352,7 @@ module m68k_core #(
             dc_req_r <= 1'b0;
             dc_we <= 1'b0; dc_lock <= 1'b0;
             dc_addr <= 32'd0; dc_wdata <= 32'd0; dc_be <= 4'b1111;
+            dc_is_long <= 1'b0;
             halted <= 1'b0;
             halt_code <= 16'd0;
             retired <= 32'd0;
@@ -2489,6 +2497,7 @@ module m68k_core #(
                         dc_addr <= want_addr;
                         dc_wdata <= want_wdata;
                         dc_be <= want_be;
+                        dc_is_long <= (ex_size == `SZ_L);
                         if (want_we) ex_state <= S_STORE;
                         else         ex_state <= S_LOAD;
                     end

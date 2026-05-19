@@ -46,6 +46,7 @@ module m68k_top #(
     wire [32*N_PORTS-1:0] p_addr;
     wire [32*N_PORTS-1:0] p_wdata;
     wire [4*N_PORTS-1:0]  p_be;
+    wire [N_PORTS-1:0]    p_is_long;
     wire [N_PORTS-1:0]    p_grant;     // unused by caches but routed for completeness
     wire [N_PORTS-1:0]    p_resp_valid;
     wire [31:0]           p_resp_data;
@@ -141,6 +142,7 @@ module m68k_top #(
         .addr_flat   (p_addr),
         .wdata_flat  (p_wdata),
         .be_flat     (p_be),
+        .is_long_flat(p_is_long),
         .grant       (p_grant),
         .resp_valid  (p_resp_valid),
         .resp_data   (p_resp_data),
@@ -418,6 +420,7 @@ module m68k_top #(
             wire        dc_req, dc_we, dc_lock;
             wire [31:0] dc_addr, dc_wdata;
             wire [3:0]  dc_be;
+            wire        dc_is_long;
             wire        dc_ack;
             wire [31:0] dc_rdata;
 
@@ -436,6 +439,7 @@ module m68k_top #(
                     .cpu_addr    (ic_addr),
                     .cpu_wdata   (32'd0),
                     .cpu_be      (4'b1111),
+                    .cpu_is_long (1'b0),
                     .cpu_ack     (ic_ack),
                     .cpu_rdata   (ic_rdata),
                     .bus_req     (p_req[gi*2]),
@@ -444,6 +448,7 @@ module m68k_top #(
                     .bus_addr    (p_addr[32*(gi*2) +: 32]),
                     .bus_wdata   (p_wdata[32*(gi*2) +: 32]),
                     .bus_be      (p_be[4*(gi*2) +: 4]),
+                    .bus_is_long (p_is_long[gi*2]),
                     .bus_grant   (p_grant[gi*2]),
                     .bus_resp_valid(p_resp_valid[gi*2]),
                     .bus_resp_data (p_resp_data),
@@ -467,6 +472,7 @@ module m68k_top #(
                     .cpu_addr    (dc_addr),
                     .cpu_wdata   (dc_wdata),
                     .cpu_be      (dc_be),
+                    .cpu_is_long (dc_is_long),
                     .cpu_ack     (dc_ack),
                     .cpu_rdata   (dc_rdata),
                     .bus_req     (p_req[gi*2+1]),
@@ -475,6 +481,7 @@ module m68k_top #(
                     .bus_addr    (p_addr[32*(gi*2+1) +: 32]),
                     .bus_wdata   (p_wdata[32*(gi*2+1) +: 32]),
                     .bus_be      (p_be[4*(gi*2+1) +: 4]),
+                    .bus_is_long (p_is_long[gi*2+1]),
                     .bus_grant   (p_grant[gi*2+1]),
                     .bus_resp_valid(p_resp_valid[gi*2+1]),
                     .bus_resp_data (p_resp_data),
@@ -497,6 +504,7 @@ module m68k_top #(
                     .cpu_addr    (ic_addr),
                     .cpu_wdata   (32'd0),
                     .cpu_be      (4'b1111),
+                    .cpu_is_long (1'b0),
                     .cpu_ack     (ic_ack),
                     .cpu_rdata   (ic_rdata),
                     .bus_req     (p_req[gi*2]),
@@ -505,6 +513,7 @@ module m68k_top #(
                     .bus_addr    (p_addr[32*(gi*2) +: 32]),
                     .bus_wdata   (p_wdata[32*(gi*2) +: 32]),
                     .bus_be      (p_be[4*(gi*2) +: 4]),
+                    .bus_is_long (p_is_long[gi*2]),
                     .bus_grant   (p_grant[gi*2]),
                     .bus_resp_valid(p_resp_valid[gi*2]),
                     .bus_resp_data (p_resp_data),
@@ -527,6 +536,7 @@ module m68k_top #(
                     .cpu_addr    (dc_addr),
                     .cpu_wdata   (dc_wdata),
                     .cpu_be      (dc_be),
+                    .cpu_is_long (dc_is_long),
                     .cpu_ack     (dc_ack),
                     .cpu_rdata   (dc_rdata),
                     .bus_req     (p_req[gi*2+1]),
@@ -535,6 +545,7 @@ module m68k_top #(
                     .bus_addr    (p_addr[32*(gi*2+1) +: 32]),
                     .bus_wdata   (p_wdata[32*(gi*2+1) +: 32]),
                     .bus_be      (p_be[4*(gi*2+1) +: 4]),
+                    .bus_is_long (p_is_long[gi*2+1]),
                     .bus_grant   (p_grant[gi*2+1]),
                     .bus_resp_valid(p_resp_valid[gi*2+1]),
                     .bus_resp_data (p_resp_data),
@@ -572,6 +583,7 @@ module m68k_top #(
                 .dc_addr    (dc_addr),
                 .dc_wdata   (dc_wdata),
                 .dc_be      (dc_be),
+                .dc_is_long (dc_is_long),
                 .dc_ack     (dc_ack),
                 .dc_rdata   (dc_rdata),
                 .halted     (halted[gi]),
