@@ -88,14 +88,25 @@ real exec.library init.
 Known follow-up: unaligned `.L` *reads* (e.g. `MOVE.L (A7)+, Dn`
 when the IRQ frame has pushed PC+SR=6 bytes onto an aligned SSP,
 making A7 word-aligned-but-not-mod-4) still return the longword-
-aligned data instead of assembling from two `mem[]` entries.  The
-cache's tag scheme uses `addr[31:10]` so unaligned and aligned
+aligned data instead of assembling from two `mem[]` entries.
+
+The cache's tag scheme uses `addr[31:10]` so unaligned and aligned
 accesses share a line, making the read-side fix non-trivial without
-splitting the cache request itself.  Kickstart handlers typically
-use MOVEM (which keeps A7 aligned) rather than `MOVE.L -(A7)`, so
-this is unlikely to be the next wall.  `tests/t96_irq_savereg.s`
-exercises the unaligned-read path and is the lone failing
-regression test.
+either splitting the cache request itself or adding a "this is .L"
+side-band signal from CPU → cache → bus.  Several attempts to plumb
+the size info through have either broken chipset-test reads (when
+`be=$1111` was treated as ".L" but the CPU sends `$1111` for all
+reads regardless of size) or required substantial restructuring.
+
+Kickstart hits this wall around `retired = 503K` instructions:
+some routine with `LINK A5, #-$E` (subtracts 14 — not a multiple of
+4) leaves A7 word-aligned-but-not-mod-4; subsequent `BSR` push +
+`MOVEM` save/restore + `RTS` pop reads the saved PC from
+`(A7)` with `A7[1:0] = 10`, which returns the longword *before* the
+intended one — boot then jumps to a bogus PC like `$03E400F8`.
+
+`tests/t96_irq_savereg.s` exercises the same pattern and is the
+lone failing regression test.
 
 ### 4. Address-error too strict — FIXED
 The CPU was trapping `.L` accesses on any address with `bits[1:0] !=

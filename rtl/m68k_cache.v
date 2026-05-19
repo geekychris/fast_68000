@@ -163,8 +163,19 @@ module m68k_cache #(
                         // Writes to I/O regions also bypass cache fills
                         // (we update existing cached lines on hit, but
                         // never allocate for I/O addresses).
-                        if (hit && !is_io)
+                        //
+                        // Unaligned .L write (cpu_be == 4'b1111 &&
+                        // cpu_addr[1:0] == 2'b10) straddles two mem[] entries
+                        // on the bus side.  Our merge_be assumes aligned
+                        // layout and would smear all 4 bytes of wdata across
+                        // mem[idx], leaving the cache inconsistent with the
+                        // (correctly split) bus state.  Force the line(s) to
+                        // be invalidated so any subsequent read takes the
+                        // bus path and gets the right bytes.
+                        if (hit && !is_io && !((cpu_be == 4'b1111) && (cpu_addr[1:0] == 2'b10)))
                             data[idx] <= merge_be(data[idx], cpu_wdata, cpu_be);
+                        if (hit && (cpu_be == 4'b1111) && (cpu_addr[1:0] == 2'b10))
+                            valids[idx] <= 1'b0;
                         bus_req_r <= 1'b1;
                         bus_we  <= 1'b1;
                         bus_lock <= cpu_lock;
