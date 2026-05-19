@@ -188,7 +188,8 @@ module m68k_top #(
         .kbd_inject_wr  (cia_a_kbd_wr),
         .kbd_inject_byte(cia_a_kbd_byte),
         .vblank_pulse_o (vblank_pulse),
-        .dskblk_pulse_o (dskblk_pulse)
+        .dskblk_pulse_o (dskblk_pulse),
+        .ovl_clear_pulse_o (ovl_clear_pulse)
     );
 
     // CIA-A and CIA-B.  Tick every bus cycle for now (10x real Amiga rate)
@@ -366,6 +367,7 @@ module m68k_top #(
     wire [2:0] paula_irq_level;
     wire       vblank_pulse;
     wire       dskblk_pulse;
+    wire       ovl_clear_pulse;
 
     paula u_pau (
         .clk        (clk),
@@ -447,7 +449,8 @@ module m68k_top #(
                     .bus_resp_data (p_resp_data),
                     .snoop_valid (snoop_valid),
                     .snoop_addr  (snoop_addr),
-                    .snoop_src_id(snoop_src_id)
+                    .snoop_src_id(snoop_src_id),
+                    .inval_all_i (ovl_clear_pulse)
                 );
 
                 m68k_cache #(
@@ -477,7 +480,8 @@ module m68k_top #(
                     .bus_resp_data (p_resp_data),
                     .snoop_valid (snoop_valid),
                     .snoop_addr  (snoop_addr),
-                    .snoop_src_id(snoop_src_id)
+                    .snoop_src_id(snoop_src_id),
+                    .inval_all_i (ovl_clear_pulse)
                 );
             end else begin : g_passthrough
                 m68k_passthrough #(
@@ -506,7 +510,8 @@ module m68k_top #(
                     .bus_resp_data (p_resp_data),
                     .snoop_valid (snoop_valid),
                     .snoop_addr  (snoop_addr),
-                    .snoop_src_id(snoop_src_id)
+                    .snoop_src_id(snoop_src_id),
+                    .inval_all_i (ovl_clear_pulse)
                 );
 
                 m68k_passthrough #(
@@ -535,7 +540,8 @@ module m68k_top #(
                     .bus_resp_data (p_resp_data),
                     .snoop_valid (snoop_valid),
                     .snoop_addr  (snoop_addr),
-                    .snoop_src_id(snoop_src_id)
+                    .snoop_src_id(snoop_src_id),
+                    .inval_all_i (ovl_clear_pulse)
                 );
             end
 

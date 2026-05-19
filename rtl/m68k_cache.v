@@ -43,7 +43,12 @@ module m68k_cache #(
 
     input  wire                snoop_valid,
     input  wire [31:0]         snoop_addr,
-    input  wire [ID_BITS-1:0]  snoop_src_id
+    input  wire [ID_BITS-1:0]  snoop_src_id,
+
+    // Cache-wide invalidate.  Used at reset and on OVL clear so the
+    // pre-OVL ROM-overlay reads aren't returned as stale data once
+    // the low-memory address space switches to RAM.
+    input  wire                inval_all_i
 );
     localparam IDX_BITS = $clog2(NUM_LINES);
     localparam TAG_BITS = 32 - IDX_BITS - 2;
@@ -147,6 +152,10 @@ module m68k_cache #(
         end else begin
             if (snoop_invalidate)
                 valids[snoop_idx] <= 1'b0;
+            if (inval_all_i) begin
+                for (i = 0; i < NUM_LINES; i = i + 1)
+                    valids[i] <= 1'b0;
+            end
 
             case (state)
                 S_IDLE: begin

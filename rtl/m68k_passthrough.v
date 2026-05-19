@@ -34,7 +34,11 @@ module m68k_passthrough #(
 
     input  wire                snoop_valid,
     input  wire [31:0]         snoop_addr,
-    input  wire [ID_BITS-1:0]  snoop_src_id
+    input  wire [ID_BITS-1:0]  snoop_src_id,
+
+    // No-op for passthrough (no storage to invalidate). Present so the
+    // module interface matches m68k_cache.
+    input  wire                inval_all_i
 );
     localparam S_IDLE = 1'b0;
     localparam S_WAIT = 1'b1;
@@ -44,7 +48,7 @@ module m68k_passthrough #(
     assign bus_req = bus_req_r && !bus_resp_valid;
 
     /* verilator lint_off UNUSED */
-    wire _unused = &{1'b0, bus_grant, snoop_valid, snoop_addr, snoop_src_id, 1'b0};
+    wire _unused = &{1'b0, bus_grant, snoop_valid, snoop_addr, snoop_src_id, inval_all_i, 1'b0};
     /* verilator lint_on UNUSED */
 
     wire bus_resp_now = (state == S_WAIT) && bus_resp_valid;

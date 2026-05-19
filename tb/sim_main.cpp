@@ -145,6 +145,15 @@ static uint32_t mem_peek_word(Vm68k_top* top, uint32_t byte_addr) {
 static void drain_console(Vm68k_top* top, uint32_t& host_tail) {
     uint32_t head = mem_peek_word(top, CONSOLE_HEAD_ADDR);
     if (host_tail == head) return;
+    // OVL-shadowed reads at $0F000 can return arbitrary ROM bytes (e.g.
+    // $DEADBEEF) before the CPU has touched the console region. Cap the
+    // per-call drain to one ring's worth so an implausibly large head
+    // doesn't lock us in a 3.7B-byte fputc loop.
+    uint32_t advance = head - host_tail;
+    if (advance > (CONSOLE_RING_MASK + 1u)) {
+        host_tail = head;
+        return;
+    }
     if (std::getenv("CONSOLE_DBG"))
         std::fprintf(stderr, "[drain] head=%u tail=%u\n", head, host_tail);
     while (host_tail != head) {

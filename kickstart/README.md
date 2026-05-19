@@ -42,12 +42,21 @@ uncached ROM data while the I-cache is fetching the same loop body
 nearby.  Workaround: `KICKSTART_FAST_BOOT` skips the BNE that gates
 on this so we proceed past stage 1.
 
-### 2. Vector-table readback fails
+### 2. Vector-table readback fails — FIXED
 After OVL clears, the vector-init at `$F801B2` writes 46 vectors to
 `$0008..$00C0` via `move.l A1, (A0)+`, then reads them back at
-`$F801C8` via `cmpa.l -(A0), A1`.  The readback comparison fails,
-suggesting either the writes don't land in the expected memory cells
-or the reads pull from a stale cached value.  Needs investigation.
+`$F801C8` via `cmpa.l -(A0), A1`.  Root cause: when OVL=1 the cache
+filled lines at low-memory tags with the ROM data routed via the
+OVL shadow.  After CIA-A clears OVL those cached lines became
+stale (the same line index now belongs to RAM addresses with a
+different tag, but the post-write reads under a SHORT word index
+could match the previous tag).  Fix (`m68k_bus.v` +
+`m68k_cache.v` + `m68k_top.v`): the bus exports a one-cycle
+`ovl_clear_pulse_o` on the OVL 1→0 edge; both the I- and D-cache
+of every core take that as `inval_all_i` and clear all `valids[]`.
+Verified end-to-end by Kickstart boot: the readback BNE at
+`$F801CA` no longer trips and execution falls through to the early
+exec.library init at `$F801D2`.
 
 ## Debug knobs
 - `+define+KICKSTART_BOOT_PC_TRACE` — `$display` every retired PC + kind

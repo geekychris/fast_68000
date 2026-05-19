@@ -139,7 +139,11 @@ module m68k_bus #(
     // Wire into Paula's vblank_int_i so the system-tick interrupt (VERTB,
     // INTREQ bit 5, IPL 3) fires once per frame.
     output wire                           vblank_pulse_o,
-    output wire                           dskblk_pulse_o
+    output wire                           dskblk_pulse_o,
+    // One-cycle pulse on OVL 1 -> 0 transition.  Wired to every cache's
+    // inval_all input so cached pre-OVL ROM-overlay reads at $00000-$7FFFF
+    // are invalidated when low memory switches to RAM.
+    output wire                           ovl_clear_pulse_o
 );
     localparam [31:0] IRQ_REG_ADDR  = 32'hFFFF_FFFC;
     localparam [31:0] BLT_BASE      = 32'h00FE_0000;
@@ -240,6 +244,8 @@ module m68k_bus #(
 
     // OVL latch: set on reset, cleared the first time CIA-A drives /OVL low.
     reg ovl_active;
+    reg ovl_just_cleared;   // one-cycle pulse on OVL 1->0
+    assign ovl_clear_pulse_o = ovl_just_cleared;
 
     // ----- Canonical Blitter/Copper shadow registers ----------------
     // Hold the most recent 16-bit canonical write so the next write to
@@ -957,6 +963,7 @@ module m68k_bus #(
             granted_is_rom_q <= 1'b0;
             granted_rom_data_q <= 32'd0;
             ovl_active <= OVL_RESET;
+            ovl_just_cleared <= 1'b0;
             irq_level <= 3'd0;
             blk_src   <= 32'd0;
             blk_dst   <= 32'd0;
@@ -1255,9 +1262,12 @@ module m68k_bus #(
             // OVL clears the first time CIA-A drives the /OVL line low.
             if (ovl_clr_i && ovl_active) begin
                 ovl_active <= 1'b0;
-`ifdef KICKSTART_BOOT_PC_TRACE
+                ovl_just_cleared <= 1'b1;
+`ifdef KICKSTART_BOOT_TRACE
                 $display("[OVL] cleared");
 `endif
+            end else begin
+                ovl_just_cleared <= 1'b0;
             end
 
             // Round-robin advance.
