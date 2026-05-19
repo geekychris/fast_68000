@@ -786,6 +786,14 @@ module m68k_core #(
     reg [3:0] ex_state;
 
     reg [31:0] ex_tas_word;  // word read in TAS phase 0
+    // CCR snapshot captured at S_LOAD ack for mem-dest RMW kinds where
+    // S_RMW_W settle needs the *operation's* flags (not the registered
+    // CCR which may have moved on).  Used by K_ALUI mem-dest path.
+    reg        ex_alui_n_q;
+    reg        ex_alui_z_q;
+    reg        ex_alui_v_q;
+    reg        ex_alui_c_q;
+    reg        ex_alui_x_q;
     reg [31:0] ex_exc_saved_pc;
     reg [15:0] ex_exc_saved_sr;
     reg  [7:0] ex_exc_vector;
@@ -961,10 +969,16 @@ module m68k_core #(
     // (alu_op == 0 is BTST, which only reads).
     wire bit_mem_writes  = (ex_kind == K_BIT) && (ex_dst_mode != `EA_DREG) &&
                            (ex_alu_op != 5'd0);
+    // K_ALUI to memory: CMPI reads only (CCR-only side effect); other ALUI
+    // ops (ADDI/SUBI/ANDI/ORI/EORI) are full RMW.
+    wire alui_mem        = (ex_kind == K_ALUI) && (ex_dst_mode != `EA_DREG) &&
+                           (ex_dst_mode != 3'b110); // 110 = CCR/SR dst
+    wire alui_mem_writes = alui_mem && (ex_alu_op != `ALU_CMP);
     wire is_settled_after_load = (ex_state == S_LOAD)  && dc_ack &&
                                  ex_valid && !halted && (ex_kind != K_TAS) &&
                                  !(load_starts_rmw && (ex_src_mode != `EA_DREG)) &&
                                  !bit_mem_writes &&
+                                 !alui_mem_writes &&
                                  !(ex_kind == K_MOVE && dst_is_mem);
     wire is_settled_after_store= (ex_state == S_STORE) && dc_ack && ex_valid && !halted;
     wire is_settled_after_tasw = (ex_state == S_TASW)  && dc_ack && ex_valid && !halted;
@@ -1290,8 +1304,25 @@ module m68k_core #(
                                     endcase
                                 end
                             end
+                        end else if (alui_mem) begin
+                            // ALUI <#imm>, <ea(mem)>.  Schedule the read; the
+                            // S_LOAD ack handler runs the ALU on dc_rdata and
+                            // (for non-CMP) chains a write through S_RMW_W.
+                            // CMPI is read-only.
+                            want_mem  = 1'b1;
+                            want_we   = 1'b0;
+                            want_lock = alui_mem_writes;
+                            want_addr = dst_ea;
+                            want_be   = 4'b1111;
+                            if (dst_an_update) begin
+                                // (An)+ / -(An) addressing on dst: commit
+                                // the new An at S_LOAD settle (for CMPI) or
+                                // S_RMW_W settle (for modifying ops).  We
+                                // don't fire the wb_aux here -- it would be
+                                // shadowed because is_settled_in_run is
+                                // false when want_mem is set.
+                            end
                         end
-                        // ALUI to memory: would need RMW; not implemented.
                     end
                     K_MOVEA: begin
                         // MOVEA: source any EA, dest is An (full 32-bit).
@@ -1795,6 +1826,24 @@ module m68k_core #(
                             wb_aux_idx_c  = {1'b1, ex_dst_reg};
                             wb_aux_data_c = dst_an_next;
                         end
+                    end else if (ex_kind == K_ALUI) begin
+                        // Mem-dest ADDI/SUBI/ANDI/ORI/EORI.  The N/Z/V/C/X
+                        // values were captured at S_LOAD ack (ex_alui_*_q)
+                        // from the in-flight ALU output -- by S_RMW_W the
+                        // live alu_y is stale.
+                        cc_we_c   = 1'b1;
+                        cc_x_we_c = (ex_alu_op == `ALU_ADD) ||
+                                    (ex_alu_op == `ALU_SUB);
+                        cc_n_c = ex_alui_n_q;
+                        cc_z_c = ex_alui_z_q;
+                        cc_v_c = ex_alui_v_q;
+                        cc_c_c = ex_alui_c_q;
+                        cc_x_c = ex_alui_x_q;
+                        if (dst_an_update) begin
+                            wb_aux_we_c   = 1'b1;
+                            wb_aux_idx_c  = {1'b1, ex_dst_reg};
+                            wb_aux_data_c = dst_an_next;
+                        end
                     end else begin
                         cc_we_c   = 1'b1;
                         cc_v_c    = 1'b0;
@@ -1924,6 +1973,34 @@ module m68k_core #(
                             default: alu_b = dc_rdata;
                         endcase
                         alu_size_c = ex_size;
+                    end
+                    K_ALUI: begin
+                        // Mem-dest ALUI (ADDI/SUBI/ANDI/ORI/EORI/CMPI to
+                        // memory): drive ALU with extracted byte/word/long
+                        // from dc_rdata as alu_a, and the immediate as alu_b.
+                        // For CMPI we commit CCR here (S_LOAD settles).  For
+                        // modifying ops the sequential block captures alu_y
+                        // and transitions to S_RMW_W; CCR commits at S_RMW_W.
+                        alu_op_c   = ex_alu_op;
+                        alu_size_c = ex_size;
+                        alu_b      = ex_src_imm32;
+                        case (ex_size)
+                            `SZ_B: alu_a = {24'd0, byte_at(dc_rdata, dc_addr[1:0])};
+                            `SZ_W: alu_a = {16'd0, dc_addr[1] ? dc_rdata[15:0]
+                                                              : dc_rdata[31:16]};
+                            default: alu_a = dc_rdata;
+                        endcase
+                        if (alui_mem && (ex_alu_op == `ALU_CMP)) begin
+                            // CMPI mem: commit CCR + (if any) An update.
+                            cc_we_c = 1'b1;
+                            cc_n_c = alu_n; cc_z_c = alu_z;
+                            cc_v_c = alu_v; cc_c_c = alu_c;
+                            if (dst_an_update) begin
+                                wb_aux_we_c   = 1'b1;
+                                wb_aux_idx_c  = {1'b1, ex_dst_reg};
+                                wb_aux_data_c = dst_an_next;
+                            end
+                        end
                     end
                     K_MOVEA: begin
                         // MOVEA from memory: load source, sign-extend if .W, write to An.
@@ -2157,6 +2234,11 @@ module m68k_core #(
             usp_shadow <= 32'd0;
             ex_state <= S_RUN;
             ex_tas_word <= 32'd0;
+            ex_alui_n_q <= 1'b0;
+            ex_alui_z_q <= 1'b0;
+            ex_alui_v_q <= 1'b0;
+            ex_alui_c_q <= 1'b0;
+            ex_alui_x_q <= 1'b0;
             ex_exc_saved_pc <= 32'd0;
             ex_exc_saved_sr <= 16'd0;
             ex_exc_vector <= 8'd0;
@@ -2332,6 +2414,34 @@ module m68k_core #(
                                 end
                             endcase
                             // dc_addr already set from the read.
+                            ex_state <= S_RMW_W;
+                        end else if (alui_mem_writes) begin
+                            // Mem-dest ADDI/SUBI/ANDI/ORI/EORI.  alu_y has
+                            // the new value (computed in S_LOAD planning).
+                            // Capture both result and CCR snapshot; S_RMW_W
+                            // settle commits the writeback + CCR.
+                            ex_tas_word <= alu_y;
+                            ex_alui_n_q <= alu_n;
+                            ex_alui_z_q <= alu_z;
+                            ex_alui_v_q <= alu_v;
+                            ex_alui_c_q <= alu_c;
+                            ex_alui_x_q <= alu_x;
+                            dc_req_r <= 1'b1;
+                            dc_we    <= 1'b1;
+                            case (ex_size)
+                                `SZ_B: begin
+                                    dc_be    <= be_for_byte(dc_addr[1:0]);
+                                    dc_wdata <= byte_into_word(alu_y[7:0], dc_addr[1:0]);
+                                end
+                                `SZ_W: begin
+                                    dc_be    <= be_for_word(dc_addr[1]);
+                                    dc_wdata <= word_into_word(alu_y[15:0], dc_addr[1]);
+                                end
+                                default: begin
+                                    dc_be    <= 4'b1111;
+                                    dc_wdata <= alu_y;
+                                end
+                            endcase
                             ex_state <= S_RMW_W;
                         end else if (bit_mem_writes) begin
                             // Memory BCHG/BCLR/BSET: capture the original
