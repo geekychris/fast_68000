@@ -85,28 +85,38 @@ table correctly, `JSR -$27C(A6)` at `$F81CB0` now lands at
 function), RTSs back to `$F81CB4`, and Kickstart continues with
 real exec.library init.
 
-Known follow-up: unaligned `.L` *reads* (e.g. `MOVE.L (A7)+, Dn`
-when the IRQ frame has pushed PC+SR=6 bytes onto an aligned SSP,
-making A7 word-aligned-but-not-mod-4) still return the longword-
-aligned data instead of assembling from two `mem[]` entries.
+### 5. Unaligned .L stack reads (RTS pop) — FIXED
+Some Kickstart routines `LINK A5, #-$E` (subtracts 14, not a
+multiple of 4), leaving A7 word-aligned-but-not-mod-4.  Subsequent
+`BSR` push + `MOVEM` save/restore + `RTS` pop reads the saved PC
+from `(A7)` with `A7[1:0] = 10`; without unaligned-.L support the
+read returns the longword *before* the intended one and boot jumps
+to a bogus PC like `$03E400F8`.
 
-The cache's tag scheme uses `addr[31:10]` so unaligned and aligned
-accesses share a line, making the read-side fix non-trivial without
-either splitting the cache request itself or adding a "this is .L"
-side-band signal from CPU → cache → bus.  Several attempts to plumb
-the size info through have either broken chipset-test reads (when
-`be=$1111` was treated as ".L" but the CPU sends `$1111` for all
-reads regardless of size) or required substantial restructuring.
+Fix: add a `cpu_is_long` side-band signal plumbed CPU → cache →
+bus.  The CPU sets it to `(ex_size == SZ_L)` at the `dc_req` commit;
+the bus latches it as `granted_is_long_q` and uses
+`(granted_is_long_q && granted_addr_q[1:0] == 2'b10)` as the
+unaligned-.L assembly condition.  Required setting `size = SZ_L`
+on K_RTS / K_RTE / K_RTR in the decoder (they had defaulted to
+SZ_W since they don't carry a size in the encoding).
 
-Kickstart hits this wall around `retired = 503K` instructions:
-some routine with `LINK A5, #-$E` (subtracts 14 — not a multiple of
-4) leaves A7 word-aligned-but-not-mod-4; subsequent `BSR` push +
-`MOVEM` save/restore + `RTS` pop reads the saved PC from
-`(A7)` with `A7[1:0] = 10`, which returns the longword *before* the
-intended one — boot then jumps to a bogus PC like `$03E400F8`.
+Result: Kickstart now boots through 1.4B+ instructions of real
+exec.library init code -- previously it stalled at ~503K
+instructions when the first unaligned RTS pop landed.  All 82
+regression tests pass, including the new t96_irq_savereg case.
 
-`tests/t96_irq_savereg.s` exercises the same pattern and is the
-lone failing regression test.
+### 6. Resident-tag scan loop — open
+At ~1.4B retired instructions Kickstart is grinding through the
+`$F80EA0` scan loop (`CMP.W (A4)+, D2` searching for $4AFC
+match-word, then `CMPA.L (A4), A5` checking the rt_MatchTag back-
+pointer).  ~24K calls to this scan routine have completed but the
+loop hasn't terminated yet.  Either there's another visible-cadence
+timing loop we haven't identified, or the scan is genuinely large
+and we just need more cycles, or there's an infinite-loop bug.
+Needs investigation -- run with PC trace narrowed to the OUTER
+caller of `$F80E88` to see if A4 / D0 / D1 are advancing each
+invocation.
 
 ### 4. Address-error too strict — FIXED
 The CPU was trapping `.L` accesses on any address with `bits[1:0] !=
