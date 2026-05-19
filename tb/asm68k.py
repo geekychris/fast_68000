@@ -415,6 +415,25 @@ class Asm:
             dm = self.reg(operands[1], 'D')
             op = (0b1011 << 12) | (dn << 9) | (0b110 << 6) | (0b000 << 3) | dm
             self.emit(op)
+        elif mnem in ('addx.b', 'addx.w', 'addx.l',
+                      'subx.b', 'subx.w', 'subx.l'):
+            # ADDX/SUBX Dy, Dx: register form only (1101/1001_xxx_1ss_000_yyy).
+            family, _, sz = mnem.partition('.')
+            top4 = 0b1101 if family == 'addx' else 0b1001
+            ss   = {'b':0b00, 'w':0b01, 'l':0b10}[sz]
+            dy = self.reg(operands[0], 'D')
+            dx = self.reg(operands[1], 'D')
+            op = (top4 << 12) | (dx << 9) | (1 << 8) | (ss << 6) | (0 << 3) | dy
+            self.emit(op)
+        elif mnem in ('negx.b', 'negx.w', 'negx.l'):
+            # NEGX <ea>: 0100_0000_ss_mm_rrr.  Currently we accept any EA the
+            # generic parser produces, but only Dn is implemented in the core.
+            _, _, sz = mnem.partition('.')
+            ss = {'b':0b00, 'w':0b01, 'l':0b10}[sz]
+            ea = self.parse_ea(operands[0])
+            op = (0b0100_0000 << 8) | (ss << 6) | (ea[0] << 3) | ea[1]
+            self.emit(op)
+            self.emit_ea_ext_sized(ea, sz)
         elif mnem == 'addq.l' or mnem == 'subq.l':
             imm = self.parse_int(operands[0])
             ea = self.parse_ea(operands[1])

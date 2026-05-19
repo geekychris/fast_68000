@@ -117,6 +117,40 @@ module m68k_alu (
                 flag_x = (b_sized != 0);
                 flag_v = b_neg && ((y & msb_mask) != 0);
             end
+            // ADDX/SUBX/NEGX: like ADD/SUB/NEG but include X.  Z is
+            // returned as the raw "result==0" bit; the caller ANDs it
+            // with the previous Z (68k Z-preserve semantics).
+            `ALU_ADDX: begin
+                sum = {1'b0, a_sized} + {1'b0, b_sized} + {32'd0, x_in};
+                y = sum[31:0] & mask;
+                res_neg = (y & msb_mask) != 0;
+                flag_n = res_neg;
+                flag_z = (y == 32'd0);
+                flag_c = sum[msb_pos+1];
+                flag_x = sum[msb_pos+1];
+                flag_v = (a_neg == b_neg) && (res_neg != a_neg);
+            end
+            `ALU_SUBX: begin
+                sum = {1'b0, a_sized} - {1'b0, b_sized} - {32'd0, x_in};
+                sub_res = sum[31:0] & mask;
+                y = sub_res;
+                res_neg = (sub_res & msb_mask) != 0;
+                flag_n = res_neg;
+                flag_z = (sub_res == 32'd0);
+                flag_c = sum[msb_pos+1];
+                flag_x = sum[msb_pos+1];
+                flag_v = (a_neg != b_neg) && (res_neg != a_neg);
+            end
+            `ALU_NEGX: begin
+                sum = 33'd0 - {1'b0, b_sized} - {32'd0, x_in};
+                y = sum[31:0] & mask;
+                res_neg = (y & msb_mask) != 0;
+                flag_n = res_neg;
+                flag_z = (y == 32'd0);
+                flag_c = sum[msb_pos+1];
+                flag_x = sum[msb_pos+1];
+                flag_v = b_neg && res_neg;
+            end
             `ALU_NOT: begin
                 y = (~b_sized) & mask;
                 flag_n = (y & msb_mask) != 0;

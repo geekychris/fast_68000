@@ -72,6 +72,9 @@ module m68k_decoder (
     localparam K_MOVECCR = 6'd40;
     localparam K_MOVEUSP = 6'd41;
     localparam K_ILLEGAL = 6'd42;
+    localparam K_ADDX    = 6'd43;
+    localparam K_SUBX    = 6'd44;
+    localparam K_NEGX    = 6'd45;
 
     // Compute extension words for an EA (mode + reg + size).
     function [1:0] ea_ext;
@@ -295,6 +298,14 @@ module m68k_decoder (
             end
 
             // NEGX/CLR/NEG/NOT (xx_ss_mm_rrr)
+            16'b0100_0000_??_??_????: begin  // NEGX
+                kind   = K_NEGX;
+                size   = size76(opcode[7:6]);
+                src_mode = m3;
+                src_reg  = r0;
+                src_ext_words = ea_ext(m3, r0, size);
+                alu_op = `ALU_NEGX;
+            end
             16'b0100_0010_??_??_????: begin  // CLR
                 kind = K_CLR;
                 size = size76(opcode[7:6]);
@@ -580,6 +591,30 @@ module m68k_decoder (
                 src_reg  = r0;
                 src_ext_words = ea_ext(m3, r0, `SZ_L);
             end
+            // SUBX Dy,Dx / SUBX -(Ay),-(Ax) — direction=1 mm=000/001.
+            16'b1001_???_100_000_???,
+            16'b1001_???_101_000_???,
+            16'b1001_???_110_000_???: begin   // SUBX Dy,Dx
+                kind   = K_SUBX;
+                size   = size76(opcode[7:6]);
+                alu_op = `ALU_SUBX;
+                reg_idx = r9;
+                src_mode = `EA_DREG;
+                src_reg  = r0;
+                direction = 1'b0;
+            end
+            16'b1001_???_100_001_???,
+            16'b1001_???_101_001_???,
+            16'b1001_???_110_001_???: begin   // SUBX -(Ay),-(Ax)
+                kind   = K_SUBX;
+                size   = size76(opcode[7:6]);
+                alu_op = `ALU_SUBX;
+                reg_idx = r9;
+                reg_is_a = 1'b1;
+                src_mode = `EA_ADEC;
+                src_reg  = r0;
+                direction = 1'b1;
+            end
             16'b1001_???_???_???_???: begin
                 kind = K_ALU;
                 size = size76(opcode[7:6]);
@@ -708,6 +743,32 @@ module m68k_decoder (
                 src_mode = m3;
                 src_reg  = r0;
                 src_ext_words = ea_ext(m3, r0, `SZ_L);
+            end
+            // ADDX Dy, Dx  : 1101_xxx_1ss_000_yyy
+            // ADDX -(Ay), -(Ax): 1101_xxx_1ss_001_yyy
+            // (Direction=1 with mm=000/001 is ADDX, not ADD-to-mem.)
+            16'b1101_???_100_000_???,
+            16'b1101_???_101_000_???,
+            16'b1101_???_110_000_???: begin   // ADDX Dy,Dx
+                kind   = K_ADDX;
+                size   = size76(opcode[7:6]);
+                alu_op = `ALU_ADDX;
+                reg_idx = r9;
+                src_mode = `EA_DREG;
+                src_reg  = r0;
+                direction = 1'b0;
+            end
+            16'b1101_???_100_001_???,
+            16'b1101_???_101_001_???,
+            16'b1101_???_110_001_???: begin   // ADDX -(Ay),-(Ax)
+                kind   = K_ADDX;
+                size   = size76(opcode[7:6]);
+                alu_op = `ALU_ADDX;
+                reg_idx = r9;
+                reg_is_a = 1'b1;
+                src_mode = `EA_ADEC;
+                src_reg  = r0;
+                direction = 1'b1;
             end
             16'b1101_???_???_???_???: begin
                 kind = K_ALU;

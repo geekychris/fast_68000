@@ -37,6 +37,9 @@
 `define ALU_ROR   5'd21
 `define ALU_ROXL  5'd22
 `define ALU_ROXR  5'd23
+`define ALU_ADDX  5'd24
+`define ALU_SUBX  5'd25
+`define ALU_NEGX  5'd26
 
 // ----------------------------------------------------------------------------
 //  Effective-address modes

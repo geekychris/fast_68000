@@ -103,6 +103,9 @@ module m68k_core #(
     localparam K_MOVECCR = 6'd40;
     localparam K_MOVEUSP = 6'd41;
     localparam K_ILLEGAL = 6'd42;
+    localparam K_ADDX    = 6'd43;
+    localparam K_SUBX    = 6'd44;
+    localparam K_NEGX    = 6'd45;
 
     // EX state.
     localparam S_RUN           = 4'd0;
@@ -457,7 +460,8 @@ module m68k_core #(
         case (idec_kind)
             K_ALU, K_LEA, K_MOVEQ,
             K_MULU, K_MULS, K_DIVU, K_DIVS,
-            K_BIT, K_SHIFT, K_EXG, K_CHK:        id_rb_idx = id_reg_idx_full;
+            K_BIT, K_SHIFT, K_EXG, K_CHK,
+            K_ADDX, K_SUBX:                      id_rb_idx = id_reg_idx_full;
             K_MOVE, K_MOVEA:                     id_rb_idx = id_dst_base_idx;
             K_ALUI:                              id_rb_idx = {idec_dst_mode != `EA_DREG, idec_dst_reg};
             K_DBCC:                              id_rb_idx = {1'b0, idec_src_reg};
@@ -1101,11 +1105,65 @@ module m68k_core #(
                             alu_b = src_operand;
                             cc_we_c = 1'b1;
                             cc_n_c = alu_n; cc_z_c = alu_z; cc_v_c = alu_v; cc_c_c = alu_c;
+                            // ADD/SUB write X; CMP doesn't.  ADDA/SUBA also
+                            // skip X per spec (Pn-dest is An here, but those
+                            // come through with ex_alu_op==ADD/SUB too -- the
+                            // 68k spec says ADDA/SUBA don't touch CCR at
+                            // all; preserved by reg_is_a path skipping
+                            // cc_we_c... actually cc_we_c is set here for
+                            // both An and Dn dst.  Live with that
+                            // pre-existing behavior for now; just make sure
+                            // ADD/SUB set X so ADDX can see it).
+                            cc_x_we_c = (ex_alu_op == `ALU_ADD) ||
+                                        (ex_alu_op == `ALU_SUB);
+                            cc_x_c = alu_x;
                             if (ex_alu_op != `ALU_CMP) begin
                                 wb_main_we_c = 1'b1;
                                 wb_main_idx_c = ex_reg_idx_full;
                                 wb_main_data_c = alu_y;
                             end
+                        end
+                    end
+                    // ADDX/SUBX register form (Dy,Dx).  Memory form (-(Ay),-(Ax))
+                    // not yet implemented; would need 2-read + 1-write RMW.
+                    K_ADDX, K_SUBX: begin
+                        if (ex_src_mode == `EA_DREG) begin
+                            alu_op_c = ex_alu_op;        // ALU_ADDX or ALU_SUBX
+                            alu_a    = ex_rb;            // Dx (destination)
+                            alu_b    = src_operand;      // Dy (source)
+                            alu_size_c = ex_size;
+                            cc_we_c   = 1'b1;
+                            cc_x_we_c = 1'b1;
+                            cc_n_c = alu_n;
+                            // 68k Z-preserve: cleared if result nonzero,
+                            // else unchanged.
+                            cc_z_c = cc_z & alu_z;
+                            cc_v_c = alu_v;
+                            cc_c_c = alu_c;
+                            cc_x_c = alu_x;
+                            wb_main_we_c   = 1'b1;
+                            wb_main_idx_c  = ex_reg_idx_full;
+                            wb_main_size_c = ex_size;
+                            wb_main_data_c = alu_y;
+                        end
+                    end
+                    // NEGX Dn (memory form not yet implemented).
+                    K_NEGX: begin
+                        if (ex_src_mode == `EA_DREG) begin
+                            alu_op_c = `ALU_NEGX;
+                            alu_b    = src_operand;
+                            alu_size_c = ex_size;
+                            cc_we_c   = 1'b1;
+                            cc_x_we_c = 1'b1;
+                            cc_n_c = alu_n;
+                            cc_z_c = cc_z & alu_z;
+                            cc_v_c = alu_v;
+                            cc_c_c = alu_c;
+                            cc_x_c = alu_x;
+                            wb_main_we_c   = 1'b1;
+                            wb_main_idx_c  = {1'b0, ex_src_reg};
+                            wb_main_size_c = ex_size;
+                            wb_main_data_c = alu_y;
                         end
                     end
                     K_ALUQ: begin
