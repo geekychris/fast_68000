@@ -31,7 +31,7 @@ RTL_SRCS := $(RTL_DIR)/m68k_alu.v \
 
 # Tests in the default `make test` suite.  t61_ovl needs a special build
 # (OVL_RESET=1 + a tiny ROM); it has its own `test-ovl` target.
-TESTS  := $(filter-out $(TESTS_DIR)/t61_ovl.s $(TESTS_DIR)/t63_boot_rom.s $(TESTS_DIR)/t65_blockdev.s $(TESTS_DIR)/t66_boot_rom_ext.s $(TESTS_DIR)/t68_floppy_dsklen.s $(TESTS_DIR)/t69_fake_kickstart.s,$(wildcard $(TESTS_DIR)/*.s))
+TESTS  := $(filter-out $(TESTS_DIR)/t61_ovl.s $(TESTS_DIR)/t63_boot_rom.s $(TESTS_DIR)/t65_blockdev.s $(TESTS_DIR)/t66_boot_rom_ext.s $(TESTS_DIR)/t68_floppy_dsklen.s $(TESTS_DIR)/t69_fake_kickstart.s $(TESTS_DIR)/t99_addq_mem.s,$(wildcard $(TESTS_DIR)/*.s))
 BENCHES:= $(wildcard $(BENCH_DIR)/*.s)
 
 N_CORES   ?= 2
