@@ -51,14 +51,17 @@ fail_count:   stop #$AE72
 fail_extra:   stop #$AE73
 
 ; ---- Address-error handler ----
-; Increments the counter at $00010000 and returns.  Note that on the
-; real 68000 the Group-0 stack frame has 4 extra words above the SR;
-; our minimal impl uses the same short 6-byte frame as other
-; exceptions, so plain `rte` works.  When we land the full Group-0
-; frame, the handler will need to adjust A7 by 8 first.
+; Increments the counter at $00010000 and returns.  The real 68000
+; (and our impl) builds a Group-0 stack frame: 8 extra bytes below
+; SR (SSW + faulted addr + IR).  RTE itself pops only the canonical
+; SR + PC, so we must drop those 8 bytes off A7 before RTE.  Our impl
+; saves PC_next (after the faulting instruction) so we don't need to
+; bump the saved PC.
 addr_err_handler:
-        addq.l  #1, D7                    ; D7 = arbitrary sentinel
+        addq.l  #1, D7                    ; sentinel
         move.l  $00010000, D0
         addq.l  #1, D0
         move.l  D0, $00010000
+        ; Drop the 8 extra Group-0 bytes off A7 before RTE.
+        addq.l  #8, A7
         rte

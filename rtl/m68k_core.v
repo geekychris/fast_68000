@@ -121,6 +121,17 @@ module m68k_core #(
     localparam S_RTE_POP_PC    = 4'd8;  // pop 32-bit PC
     localparam S_RMW_W         = 4'd9;  // RMW write phase (NEG/NOT to memory)
     localparam S_MOVEM         = 4'd10; // MOVEM register-list iterator
+    // Group-0 (bus/address error) frame extends the canonical 6-byte frame
+    // with 4 more words pushed BELOW the SR/PC pair (in the direction of
+    // decreasing addresses):
+    //   SP+0  SSW       SP+2..5  fault addr  SP+6  IR
+    //   SP+8  SR        SP+10..13 PC
+    // S_EXC_PUSH_SR transitions to S_EXC_PUSH_IR (not S_EXC_FETCH) when
+    // exc_is_group0.
+    localparam S_EXC_PUSH_IR   = 4'd11;
+    localparam S_EXC_PUSH_ALO  = 4'd12;
+    localparam S_EXC_PUSH_AHI  = 4'd13;
+    localparam S_EXC_PUSH_SSW  = 4'd14;
 
     // Helpful pure functions on byte position within a 32-bit word.
     function [3:0] be_for_byte;
@@ -565,6 +576,7 @@ module m68k_core #(
     reg  [31:0] ex_sp;
     reg  [3:0]  ex_reg_idx_full;
     reg         ex_predicted_taken;
+    reg  [15:0] ex_opcode;       // current instruction word (for Group-0 IR push)
 
     wire [2:0] id_total_words = 3'd1 + {1'b0, idec_src_ext_words} + {1'b0, idec_dst_ext_words};
     wire [31:0] id_pc_next = id_pc + ({29'd0, id_total_words} << 1);
@@ -592,6 +604,7 @@ module m68k_core #(
             ex_direction <= 1'b0;
             ex_shift_count <= 4'd0;
             ex_shift_dyn <= 1'b0;
+            ex_opcode <= 16'd0;
         end else if (redirect_valid) begin
             ex_valid <= 1'b0;
         end else if (!stall) begin
@@ -616,6 +629,7 @@ module m68k_core #(
             ex_ra          <= id_ra_fwd;
             ex_rb          <= id_rb_fwd;
             ex_sp          <= id_sp_fwd;
+            ex_opcode      <= id_op;
             ex_reg_idx_full<= id_reg_idx_full;
             ex_predicted_taken <= id_predicted_taken;
         end
@@ -778,6 +792,11 @@ module m68k_core #(
     reg        ex_exc_was_user; // 1 if we were in user mode entering this exception
     reg [31:0] working_sp;      // SP being incremented/decremented during exc/rte
     reg  [2:0] ex_exc_new_sri;  // new sr_i to install after entry (==ipl for IRQ)
+    // Group-0 (bus/address error) extra frame info.
+    reg        ex_exc_is_group0;
+    reg [31:0] ex_exc_addr;
+    reg [15:0] ex_exc_ir;
+    reg [15:0] ex_exc_ssw;
 
     // MOVEM iterator state.
     reg [15:0] movem_mask;       // remaining bits to process (LSB-first)
@@ -870,6 +889,11 @@ module m68k_core #(
     reg        exc_is_irq_c;
     reg  [7:0] exc_vector_c;
     reg [31:0] exc_saved_pc_c;
+    // Group-0 (bus/address error) extras.  Captured when exc_launch_c fires
+    // with vector 2 (bus) or 3 (address).
+    reg        exc_group0_c;
+    reg [31:0] exc_addr_c;
+    reg [15:0] exc_ssw_c;
 
     // Combinational SR writeback (for MOVE-to-SR, ANDI/ORI/EORI to SR/CCR, etc.).
     // Setting sr_we_c installs sr_data_c into the SR bits on the settled cycle.
@@ -1019,6 +1043,9 @@ module m68k_core #(
         exc_is_irq_c = 1'b0;
         exc_vector_c = 8'd0;
         exc_saved_pc_c = ex_pc;
+        exc_group0_c = 1'b0;
+        exc_addr_c   = 32'd0;
+        exc_ssw_c    = 16'd0;
         sr_we_c = 1'b0;
         sr_data_c = 16'd0;
         usp_we_c = 1'b0;
@@ -2072,10 +2099,20 @@ module m68k_core #(
         if (ex_valid && !halted && want_mem) begin
             if ((ex_size == `SZ_W && want_addr[0]) ||
                 (ex_size == `SZ_L && (want_addr[1:0] != 2'b00))) begin
-                want_mem       = 1'b0;
                 exc_launch_c   = 1'b1;
                 exc_vector_c   = 8'd`VEC_ADDR_ERROR;
-                exc_saved_pc_c = ex_pc;
+                // Save the PC AFTER the faulting instruction so RTE returns
+                // to the following instruction.  Real 68000 saves the PC of
+                // the faulting instruction itself; handlers there can use
+                // SSW/IR to compute the resume point.  Returning to
+                // ex_pc_next keeps test handlers simple.
+                exc_saved_pc_c = ex_pc_next;
+                exc_group0_c   = 1'b1;
+                exc_addr_c     = want_addr;
+                // SSW: bit 0 = R/W (1=read).  We invert want_we since
+                // want_we==1 means the in-flight access was a write.
+                exc_ssw_c      = {15'd0, ~want_we};
+                want_mem       = 1'b0;
             end
         end
     end
@@ -2125,6 +2162,10 @@ module m68k_core #(
             ex_exc_vector <= 8'd0;
             ex_exc_was_user <= 1'b0;
             ex_exc_new_sri <= 3'd0;
+            ex_exc_is_group0 <= 1'b0;
+            ex_exc_addr <= 32'd0;
+            ex_exc_ir   <= 16'd0;
+            ex_exc_ssw  <= 16'd0;
             working_sp <= 32'd0;
             movem_mask <= 16'd0;
             movem_idx <= 5'd0;
@@ -2192,6 +2233,10 @@ module m68k_core #(
                         ex_exc_saved_sr <= sr_now;
                         ex_exc_vector   <= exc_vector_c;
                         ex_exc_was_user <= ~sr_s;
+                        ex_exc_is_group0 <= exc_group0_c;
+                        ex_exc_addr     <= exc_addr_c;
+                        ex_exc_ir       <= ex_opcode;
+                        ex_exc_ssw      <= exc_ssw_c;
                         // For IRQ: set new sr_i to ipl level so further IRQs
                         // at the same/lower priority are masked. For other
                         // exceptions: sr_i is preserved.
@@ -2424,20 +2469,77 @@ module m68k_core #(
                 end
                 S_EXC_PUSH_SR: begin
                     if (dc_ack) begin
-                        // SR pushed. Fetch vector at (vector * 4).
+                        // Enforce supervisor mode (matches old behavior).
+                        if (ex_exc_was_user) usp_shadow <= rf_rc_data;
+                        sr_s <= 1'b1;
+                        sr_t <= 1'b0;
+                        sr_i <= ex_exc_new_sri;
+                        if (ex_exc_is_group0) begin
+                            // Group-0 frame: push IR at (working_sp - 2).
+                            // working_sp is currently at SR offset (post-SR
+                            // push moved it down by 2, so this is SP-6).
+                            // After IR push working_sp will be SP-8.
+                            working_sp <= working_sp - 32'd2;
+                            dc_req_r <= 1'b1;
+                            dc_we    <= 1'b1;
+                            dc_addr  <= working_sp - 32'd2;
+                            dc_wdata <= {ex_exc_ir, 16'd0};
+                            dc_be    <= 4'b1100;
+                            ex_state <= S_EXC_PUSH_IR;
+                        end else begin
+                            // Short frame: go straight to vector fetch.
+                            dc_req_r <= 1'b1;
+                            dc_we    <= 1'b0;
+                            dc_addr  <= {22'd0, ex_exc_vector, 2'b00};
+                            dc_be    <= 4'b1111;
+                            ex_state <= S_EXC_FETCH;
+                        end
+                    end
+                end
+                S_EXC_PUSH_IR: begin
+                    if (dc_ack) begin
+                        // Push fault-addr low half at SP-10.
+                        working_sp <= working_sp - 32'd2;
+                        dc_req_r <= 1'b1;
+                        dc_we    <= 1'b1;
+                        dc_addr  <= working_sp - 32'd2;
+                        dc_wdata <= {16'd0, ex_exc_addr[15:0]};
+                        dc_be    <= 4'b0011;
+                        ex_state <= S_EXC_PUSH_ALO;
+                    end
+                end
+                S_EXC_PUSH_ALO: begin
+                    if (dc_ack) begin
+                        // Push fault-addr high half at SP-12.
+                        working_sp <= working_sp - 32'd2;
+                        dc_req_r <= 1'b1;
+                        dc_we    <= 1'b1;
+                        dc_addr  <= working_sp - 32'd2;
+                        dc_wdata <= {ex_exc_addr[31:16], 16'd0};
+                        dc_be    <= 4'b1100;
+                        ex_state <= S_EXC_PUSH_AHI;
+                    end
+                end
+                S_EXC_PUSH_AHI: begin
+                    if (dc_ack) begin
+                        // Push SSW at SP-14.
+                        working_sp <= working_sp - 32'd2;
+                        dc_req_r <= 1'b1;
+                        dc_we    <= 1'b1;
+                        dc_addr  <= working_sp - 32'd2;
+                        dc_wdata <= {16'd0, ex_exc_ssw};
+                        dc_be    <= 4'b0011;
+                        ex_state <= S_EXC_PUSH_SSW;
+                    end
+                end
+                S_EXC_PUSH_SSW: begin
+                    if (dc_ack) begin
+                        // All frame fields pushed.  Fetch vector.
                         dc_req_r <= 1'b1;
                         dc_we    <= 1'b0;
                         dc_addr  <= {22'd0, ex_exc_vector, 2'b00};
                         dc_be    <= 4'b1111;
                         ex_state <= S_EXC_FETCH;
-                        // Now enforce supervisor mode and clear trace. If we
-                        // came from user mode, save current A7 (the USP) into
-                        // usp_shadow. The new A7 (= working_sp) is written by
-                        // the planning block when the next ack arrives.
-                        if (ex_exc_was_user) usp_shadow <= rf_rc_data;
-                        sr_s <= 1'b1;
-                        sr_t <= 1'b0;
-                        sr_i <= ex_exc_new_sri;
                     end
                 end
                 S_EXC_FETCH: begin
