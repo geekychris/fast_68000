@@ -1,37 +1,59 @@
-# Kickstart boot attempt — current state
+# Kickstart boot on the sim
 
 ## What works
 - ROM decryption: `tools/rom_decrypt.py` strips the `AMIROMTYPE1` header
-  and XOR-decrypts an AmiKit-style ROM against `rom.key`.
-- Boot flow: `make test-boot-rom-bin ROMFILE=kickstart/kick.bin ROMSIZE_WORDS=131072`
-  runs the t63 trampoline, which reads SSP from `$0` and PC from `$4` (via
-  OVL=1 ROM overlay) and jumps to `$00F800D2` (the Kickstart entry).
-- STOP semantics: with `+define+KICKSTART_BOOT` STOP loads imm into SR and
-  waits for an IRQ (instead of halting the sim).  Test default is preserved.
+  and XORs the encrypted ROM against `rom.key`.
+- Boot flow:
+  ```
+  python3 tools/rom_decrypt.py kick.rom rom.key kickstart/kick.bin
+  make test-boot-rom-bin ROMFILE=kickstart/kick.bin ROMSIZE_WORDS=131072
+  ```
+- The boot-rom-bin target builds with `+define+KICKSTART_BOOT`, which:
+  - Sets RESET_PC to `$00F800D2` (Kickstart's first instruction; the
+    trampoline at `$0400` is shadowed by OVL=1 so the CPU just starts
+    at the ROM entry).
+  - Changes STOP semantics from "halt the sim" to "load imm into SR
+    and wait for an IRQ" (real 68k behavior).
 
-## Current wall
-Kickstart runs 12,399 instructions, then PC ends up at `$42A8040D` — an
-address outside both RAM ($00000-$1FFFFF) and ROM ($F80000-$FFFFFF).
-Memory at that address reads as zero from the bus, so the CPU decodes
-`$0000` as a STOP #0 forever.
+## Current progress
+8M+ instructions of real Kickstart code run successfully.  Trajectory:
 
-No redirect to an address with bit 30 set was traced during the run,
-which means PC reached `$42A8040D` either via:
-  - sequential IF advancement after an earlier redirect that *was* in
-    range but landed in unmapped territory (would have read as 0s, so
-    PC advances through "NOP NOP" garbage until hitting the STOP-shaped
-    word) — most likely
-  - a JMP/JSR/RTS target read from corrupted memory
+  - `$F800D2` — entry; sets SSP via LEA, initial register load.
+  - `$F800E2` — ROM-checksum loop: 32-bit add of all 131,072 ROM longs
+    into D5 with carry-in via ADDQ, then DBF inner+outer (~500K
+    instructions).  Runs to completion.
+  - `$F80100` onward — checksum compare, branches into setup code.
+  - `$F80434`/`$F80442` — power-on LED blink loop.  Sets/clears bit 1
+    of CIA-A PRA (`$00BFE001`) inside two DBF loops with D0 = $FFFF
+    then $3FFF inner counts, and an outer D1 = 10.  Each call to the
+    blink routine is ~1.8M instructions; Kickstart appears to call it
+    several times during stage-1 init.
 
-To debug from here:
-  - Build with `+define+KICKSTART_BOOT_TRACE` to print every STOP and
-    bit-30-set redirect.
-  - Add a tracer that fires whenever a JMP/JSR/RTS computes a target
-    outside ROM/RAM.  That likely finds the actual point of
-    corruption.
+At 100M cycles we get through ~16M instructions and Kickstart is
+still iterating through its early init (mostly the LED blinks).
+
+## Debug knobs
+- `+define+KICKSTART_BOOT_PC_TRACE` — `$display` every retired PC + kind.
+  Useful but produces millions of lines.
+- `+define+KICKSTART_BOOT_TRACE`    — `$display` STOP events.
+
+Override the cycle budget with `ROMCYCLES`:
+```
+make test-boot-rom-bin ROMFILE=kickstart/kick.bin ROMSIZE_WORDS=131072 \
+    ROMCYCLES=500000000
+```
+
+## Next steps
+- Speed: at our current ~6 cycles/instr, real Kickstart's full init
+  needs hundreds of millions of cycles in the sim.  Either run longer
+  or (eventually) patch the LED-blink loops to skip the inner spins.
+- Once init completes, expansion.library will probe autoconfig --
+  our 8MB FAST RAM card should bind.  Then exec.library init runs,
+  then trackdisk.device wants to boot from the disk image.
 
 ## Files touched
-- `tools/rom_decrypt.py` — new
-- `kickstart/kick.bin` — generated (gitignored)
-- `rtl/m68k_core.v` — KICKSTART_BOOT wait-for-IRQ STOP semantics
-- `Makefile` — VERI_DEFS hook so the build can `+define`
+- `tools/rom_decrypt.py` — AMIROMTYPE1 XOR decrypt
+- `kickstart/kick.bin`   — generated (gitignored)
+- `rtl/m68k_core.v`      — KICKSTART_BOOT wait-for-IRQ STOP semantics
+- `rtl/m68k_defs.vh`     — RESET_PC = $F800D2 under KICKSTART_BOOT
+- `Makefile`             — VERI_DEFS hook + ROMCYCLES override

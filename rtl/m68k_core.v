@@ -317,10 +317,17 @@ module m68k_core #(
             if_drain <= 1'b0;
         end else if (redirect_valid) begin
 `ifdef KICKSTART_BOOT_TRACE
-            // Trace any redirect to an address with bit 30 set -- these are
-            // definitely out of range on Amiga.  $42A80xxx, $50000xxx, etc.
-            if (redirect_pc[30] && redirect_pc != ex_pc)
-                $display("[BAD-PC] from=%h to=%h retired=%d kind=%d sp=%h", ex_pc, redirect_pc, retired, ex_kind, rf_rc_data);
+            // Trace any redirect to an address outside RAM ($00000-$1FFFFF)
+            // and ROM ($F80000-$FFFFFF).
+            if (redirect_pc != ex_pc) begin
+                if (!(redirect_pc[31:21] == 11'b0) &&            // not 0x000000-0x1FFFFF
+                    !(redirect_pc[31:20] == 12'hF80) &&          // not 0xF80000-0xF8FFFF
+                    !(redirect_pc[31:19] == 13'b1111_1000_0000_1) && // 0xF90000-0xF97FFF
+                    !(redirect_pc >= 32'h00F80000 &&
+                      redirect_pc <= 32'h00FFFFFF))
+                    $display("[BAD-PC] from=%h to=%h retired=%d kind=%d sp=%h",
+                        ex_pc, redirect_pc, retired, ex_kind, rf_rc_data);
+            end
 `endif
             // A speculative fetch may still be in flight to the cache. Mark
             // it for drain so the eventual ack is discarded before we start
@@ -2305,6 +2312,10 @@ module m68k_core #(
         end else begin
             // Count instructions that complete each cycle. STOP doesn't count.
             if (is_settled && ex_kind != K_STOP) retired <= retired + 32'd1;
+`ifdef KICKSTART_BOOT_PC_TRACE
+            if (is_settled && ex_kind != K_STOP)
+                $display("[PC] r=%d pc=%h kind=%d", retired, ex_pc, ex_kind);
+`endif
 
             if (is_settled && cc_we_c) begin
                 cc_n <= cc_n_c; cc_z <= cc_z_c; cc_v <= cc_v_c; cc_c <= cc_c_c;

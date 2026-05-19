@@ -436,8 +436,8 @@ test-boot-rom-bin:
 	    VERI_DEFS='+define+KICKSTART_BOOT' \
 	    >build_rom_bin/_build.log 2>&1
 	$(PYTHON) $(TB_DIR)/asm68k.py tests/t63_boot_rom.s build_rom_bin/program.hex
-	@echo "Running $(ROMFILE) for up to 10M cycles..."
-	@(cd build_rom_bin && ./Vm68k_top 10000000) | tail -40
+	@echo "Running $(ROMFILE) for up to $${ROMCYCLES:-100000000} cycles..."
+	@(cd build_rom_bin && ./Vm68k_top $${ROMCYCLES:-100000000}) | tail -40
 
 # ---------------------------------------------------------------------------
 # Block-device DMA test.  Builds with a tiny disk image (tests/disk_test.hex)

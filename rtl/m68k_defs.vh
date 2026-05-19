@@ -128,6 +128,14 @@
 // ----------------------------------------------------------------------------
 //  Reset and boot
 // ----------------------------------------------------------------------------
+`ifdef KICKSTART_BOOT
+// Kickstart's first executable instruction is at $F800D2 (sets SSP via
+// LEA, so we don't need a valid reset SSP).  Real 68k would fetch
+// SSP/PC from $0/$4 here, but our trampoline-at-$400 approach is
+// shadowed by OVL=1 making low memory show the ROM.
+`define RESET_PC   32'h00F8_00D2
+`else
 `define RESET_PC   32'h0000_0400
+`endif
 
 `endif
