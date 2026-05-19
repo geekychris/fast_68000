@@ -38,7 +38,7 @@ N_CORES   ?= 2
 MEM_WORDS ?= 65536
 BUILD     ?= build
 
-.PHONY: all build test test-ovl test-all test-boot-rom test-boot-rom-ext test-blockdev test-floppy test-boot-rom-bin test-fake-kickstart bench clean demo demo-fb demo-os demo-blt demo-cop demo-den demo-pau demo-poly demo-spr demo-morph demo-ham demo-coprainbow demo-showcase demo-hires fetch-musashi musashi crosscheck fetch-fx68k fx68k crosscheck-fx68k crosscheck-all demos-c demos-c-build cc68k-image fetch-minimig minimig crosscheck-minimig
+.PHONY: all build test test-ovl test-all test-boot-rom test-boot-rom-ext test-blockdev test-floppy test-boot-rom-bin test-fake-kickstart bench clean demo demo-fb demo-os demo-blt demo-cop demo-den demo-pau demo-poly demo-spr demo-morph demo-ham demo-coprainbow demo-showcase demo-hires demo-kickstart demo-fashion fetch-musashi musashi crosscheck fetch-fx68k fx68k crosscheck-fx68k crosscheck-all demos-c demos-c-build cc68k-image fetch-minimig minimig crosscheck-minimig
 
 all: test
 
@@ -585,6 +585,44 @@ demo-coprainbow:
 	@echo
 	@echo "Launching Copper-rainbow HAM demo (32 base colors x 16 R steps per row)."
 	@(cd build_demo && ./Vm68k_top 200000000 --graphics)
+
+# HAM6 "Fashion-style" demo: a stylised 256x192 HAM image with three
+# vertical bands of smooth gradient (sky / skin / dress / shadow).  No
+# Copper interaction — just Denise's HAM6 pipeline turning a single
+# 6-bitplane image into thousands of distinct colours.  Pair with
+# demo-coprainbow for the Copper-driven variant.
+demo-fashion:
+	@if [ "$(HAVE_SDL2)" != "1" ]; then \
+	    echo "SDL2 not detected; running headless. brew install sdl2 for graphics."; \
+	    $(MAKE) --no-print-directory build BUILD=build_demo N_CORES=1 USE_CACHE=1 MEM_WORDS=131072; \
+	    $(PYTHON) $(TB_DIR)/asm68k.py $(DEMO_DIR)/fashion_demo.s build_demo/program.hex; \
+	    (cd build_demo && ./Vm68k_top 200000000); \
+	else \
+	    $(MAKE) --no-print-directory build BUILD=build_demo N_CORES=1 USE_CACHE=1 MEM_WORDS=131072 WITH_SDL2=1; \
+	    $(PYTHON) $(TB_DIR)/asm68k.py $(DEMO_DIR)/fashion_demo.s build_demo/program.hex; \
+	    echo; \
+	    echo "Launching HAM6 fashion-style demo (3 banded gradient image, ~3000 colours)."; \
+	    (cd build_demo && ./Vm68k_top 200000000 --graphics); \
+	fi
+
+# Kickstart-shape demo: canonical Blitter+Copper addresses ($DFF040/$DFF080)
+# plus a VERTB IRQ that rotates the band palette each frame.  Renders 200
+# Denise frames; the visible effect is a slow vertical scroll of an 8-band
+# rainbow over a striped 1bpp bitplane.  Without SDL2 the same demo still
+# runs headless and verifies that VERTB fired (halt 0 = pass).
+demo-kickstart:
+	@if [ "$(HAVE_SDL2)" != "1" ]; then \
+	    echo "SDL2 not detected; running headless (set HAVE_SDL2 + brew install sdl2 for graphics)."; \
+	    $(MAKE) --no-print-directory build BUILD=build_demo N_CORES=1 USE_CACHE=1 MEM_WORDS=131072; \
+	    $(PYTHON) $(TB_DIR)/asm68k.py $(DEMO_DIR)/kickstart_demo.s build_demo/program.hex; \
+	    (cd build_demo && ./Vm68k_top 200000000); \
+	else \
+	    $(MAKE) --no-print-directory build BUILD=build_demo N_CORES=1 USE_CACHE=1 MEM_WORDS=131072 WITH_SDL2=1; \
+	    $(PYTHON) $(TB_DIR)/asm68k.py $(DEMO_DIR)/kickstart_demo.s build_demo/program.hex; \
+	    echo; \
+	    echo "Launching kickstart-shape demo: canonical Blitter+Copper + VERTB IRQ rotates palette."; \
+	    (cd build_demo && ./Vm68k_top 200000000 --graphics); \
+	fi
 
 demo-ham:
 	@if [ "$(HAVE_SDL2)" != "1" ]; then \
