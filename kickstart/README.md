@@ -31,16 +31,25 @@
 
 ## Known issues blocking further progress
 
-### 1. Checksum diverges from $FFFFFFFF around iter ~100K
-The compute is correct for the first ~95K iterations (verified by
-Python re-run with the same ROM bytes), then D5 jumps off by
-specific values like `$201FBE1B` and `$E153BE5C` and never recovers.
-The divergence happens during the `add.l (A0)+, D5` body with no
-intervening exceptions or context switches.  Suspected: a subtle
-I-cache vs. D-cache race or bus-arbitration ordering when reading
-uncached ROM data while the I-cache is fetching the same loop body
-nearby.  Workaround: `KICKSTART_FAST_BOOT` skips the BNE that gates
-on this so we proceed past stage 1.
+### 1. Checksum diverges from $FFFFFFFF around iter ~100K — FIXED
+Root cause: the legacy chipset / block-device / keyboard-inject /
+bitplane-probe testbench registers at `$00FE_xxxx` ($00FE_0000-$00FE_05FF,
+$00FE_8000-$00FE_800C, $00FE_9000, $00FE_9100+) overlap with the
+512 KB Kickstart ROM region ($00F8_0000-$00FF_FFFF).  When the
+checksum walked past `$F80000+$60000`, its `add.l (A0)+, D5` reads
+were routed to the testbench peripherals (which return 0) instead of
+the real ROM bytes.  Different sub-windows aliased at different
+offsets, so the divergence point varied between runs.
+
+Fix in `rtl/m68k_bus.v`: a `localparam LEGACY_CHIPSET =
+(ROM_WORDS <= 98304)` gates every testbench-only `is_*_legacy`,
+`is_blk_reg`, `is_kbd_inject_reg`, and `is_bpl_probe_reg` decode.
+For ROM_WORDS large enough to extend into `$FE_xxxx` the testbench
+registers stay disabled so ROM wins.  Canonical Amiga chipset at
+`$00DF_F000+` is unaffected.
+
+`KICKSTART_FAST_BOOT`'s skip of the post-checksum BNE at `$F801AA`
+is no longer needed and has been removed.
 
 ### 3. Library jump-table called before init — open
 Past the vector init and memory probe ($4000..$80000), Kickstart sets

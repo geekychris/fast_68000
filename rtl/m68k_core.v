@@ -1293,13 +1293,6 @@ module m68k_core #(
                         // $F80462 (bgt $F80458 with a 86K-iteration count).
                         // Force fall-through.
                         if (ex_pc == 32'h00F8_0462) take_branch_c = 1'b0;
-                        // Skip the post-checksum BNE at $F801AA, which
-                        // branches to the LED-blink-failure handler if our
-                        // computed checksum doesn't match.  Our checksum
-                        // currently diverges from the expected $FFFFFFFF;
-                        // forcing fall-through lets us proceed past stage 1
-                        // while we debug the underlying issue.
-                        if (ex_pc == 32'h00F8_01AA) take_branch_c = 1'b0;
 `endif
                     end
                     // ----------------------------------------------------

@@ -572,24 +572,36 @@ module m68k_bus #(
     wire is_disk_read = (addr[winner] >= DISK_BASE) && (addr[winner] <= DISK_END);
     wire [DISK_IDX_BITS-1:0] disk_idx =
         addr[winner][DISK_IDX_BITS+1:2] - DISK_BASE[DISK_IDX_BITS+1:2];
-    wire is_blk_reg = (addr[winner] == BLKSRC_AD) ||
+    wire is_blk_reg = LEGACY_CHIPSET && (
+                      (addr[winner] == BLKSRC_AD) ||
                       (addr[winner] == BLKDST_AD) ||
                       (addr[winner] == BLKCNT_AD) ||
-                      (addr[winner] == BLKCMD_AD);
-    wire is_blt_legacy = (addr[winner] >= BLT_BASE) && (addr[winner] <= BLT_END);
+                      (addr[winner] == BLKCMD_AD));
+    // The legacy chipset region ($00FE_0000-$00FE_05FF) was this codebase's
+    // pre-canonical-Amiga convention.  It collides with the Kickstart ROM
+    // (which lives at $00F8_0000-$00FF_FFFF) whenever the loaded ROM is
+    // larger than ~$60000 bytes — for a real 512 KB Kickstart, reads at
+    // $00FE_xxxx hit a blitter/copper/etc. slave that masks the ROM data,
+    // breaking the ROM checksum the moment it walks past $F80000+$60000.
+    // Disable the legacy window when the ROM extends into it; canonical
+    // Amiga chipset at $00DF_F000+ stays active regardless.
+    localparam LEGACY_CHIPSET = (ROM_WORDS <= 98304);
+
+    wire is_blt_legacy = LEGACY_CHIPSET && (addr[winner] >= BLT_BASE) && (addr[winner] <= BLT_END);
     wire is_blt_amiga  = (addr[winner] >= BLT_AMIGA_BASE) && (addr[winner] <= BLT_AMIGA_END);
     wire is_blt_reg    = is_blt_legacy | is_blt_amiga;
-    wire is_cop_legacy = (addr[winner] >= COP_BASE) && (addr[winner] <= COP_END);
+    wire is_cop_legacy = LEGACY_CHIPSET && (addr[winner] >= COP_BASE) && (addr[winner] <= COP_END);
     wire is_cop_amiga  = (addr[winner] >= COP_AMIGA_BASE) && (addr[winner] <= COP_AMIGA_END);
     wire is_cop_reg    = is_cop_legacy | is_cop_amiga;
-    wire is_den_legacy = ((addr[winner] >= DEN_BASE)  && (addr[winner] <= DEN_END)) ||
-                         ((addr[winner] >= DEN2_BASE) && (addr[winner] <= DEN2_END));
+    wire is_den_legacy = LEGACY_CHIPSET &&
+                         (((addr[winner] >= DEN_BASE)  && (addr[winner] <= DEN_END)) ||
+                          ((addr[winner] >= DEN2_BASE) && (addr[winner] <= DEN2_END)));
     wire is_den_amiga  = ((addr[winner] >= DEN_AMIGA_BASE)  && (addr[winner] <= DEN_AMIGA_END)) ||
                          ((addr[winner] >= DEN2_AMIGA_BASE) && (addr[winner] <= DEN2_AMIGA_END));
     wire is_den_reg = is_den_legacy | is_den_amiga;
     wire den_bank   = ((addr[winner] >= DEN2_BASE)       && (addr[winner] <= DEN2_END)) ||
                       ((addr[winner] >= DEN2_AMIGA_BASE) && (addr[winner] <= DEN2_AMIGA_END));
-    wire is_pau_legacy = (addr[winner] >= PAU_BASE) && (addr[winner] <= PAU_END);
+    wire is_pau_legacy = LEGACY_CHIPSET && (addr[winner] >= PAU_BASE) && (addr[winner] <= PAU_END);
     // Agnus stub steals four addresses out of the Paula window.  Strip them
     // here so they don't reach the Paula slave.
     wire is_agnus_reg  = (addr[winner] == DMACONR_ADDR) ||
@@ -609,18 +621,19 @@ module m68k_bus #(
                          && !is_agnus_reg && !is_paula_ro_reg && !is_shadow_reg;
     wire is_autoconfig_reg = (addr[winner] >= AUTOCONFIG_BASE) &&
                               (addr[winner] <= AUTOCONFIG_END);
-    wire is_kbd_inject_reg = (addr[winner] == KBD_INJECT_ADDR);
-    wire is_bpl_probe_reg = (addr[winner] == BPL_FETCH_COUNTER_ADDR) ||
+    wire is_kbd_inject_reg = LEGACY_CHIPSET && (addr[winner] == KBD_INJECT_ADDR);
+    wire is_bpl_probe_reg = LEGACY_CHIPSET && (
+                             (addr[winner] == BPL_FETCH_COUNTER_ADDR) ||
                              (addr[winner] == BPL1DAT_PROBE_ADDR)    ||
                              (addr[winner] == BPL2DAT_PROBE_ADDR)    ||
                              (addr[winner] == BPL3DAT_PROBE_ADDR)    ||
                              (addr[winner] == BPL4DAT_PROBE_ADDR)    ||
                              (addr[winner] == BPL5DAT_PROBE_ADDR)    ||
                              (addr[winner] == BPL6DAT_PROBE_ADDR)    ||
-                             (addr[winner] == BPLCON0_PROBE_ADDR);
+                             (addr[winner] == BPLCON0_PROBE_ADDR));
     wire is_pau_reg  = is_pau_legacy | is_pau_amiga;
-    wire is_ciaa_legacy = (addr[winner] >= CIAA_BASE) && (addr[winner] <= CIAA_END);
-    wire is_ciab_legacy = (addr[winner] >= CIAB_BASE) && (addr[winner] <= CIAB_END);
+    wire is_ciaa_legacy = LEGACY_CHIPSET && (addr[winner] >= CIAA_BASE) && (addr[winner] <= CIAA_END);
+    wire is_ciab_legacy = LEGACY_CHIPSET && (addr[winner] >= CIAB_BASE) && (addr[winner] <= CIAB_END);
     wire is_ciaa_amiga  = (addr[winner] >= CIAA_AMIGA_BASE) && (addr[winner] <= CIAA_AMIGA_END);
     wire is_ciab_amiga  = (addr[winner] >= CIAB_AMIGA_BASE) && (addr[winner] <= CIAB_AMIGA_END);
     wire is_ciaa_reg = is_ciaa_legacy | is_ciaa_amiga;
