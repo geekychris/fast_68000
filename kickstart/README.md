@@ -51,16 +51,51 @@ registers stay disabled so ROM wins.  Canonical Amiga chipset at
 `KICKSTART_FAST_BOOT`'s skip of the post-checksum BNE at `$F801AA`
 is no longer needed and has been removed.
 
-### 3. Library jump-table called before init — open
-Past the vector init and memory probe ($4000..$80000), Kickstart sets
-up a library base in `A6=$4628` and then calls `JSR -$27C(A6)` at
-`$F81CB0`.  Target `$000043AC` is in uninitialized low RAM, so the
-CPU executes ~130K `ORI #imm,Dn` pseudo-instructions worth of zeros,
-eventually trips a CHK at `$00080006`, vectors to the default handler
-($F80416), LED-blink, RESET, restart.  Either Kickstart's exec
-library hasn't laid down its jump vectors yet by this point, or A6
-is bogus.  Needs more digging into the boot sequence
-`$F80238-$F81CB0`.
+### 3. Library jump-table called before init — FIXED
+Two intertwined CPU/bus bugs were silently corrupting Kickstart's
+library jump-table construction at `$F81C7C` (`MOVE.L A3, -(A0)` /
+`MOVE.W #$4EF9, -(A0)` loop) and the subsequent `JSR -$27C(A6)` at
+`$F81CB0`:
+
+a) **JSR/JMP d16(An) ignored the displacement.**  Our K_JMP / K_JSR
+   computed `take_branch_target_c = ex_ra` (= raw `An`).  For source
+   modes other than absolute, that drops the `d16/d8` displacement
+   entirely.  Every `JSR -N(A6)` style library call therefore
+   jumped to `A6` itself instead of `A6-N`.  Fix
+   (`rtl/m68k_core.v`): use `src_ea` which is computed correctly for
+   all EA modes.
+
+b) **Unaligned `.L` writes clobbered the wrong `mem[]` entry.**  The
+   jump-table loop alternates `MOVE.L A3, -(A0)` (4-byte longword)
+   and `MOVE.W #$4EF9, -(A0)` (2-byte opcode), so the longword
+   writes land at `A0` values where `A0[1:0] == 10` -- a word-
+   aligned but not longword-aligned address.  Our bus indexed
+   `mem[]` by `addr[18:2]`, dropping bits 1:0; an unaligned `.L`
+   write therefore overwrote the entire `mem[mem_idx]` longword
+   with the four wdata bytes, blowing away the `$4EF9` opcode just
+   written 2 bytes above and leaving the next mem[] entry untouched.
+   Real 68000 silicon expands this internally to two consecutive
+   word transactions.  Fix (`rtl/m68k_bus.v`): detect `be=1111 &&
+   addr[1:0]=10`, split the write across `mem[mem_idx][15:0]` and
+   `mem[mem_idx+1][31:24:16]`.
+
+With both fixes the loop builds the 151-entry exec.library jump
+table correctly, `JSR -$27C(A6)` at `$F81CB0` now lands at
+`$00004130` (the right JMP slot), JMPs to `$00F80CF6` (an exec
+function), RTSs back to `$F81CB4`, and Kickstart continues with
+real exec.library init.
+
+Known follow-up: unaligned `.L` *reads* (e.g. `MOVE.L (A7)+, Dn`
+when the IRQ frame has pushed PC+SR=6 bytes onto an aligned SSP,
+making A7 word-aligned-but-not-mod-4) still return the longword-
+aligned data instead of assembling from two `mem[]` entries.  The
+cache's tag scheme uses `addr[31:10]` so unaligned and aligned
+accesses share a line, making the read-side fix non-trivial without
+splitting the cache request itself.  Kickstart handlers typically
+use MOVEM (which keeps A7 aligned) rather than `MOVE.L -(A7)`, so
+this is unlikely to be the next wall.  `tests/t96_irq_savereg.s`
+exercises the unaligned-read path and is the lone failing
+regression test.
 
 ### 4. Address-error too strict — FIXED
 The CPU was trapping `.L` accesses on any address with `bits[1:0] !=

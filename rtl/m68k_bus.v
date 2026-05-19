@@ -1227,10 +1227,25 @@ module m68k_bus #(
             end else if (winner_valid && we[winner] && is_disk_read) begin
                 // Disk image is read-only; silently drop the write.
             end else if (winner_valid && we[winner]) begin
-                if (be[winner][3]) mem[mem_idx][31:24] <= wdata[winner][31:24];
-                if (be[winner][2]) mem[mem_idx][23:16] <= wdata[winner][23:16];
-                if (be[winner][1]) mem[mem_idx][15:8]  <= wdata[winner][15:8];
-                if (be[winner][0]) mem[mem_idx][7:0]   <= wdata[winner][7:0];
+                // Unaligned .L write (addr[1:0]==10, all four bytes enabled)
+                // straddles two mem[] entries on real 68000 silicon -- two
+                // consecutive word writes, low half to bytes 2..3 of the
+                // longword starting at (addr & ~3), high half to bytes 0..1
+                // of the next longword.  Without this case the entire 32-bit
+                // wdata clobbered a single mem[] entry, silently corrupting
+                // Kickstart's library jump-table writes at MOVE.L A3, -(A0)
+                // for every other entry.
+                if (be[winner] == 4'b1111 && addr[winner][1:0] == 2'b10) begin
+                    mem[mem_idx][15:8]      <= wdata[winner][31:24];
+                    mem[mem_idx][7:0]       <= wdata[winner][23:16];
+                    mem[mem_idx + 1][31:24] <= wdata[winner][15:8];
+                    mem[mem_idx + 1][23:16] <= wdata[winner][7:0];
+                end else begin
+                    if (be[winner][3]) mem[mem_idx][31:24] <= wdata[winner][31:24];
+                    if (be[winner][2]) mem[mem_idx][23:16] <= wdata[winner][23:16];
+                    if (be[winner][1]) mem[mem_idx][15:8]  <= wdata[winner][15:8];
+                    if (be[winner][0]) mem[mem_idx][7:0]   <= wdata[winner][7:0];
+                end
             end
 
             // Latch for delayed response.

@@ -1088,7 +1088,13 @@ module m68k_core #(
                     K_NOP, K_STOP: ;
                     K_JMP: begin
                         take_branch_c = 1'b1;
-                        take_branch_target_c = (ex_src_mode == `EA_EXT) ? ex_src_imm32 : ex_ra;
+                        // src_ea is the address computed for every supported
+                        // JMP source mode: An direct, (An), d16(An), d8(An,Xn),
+                        // $xxxx.W, $xxxx.L, d16(PC), d8(PC,Xn).  Using ex_ra
+                        // alone silently dropped the d16/d8 displacement on
+                        // JMP d16(An) which Kickstart's library jump-table
+                        // path tripped over.
+                        take_branch_target_c = src_ea;
                     end
                     K_JSR: begin
                         // Issue store of return address; branch + SP commit at S_STORE.
@@ -2193,7 +2199,11 @@ module m68k_core #(
                         wb_aux_idx_c = 4'd15;
                         wb_aux_data_c = ex_sp - 32'd4;
                         take_branch_c = 1'b1;
-                        take_branch_target_c = (ex_src_mode == `EA_EXT) ? ex_src_imm32 : ex_ra;
+                        // src_ea is the address computed for every supported
+                        // JSR source mode (same as JMP).  Using ex_ra dropped
+                        // the displacement on JSR d16(An), which is the bulk
+                        // of AmigaOS library calls (JSR -N(A6)).
+                        take_branch_target_c = src_ea;
                     end
                     K_BCC: begin
                         // BSR completion.
