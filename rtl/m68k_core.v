@@ -1942,6 +1942,27 @@ module m68k_core #(
             end
             default: ;
         endcase
+
+        // Address-error detection.  Any data-side access (want_mem) issued
+        // with a size that doesn't match the address's alignment traps to
+        // VEC_ADDR_ERROR (vector 3).  68000 semantics:
+        //   - .W requires bit 0 == 0
+        //   - .L requires bits 1:0 == 0
+        //   - .B always OK
+        // We suppress the access (want_mem <= 0) and reroute to exc_launch.
+        // Note: this is a partial implementation — it only catches
+        // accesses issued via the central S_RUN want_mem path.  MOVEM,
+        // RTE/RTR, exception stack pushes and TAS go through their own
+        // dc_* dispatch and don't hit this check yet.
+        if (ex_valid && !halted && want_mem) begin
+            if ((ex_size == `SZ_W && want_addr[0]) ||
+                (ex_size == `SZ_L && (want_addr[1:0] != 2'b00))) begin
+                want_mem       = 1'b0;
+                exc_launch_c   = 1'b1;
+                exc_vector_c   = 8'd`VEC_ADDR_ERROR;
+                exc_saved_pc_c = ex_pc;
+            end
+        end
     end
 
     // (No early An commit during mem-to-mem K_MOVE chained S_LOAD->S_STORE.
