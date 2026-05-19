@@ -106,17 +106,50 @@ exec.library init code -- previously it stalled at ~503K
 instructions when the first unaligned RTS pop landed.  All 82
 regression tests pass, including the new t96_irq_savereg case.
 
-### 6. Resident-tag scan loop — open
-At ~1.4B retired instructions Kickstart is grinding through the
-`$F80EA0` scan loop (`CMP.W (A4)+, D2` searching for $4AFC
-match-word, then `CMPA.L (A4), A5` checking the rt_MatchTag back-
-pointer).  ~24K calls to this scan routine have completed but the
-loop hasn't terminated yet.  Either there's another visible-cadence
-timing loop we haven't identified, or the scan is genuinely large
-and we just need more cycles, or there's an infinite-loop bug.
-Needs investigation -- run with PC trace narrowed to the OUTER
-caller of `$F80E88` to see if A4 / D0 / D1 are advancing each
-invocation.
+### 6. Resident-tag scan loop ran forever — FIXED
+Two follow-on bugs were keeping the boot in the resident-tag scan
+even after unaligned-.L reads worked for RAM:
+
+a) **Unaligned .L read of the resident-list terminator at `$F8037E`
+   returned the wrong bytes.**  The terminator is the longword
+   `$FFFFFFFF` at `$F8037E` (i.e. addr[1:0] = 10, straddling
+   `rom[$DF]` and `rom[$E0]`).  The bus's unaligned-.L assembly
+   path was only wired into the `mem[]` (RAM) return -- the
+   `granted_is_rom_q ? granted_rom_data_q` short-circuit above it
+   captured only `rom[rom_idx]` (the aligned half), so the read
+   returned `$0000FFFF` instead of `$FFFFFFFF`.  The list-walker at
+   `$F80E70` checks `CMP.L #-1, D1 ; BEQ exit`, never saw -1, and
+   walked off the end of the in-ROM list into low-RAM zeros.
+   Fix in `rtl/m68k_bus.v`: when `is_long[winner] &&
+   addr[winner][1:0] == 2'b10`, capture
+   `{rom[rom_idx][15:0], rom[rom_idx+1][31:16]}` into
+   `granted_rom_data_q` instead.
+
+b) **Second LED-blink timing loop at `$F84038` / `$F84044`.**  The
+   post-init init-OS code re-blinks the floppy LED via a BSET/BCLR
+   pair driven by inner DBF instructions, identical pattern to the
+   power-on probe at `$F8043C` / `$F8044A` that we already short-
+   circuit under `KICKSTART_FAST_BOOT`.  Added the two new PCs to
+   the same skip.
+
+### Status: Kickstart boots
+With all of the above, Kickstart now runs to completion: ROM
+checksum → vector init → memory probe → exec.library setup → JT
+build → InitResident scan completes → screen blank + COLOR00 loop →
+JMP into the cold-reboot epilogue (`$F80E06-$F80E18`) → `RESET`
+opcode → `JMP (A0)` back to `$F800D0`.  The boot then cycles
+through this reset path repeatedly (~26 times in 100M cycles)
+because there is no bootable floppy / hard disk to find.  Total
+unique PCs visited: 544.
+
+### Next: provide a boot device
+To progress past the reset loop, the system needs to expose a
+working DSKBLK / trackdisk DMA path that returns a valid MFM
+boot block (`DOS\0` magic + checksum + bootblock code) so
+Kickstart's trackdisk.device picks it up and JSRs the bootblock.
+The bus already has the MFM DMA stub; the missing piece is a
+real Workbench-style MFM image generator (or fake DOS\0 short
+boot stub) loaded via `DISK_HEXFILE`.
 
 ### 4. Address-error too strict — FIXED
 The CPU was trapping `.L` accesses on any address with `bits[1:0] !=

@@ -1290,8 +1290,20 @@ module m68k_bus #(
             if (winner_valid && is_ciab_reg && !we[winner])
                 granted_ciab_rdata_q <= cia_b_slv_rdata;
             granted_is_rom_q <= winner_valid && !we[winner] && is_rom_access;
-            if (winner_valid && !we[winner] && is_rom_access)
-                granted_rom_data_q <= rom[rom_idx];
+            if (winner_valid && !we[winner] && is_rom_access) begin
+                // Unaligned .L read at addr[1:0]=10 spans two rom[] entries;
+                // assemble the same way the RAM path does (low half of
+                // rom[idx], high half of rom[idx+1]).  Without this an
+                // unaligned .L read of $FFFFFFFF terminator at e.g.
+                // $F8037E returned only the aligned half ($0000FFFF) and
+                // Kickstart's resident-list walker never saw -1, scanning
+                // until the cycle budget ran out.
+                if (is_long[winner] && addr[winner][1:0] == 2'b10)
+                    granted_rom_data_q <=
+                        {rom[rom_idx][15:0], rom[rom_idx + 1'b1][31:16]};
+                else
+                    granted_rom_data_q <= rom[rom_idx];
+            end
 
             // OVL clears the first time CIA-A drives the /OVL line low.
             if (ovl_clr_i && ovl_active) begin

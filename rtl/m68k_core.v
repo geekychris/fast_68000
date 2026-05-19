@@ -1508,9 +1508,13 @@ module m68k_core #(
                         // (inner2) loops at the CIA-A PRA poke routine.
                         // The outer DBF at $F8044E is left alone so D1
                         // still counts.
-                        if (ex_pc == 32'h00F8_043C || ex_pc == 32'h00F8_044A) begin
+                        if (ex_pc == 32'h00F8_043C || ex_pc == 32'h00F8_044A ||
+                            ex_pc == 32'h00F8_4038 || ex_pc == 32'h00F8_4044) begin
                             // Force Dn[15:0] = $FFFF (== -1, the DBF
                             // underflow condition) so it falls through.
+                            // Two LED-blink BSET/BCLR routines: one at
+                            // \$F8043C/\$F8044A (power-on probe), another
+                            // at \$F84038/\$F84044 (post-Resident-Init).
                             wb_main_we_c   = 1'b1;
                             wb_main_idx_c  = {1'b0, ex_src_reg};
                             wb_main_data_c = {ex_rb[31:16], 16'hFFFF};
