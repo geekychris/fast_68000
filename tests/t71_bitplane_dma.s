@@ -24,7 +24,11 @@ core0:
         move.w  #$0000, $00DFF0E0           ; BPL1PTH
         move.w  #$6000, $00DFF0E2           ; BPL1PTL
 
-        ; 3. Enable DMA: DMACON SET DMAEN(bit9)+BPLEN(bit8) = $8300.
+        ; 3. Set BPU=1 in BPLCON0 (bits [14:12]=1).  Agnus now gates
+        ;    bitplane DMA on BPU>0; with BPU=0 no fetches happen.
+        move.w  #$1000, $00DFF100           ; BPLCON0 = BPU<<12
+
+        ; 4. Enable DMA: DMACON SET DMAEN(bit9)+BPLEN(bit8) = $8300.
         move.w  #$8300, $00DFF096
 
         ; 4. Wait long enough for several scanlines and fetch ticks.

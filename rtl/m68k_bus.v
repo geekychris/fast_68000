@@ -128,7 +128,13 @@ module m68k_bus #(
     input  wire                           ovl_clr_i,
     // Keyboard byte injection (testbench-driven).
     output reg                            kbd_inject_wr,
-    output reg  [7:0]                     kbd_inject_byte
+    output reg  [7:0]                     kbd_inject_byte,
+
+    // Vertical-blank pulse from Agnus beam counter (one host clock high
+    // per frame, on the cycle (agnus_h, agnus_v) = (LAST_H, LAST_V)).
+    // Wire into Paula's vblank_int_i so the system-tick interrupt (VERTB,
+    // INTREQ bit 5, IPL 3) fires once per frame.
+    output wire                           vblank_pulse_o
 );
     localparam [31:0] IRQ_REG_ADDR  = 32'hFFFF_FFFC;
     localparam [31:0] BLT_BASE      = 32'h00FE_0000;
@@ -156,18 +162,23 @@ module m68k_bus #(
     localparam [31:0] CIAA_AMIGA_END  = 32'h00BF_EFFF;
     localparam [31:0] CIAB_AMIGA_BASE = 32'h00BF_D000;
     localparam [31:0] CIAB_AMIGA_END  = 32'h00BF_DFFF;
-    // Canonical Amiga chipset window aliasing.  Each region below maps
-    // 1:1 to our internal slave's register layout (Paula and Denise are
-    // already canonical-aligned within their windows).  Blitter
-    // ($DFF040-$DFF07F) and Copper ($DFF080-$DFF08F) need register-offset
-    // translation because our internal blitter starts at offset 0 with
-    // a custom BLTCON layout; they're left as a follow-on.
+    // Canonical Amiga chipset window aliasing.  Paula/Denise are 1:1.
+    // Blitter ($DFF040-$DFF07F) and Copper ($DFF080-$DFF08E) need
+    // register-offset and bit-layout translation; the canonical writes
+    // are bit-translated into our internal 32-bit register slave at the
+    // muxing layer below.  Reads on the canonical Blitter/Copper window
+    // fall through to the chipset shadow (chip_regs[]) so software can
+    // round-trip 16-bit Amiga values.
     localparam [31:0] PAU_AMIGA_BASE = 32'h00DF_F000;
     localparam [31:0] PAU_AMIGA_END  = 32'h00DF_F0FF;
     localparam [31:0] DEN_AMIGA_BASE = 32'h00DF_F100;
     localparam [31:0] DEN_AMIGA_END  = 32'h00DF_F1FF;
     localparam [31:0] DEN2_AMIGA_BASE= 32'h00DF_F300;
     localparam [31:0] DEN2_AMIGA_END = 32'h00DF_F3FF;
+    localparam [31:0] BLT_AMIGA_BASE = 32'h00DF_F040;
+    localparam [31:0] BLT_AMIGA_END  = 32'h00DF_F07F;
+    localparam [31:0] COP_AMIGA_BASE = 32'h00DF_F080;
+    localparam [31:0] COP_AMIGA_END  = 32'h00DF_F08F;
     // Kickstart-style ROM region: 32-bit aligned, ROM_WORDS deep, mapped
     // at $F80000+ (also at $FFFFFFxx via the 68000's reset-vector fetch,
     // since OVL remaps low memory to here at reset).
@@ -222,6 +233,19 @@ module m68k_bus #(
     // OVL latch: set on reset, cleared the first time CIA-A drives /OVL low.
     reg ovl_active;
 
+    // ----- Canonical Blitter/Copper shadow registers ----------------
+    // Hold the most recent 16-bit canonical write so the next write to
+    // the other half of a 32-bit value can compose the full word and
+    // re-emit it to the internal slave port (which is 32-bit-wide).
+    reg [15:0] canon_bltcon0;
+    reg [15:0] canon_bltcon1;
+    reg [31:0] canon_bltapt;
+    reg [31:0] canon_bltbpt;
+    reg [31:0] canon_bltcpt;
+    reg [31:0] canon_bltdpt;
+    reg [31:0] canon_cop1lc;
+    reg [31:0] canon_cop2lc;
+
     // ----- Agnus stub (minimal) ---------------------------------------
     // Real Agnus owns $DFF000-$DFF03F (DMA + beam) and shares $DFF080-$DFF09F
     // with the copper/interrupt block.  This stub implements just the four
@@ -238,6 +262,10 @@ module m68k_bus #(
     reg [9:0] agnus_h;
     reg [9:0] agnus_v;
     reg [15:0] dmacon;
+
+    // VERTB pulse: high for one cycle each frame, just before agnus_v
+    // wraps to 0.  Paula edge-detects on the rising edge to set INTREQ[5].
+    assign vblank_pulse_o = (agnus_h == AGNUS_H_LAST) && (agnus_v == AGNUS_V_LAST);
     // Beam tick.  Increment H every clock; on wrap, increment V; on V wrap,
     // back to 0.  In a real Amiga the H tick is one bus cycle (8 master
     // clocks); here we tick once per system clock so the counter advances
@@ -350,6 +378,7 @@ module m68k_bus #(
                       (addr[winner] == DSKLEN_ADDR);
     wire is_shadow_reg =
         ((addr[winner] >= 32'h00DF_F020 && addr[winner] <= 32'h00DF_F02E) ||
+         (addr[winner] >= 32'h00DF_F040 && addr[winner] <= 32'h00DF_F07F) ||
          (addr[winner] >= 32'h00DF_F080 && addr[winner] <= 32'h00DF_F094) ||
          (addr[winner] == 32'h00DF_F098)                                  ||
          (addr[winner] >= 32'h00DF_F0E0 && addr[winner] <= 32'h00DF_F0FF))
@@ -374,28 +403,51 @@ module m68k_bus #(
     localparam [31:0] KBD_INJECT_ADDR = 32'h00FE_9000;
 
     // ----- Agnus bitplane DMA engine --------------------------------
-    // Reads bitplane data words from memory into BPL1DAT.  Active when
-    // DMACON BPLEN (bit 8) AND DMAEN (bit 9) are both set.  Fetches one
-    // word every BPL_FETCH_DIV host clocks; restarts bpl1pt from the
-    // shadow BPL1PT register at the start of each scanline; applies
-    // BPL1MOD (chip_regs[$108]) at line end.
+    // Multi-plane bitplane DMA.  Active when DMACON BPLEN (bit 8) AND
+    // DMACON DMAEN (bit 9) are both set AND BPLCON0[14:12] (BPU) > 0.
     //
-    // Today only one plane (BPL1) is wired up — enough to exercise the
-    // bus master path and verify writes to BPL1PT propagate.  Multi-
-    // plane fetch (BPL2..BPL6) is a follow-on, gated on the same DMACON
-    // bits and round-robined across active planes per scanline.
+    // Each BPL_FETCH_DIV host clocks, one half-word is fetched from
+    // mem[bpl_pt[plane_idx]] into bpl_dat[plane_idx], plane_idx is
+    // advanced (mod BPU), and the corresponding running pointer is
+    // incremented by 2.  Pointer pre-load: when BPLEN transitions 0→1
+    // (or BPLCON0 BPU changes from 0 to non-zero), all six running
+    // pointers are reloaded from the chipset shadow BPLnPT slots.
     //
-    // BPL1DAT is exposed at $00FE_9104 (16-bit value in the high half
-    // of the long).  The fetch counter is at $00FE_9100 (32-bit; tests
-    // verify Agnus actually moved data).
+    // Limitations vs real Agnus:
+    //   - No DDFSTRT/DDFSTOP horizontal gating; fetches happen any time
+    //     the engine is enabled.
+    //   - No per-line modulo (BPLnMOD lives in the Denise window which
+    //     we don't snoop here); pointers run straight through memory.
+    //   - No slot-accurate interleaving vs blitter / copper / CPU.
+    //
+    // Probes (host bus side):
+    //   $00FE_9100   total fetch counter (32-bit)
+    //   $00FE_9104   BPL1DAT  (16-bit value in high half of long)
+    //   $00FE_9108   BPL2DAT
+    //   $00FE_910C   BPL3DAT
+    //   $00FE_9110   BPL4DAT
+    //   $00FE_9114   BPL5DAT
+    //   $00FE_9118   BPL6DAT
+    //   $00FE_911C   BPLCON0 shadow (debug)
     localparam [31:0] BPL_FETCH_COUNTER_ADDR = 32'h00FE_9100;
     localparam [31:0] BPL1DAT_PROBE_ADDR     = 32'h00FE_9104;
+    localparam [31:0] BPL2DAT_PROBE_ADDR     = 32'h00FE_9108;
+    localparam [31:0] BPL3DAT_PROBE_ADDR     = 32'h00FE_910C;
+    localparam [31:0] BPL4DAT_PROBE_ADDR     = 32'h00FE_9110;
+    localparam [31:0] BPL5DAT_PROBE_ADDR     = 32'h00FE_9114;
+    localparam [31:0] BPL6DAT_PROBE_ADDR     = 32'h00FE_9118;
+    localparam [31:0] BPLCON0_PROBE_ADDR     = 32'h00FE_911C;
     localparam [9:0]  BPL_FETCH_DIV = 10'd16;     // fetch every 16 host clk
-    reg [31:0] bpl1pt;             // live working pointer
-    reg [15:0] bpl1dat;
+    reg [31:0] bpl_pt   [0:5];        // live per-plane running pointers
+    reg [15:0] bpl_dat  [0:5];        // last fetched word per plane
     reg [31:0] bpl_fetches;
     reg [9:0]  bpl_fetch_tick;
+    reg [2:0]  bpl_plane_idx;         // which plane to fetch next (0..5)
+    reg [15:0] bplcon0_shadow;        // snooped from writes to $DFF100
+    reg        bpl_was_active;        // last cycle's (BPLEN & DMAEN & BPU>0)
     reg [9:0]  agnus_v_prev;
+    wire [2:0] bpu = bplcon0_shadow[14:12];
+    wire       bpl_active_now = dmacon[8] && dmacon[9] && (bpu != 3'd0);
 
     // Unflatten inputs.
     wire [31:0] addr  [0:N_PORTS-1];
@@ -498,8 +550,12 @@ module m68k_bus #(
                       (addr[winner] == BLKDST_AD) ||
                       (addr[winner] == BLKCNT_AD) ||
                       (addr[winner] == BLKCMD_AD);
-    wire is_blt_reg = (addr[winner] >= BLT_BASE) && (addr[winner] <= BLT_END);
-    wire is_cop_reg = (addr[winner] >= COP_BASE) && (addr[winner] <= COP_END);
+    wire is_blt_legacy = (addr[winner] >= BLT_BASE) && (addr[winner] <= BLT_END);
+    wire is_blt_amiga  = (addr[winner] >= BLT_AMIGA_BASE) && (addr[winner] <= BLT_AMIGA_END);
+    wire is_blt_reg    = is_blt_legacy | is_blt_amiga;
+    wire is_cop_legacy = (addr[winner] >= COP_BASE) && (addr[winner] <= COP_END);
+    wire is_cop_amiga  = (addr[winner] >= COP_AMIGA_BASE) && (addr[winner] <= COP_AMIGA_END);
+    wire is_cop_reg    = is_cop_legacy | is_cop_amiga;
     wire is_den_legacy = ((addr[winner] >= DEN_BASE)  && (addr[winner] <= DEN_END)) ||
                          ((addr[winner] >= DEN2_BASE) && (addr[winner] <= DEN2_END));
     wire is_den_amiga  = ((addr[winner] >= DEN_AMIGA_BASE)  && (addr[winner] <= DEN_AMIGA_END)) ||
@@ -529,7 +585,13 @@ module m68k_bus #(
                               (addr[winner] <= AUTOCONFIG_END);
     wire is_kbd_inject_reg = (addr[winner] == KBD_INJECT_ADDR);
     wire is_bpl_probe_reg = (addr[winner] == BPL_FETCH_COUNTER_ADDR) ||
-                             (addr[winner] == BPL1DAT_PROBE_ADDR);
+                             (addr[winner] == BPL1DAT_PROBE_ADDR)    ||
+                             (addr[winner] == BPL2DAT_PROBE_ADDR)    ||
+                             (addr[winner] == BPL3DAT_PROBE_ADDR)    ||
+                             (addr[winner] == BPL4DAT_PROBE_ADDR)    ||
+                             (addr[winner] == BPL5DAT_PROBE_ADDR)    ||
+                             (addr[winner] == BPL6DAT_PROBE_ADDR)    ||
+                             (addr[winner] == BPLCON0_PROBE_ADDR);
     wire is_pau_reg  = is_pau_legacy | is_pau_amiga;
     wire is_ciaa_legacy = (addr[winner] >= CIAA_BASE) && (addr[winner] <= CIAA_END);
     wire is_ciab_legacy = (addr[winner] >= CIAB_BASE) && (addr[winner] <= CIAB_END);
@@ -574,23 +636,245 @@ module m68k_bus #(
         endcase
     end
 
+    // ----- Canonical-write translation (Blitter / Copper) -------------
+    // 16-bit Amiga write data sits in the high or low half of the 32-bit
+    // bus word depending on byte address bit 1 (big-endian: addr+0 in
+    // bits[31:16], addr+2 in bits[15:0]).
+    wire        amiga_high_half  = (addr[winner][1] == 1'b0);
+    wire [15:0] amiga_wdata_half = amiga_high_half ? wdata[winner][31:16]
+                                                   : wdata[winner][15:0];
+    // Canonical register index within the 64-byte Blitter / 16-byte
+    // Copper window (1 reg = 2 bytes).
+    wire [4:0]  blt_amiga_reg    = addr[winner][5:1];
+    wire [2:0]  cop_amiga_reg    = addr[winner][3:1];
+
+    // Translate canonical Blitter write to internal slave (32-bit, 16
+    // long-aligned regs).  Internal layout (per blitter.v):
+    //   $00 BLTCON   $04 BLTAFWM  $08 BLTALWM
+    //   $0C BLTAPT   $10 BLTBPT   $14 BLTCPT   $18 BLTDPT
+    //   $1C BLTAMOD  $20 BLTBMOD  $24 BLTCMOD  $28 BLTDMOD
+    //   $2C BLTADAT  $30 BLTBDAT  $34 BLTCDAT
+    //   $38 BLTSIZE (trigger)     $3C BLTSTAT (RO)
+    reg [5:0]  blt_xlat_addr;
+    reg [31:0] blt_xlat_wdata;
+    reg        blt_xlat_valid;
+    always @* begin
+        blt_xlat_addr  = 6'h00;
+        blt_xlat_wdata = 32'd0;
+        blt_xlat_valid = 1'b0;
+        case (blt_amiga_reg)
+            5'd0: begin                       // BLTCON0 ($DFF040)
+                blt_xlat_valid = 1'b1;
+                blt_xlat_addr  = 6'h00;
+                blt_xlat_wdata = {
+                    amiga_wdata_half[7:0],       // LF       [31:24]
+                    amiga_wdata_half[15:12],     // ASH      [23:20]
+                    canon_bltcon1[15:12],        // BSH      [19:16]
+                    canon_bltcon1[1],            // DESC     [15]
+                    canon_bltcon1[3],            // IFE      [14]
+                    canon_bltcon1[4],            // EFE      [13]
+                    canon_bltcon1[2],            // FCI      [12]
+                    canon_bltcon1[0],            // LINE     [11]
+                    canon_bltcon1[3:1],          // oct      [10:8]
+                    4'd0,                        //          [7:4]
+                    amiga_wdata_half[11:8]       // USEA-D   [3:0]
+                };
+            end
+            5'd1: begin                       // BLTCON1 ($DFF042)
+                blt_xlat_valid = 1'b1;
+                blt_xlat_addr  = 6'h00;
+                blt_xlat_wdata = {
+                    canon_bltcon0[7:0],
+                    canon_bltcon0[15:12],
+                    amiga_wdata_half[15:12],
+                    amiga_wdata_half[1],
+                    amiga_wdata_half[3],
+                    amiga_wdata_half[4],
+                    amiga_wdata_half[2],
+                    amiga_wdata_half[0],
+                    amiga_wdata_half[3:1],
+                    4'd0,
+                    canon_bltcon0[11:8]
+                };
+            end
+            5'd2: begin                       // BLTAFWM
+                blt_xlat_valid = 1'b1;
+                blt_xlat_addr  = 6'h04;
+                blt_xlat_wdata = {16'd0, amiga_wdata_half};
+            end
+            5'd3: begin                       // BLTALWM
+                blt_xlat_valid = 1'b1;
+                blt_xlat_addr  = 6'h08;
+                blt_xlat_wdata = {16'd0, amiga_wdata_half};
+            end
+            5'd4: begin                       // BLTCPTH
+                blt_xlat_valid = 1'b1;
+                blt_xlat_addr  = 6'h14;
+                blt_xlat_wdata = {amiga_wdata_half, canon_bltcpt[15:0]};
+            end
+            5'd5: begin                       // BLTCPTL
+                blt_xlat_valid = 1'b1;
+                blt_xlat_addr  = 6'h14;
+                blt_xlat_wdata = {canon_bltcpt[31:16], amiga_wdata_half};
+            end
+            5'd6: begin                       // BLTBPTH
+                blt_xlat_valid = 1'b1;
+                blt_xlat_addr  = 6'h10;
+                blt_xlat_wdata = {amiga_wdata_half, canon_bltbpt[15:0]};
+            end
+            5'd7: begin                       // BLTBPTL
+                blt_xlat_valid = 1'b1;
+                blt_xlat_addr  = 6'h10;
+                blt_xlat_wdata = {canon_bltbpt[31:16], amiga_wdata_half};
+            end
+            5'd8: begin                       // BLTAPTH
+                blt_xlat_valid = 1'b1;
+                blt_xlat_addr  = 6'h0C;
+                blt_xlat_wdata = {amiga_wdata_half, canon_bltapt[15:0]};
+            end
+            5'd9: begin                       // BLTAPTL
+                blt_xlat_valid = 1'b1;
+                blt_xlat_addr  = 6'h0C;
+                blt_xlat_wdata = {canon_bltapt[31:16], amiga_wdata_half};
+            end
+            5'd10: begin                      // BLTDPTH
+                blt_xlat_valid = 1'b1;
+                blt_xlat_addr  = 6'h18;
+                blt_xlat_wdata = {amiga_wdata_half, canon_bltdpt[15:0]};
+            end
+            5'd11: begin                      // BLTDPTL
+                blt_xlat_valid = 1'b1;
+                blt_xlat_addr  = 6'h18;
+                blt_xlat_wdata = {canon_bltdpt[31:16], amiga_wdata_half};
+            end
+            5'd12: begin                      // BLTSIZE -- starts blit
+                blt_xlat_valid = 1'b1;
+                blt_xlat_addr  = 6'h38;
+                blt_xlat_wdata = {16'd0, amiga_wdata_half};
+            end
+            5'd16: begin                      // BLTCMOD ($DFF060)
+                blt_xlat_valid = 1'b1;
+                blt_xlat_addr  = 6'h24;
+                blt_xlat_wdata = {{16{amiga_wdata_half[15]}}, amiga_wdata_half};
+            end
+            5'd17: begin                      // BLTBMOD ($DFF062)
+                blt_xlat_valid = 1'b1;
+                blt_xlat_addr  = 6'h20;
+                blt_xlat_wdata = {{16{amiga_wdata_half[15]}}, amiga_wdata_half};
+            end
+            5'd18: begin                      // BLTAMOD ($DFF064)
+                blt_xlat_valid = 1'b1;
+                blt_xlat_addr  = 6'h1C;
+                blt_xlat_wdata = {{16{amiga_wdata_half[15]}}, amiga_wdata_half};
+            end
+            5'd19: begin                      // BLTDMOD ($DFF066)
+                blt_xlat_valid = 1'b1;
+                blt_xlat_addr  = 6'h28;
+                blt_xlat_wdata = {{16{amiga_wdata_half[15]}}, amiga_wdata_half};
+            end
+            5'd24: begin                      // BLTCDAT ($DFF070)
+                blt_xlat_valid = 1'b1;
+                blt_xlat_addr  = 6'h34;
+                blt_xlat_wdata = {16'd0, amiga_wdata_half};
+            end
+            5'd25: begin                      // BLTBDAT ($DFF072)
+                blt_xlat_valid = 1'b1;
+                blt_xlat_addr  = 6'h30;
+                blt_xlat_wdata = {16'd0, amiga_wdata_half};
+            end
+            5'd26: begin                      // BLTADAT ($DFF074)
+                blt_xlat_valid = 1'b1;
+                blt_xlat_addr  = 6'h2C;
+                blt_xlat_wdata = {16'd0, amiga_wdata_half};
+            end
+            // BLTCON0L/BLTSIZV/BLTSIZH (ECS) and reserved slots drop.
+            default: ;
+        endcase
+    end
+
+    // Translate canonical Copper write to internal slave (32-bit).
+    // Internal copper.v register layout:
+    //   $00 COP1LC   $04 COPJMP1 (strobe)  $08 COPSTAT (RO)
+    //   $0C COP2LC   $10 COPJMP2 (strobe)
+    reg [5:0]  cop_xlat_addr;
+    reg [31:0] cop_xlat_wdata;
+    reg        cop_xlat_valid;
+    always @* begin
+        cop_xlat_addr  = 6'h00;
+        cop_xlat_wdata = 32'd0;
+        cop_xlat_valid = 1'b0;
+        case (cop_amiga_reg)
+            3'd0: begin                       // COP1LCH ($DFF080)
+                cop_xlat_valid = 1'b1;
+                cop_xlat_addr  = 6'h00;
+                cop_xlat_wdata = {amiga_wdata_half, canon_cop1lc[15:0]};
+            end
+            3'd1: begin                       // COP1LCL ($DFF082)
+                cop_xlat_valid = 1'b1;
+                cop_xlat_addr  = 6'h00;
+                cop_xlat_wdata = {canon_cop1lc[31:16], amiga_wdata_half};
+            end
+            3'd2: begin                       // COP2LCH ($DFF084)
+                cop_xlat_valid = 1'b1;
+                cop_xlat_addr  = 6'h0C;
+                cop_xlat_wdata = {amiga_wdata_half, canon_cop2lc[15:0]};
+            end
+            3'd3: begin                       // COP2LCL ($DFF086)
+                cop_xlat_valid = 1'b1;
+                cop_xlat_addr  = 6'h0C;
+                cop_xlat_wdata = {canon_cop2lc[31:16], amiga_wdata_half};
+            end
+            3'd4: begin                       // COPJMP1 ($DFF088)
+                cop_xlat_valid = 1'b1;
+                cop_xlat_addr  = 6'h04;
+                cop_xlat_wdata = 32'd0;
+            end
+            3'd5: begin                       // COPJMP2 ($DFF08A)
+                cop_xlat_valid = 1'b1;
+                cop_xlat_addr  = 6'h10;
+                cop_xlat_wdata = 32'd0;
+            end
+            // COPINS ($DFF08C) / COPCON ($DFF08E): drop silently.
+            default: ;
+        endcase
+    end
+
     // Combinational slave ports.  When the winning access hits the blitter
     // or Copper register space, we route the request to the appropriate
-    // slv_* and prevent the memory write.  Reads return slv_rdata via the
-    // delayed-response path.
+    // slv_* and prevent the memory write.  Canonical writes are translated
+    // (bit-layout and address) before reaching the slave; legacy writes are
+    // passed through unmodified.  Reads return slv_rdata via the delayed-
+    // response path (legacy reads only -- canonical reads fall through to
+    // the chipset shadow chip_regs[]).
     always @* begin
-        blt_slv_req   = winner_valid && is_blt_reg;
-        blt_slv_we    = winner_valid && is_blt_reg && we[winner];
-        blt_slv_addr  = addr[winner][5:0];
-        blt_slv_be    = be[winner];
-        blt_slv_wdata = wdata[winner];
+        if (is_blt_amiga) begin
+            blt_slv_req   = winner_valid && we[winner] && blt_xlat_valid;
+            blt_slv_we    = winner_valid && we[winner] && blt_xlat_valid;
+            blt_slv_addr  = blt_xlat_addr;
+            blt_slv_be    = 4'b1111;
+            blt_slv_wdata = blt_xlat_wdata;
+        end else begin
+            blt_slv_req   = winner_valid && is_blt_legacy;
+            blt_slv_we    = winner_valid && is_blt_legacy && we[winner];
+            blt_slv_addr  = addr[winner][5:0];
+            blt_slv_be    = be[winner];
+            blt_slv_wdata = wdata[winner];
+        end
     end
     always @* begin
-        cop_slv_req   = winner_valid && is_cop_reg;
-        cop_slv_we    = winner_valid && is_cop_reg && we[winner];
-        cop_slv_addr  = addr[winner][5:0];
-        cop_slv_be    = be[winner];
-        cop_slv_wdata = wdata[winner];
+        if (is_cop_amiga) begin
+            cop_slv_req   = winner_valid && we[winner] && cop_xlat_valid;
+            cop_slv_we    = winner_valid && we[winner] && cop_xlat_valid;
+            cop_slv_addr  = cop_xlat_addr;
+            cop_slv_be    = 4'b1111;
+            cop_slv_wdata = cop_xlat_wdata;
+        end else begin
+            cop_slv_req   = winner_valid && is_cop_legacy;
+            cop_slv_we    = winner_valid && is_cop_legacy && we[winner];
+            cop_slv_addr  = addr[winner][5:0];
+            cop_slv_be    = be[winner];
+            cop_slv_wdata = wdata[winner];
+        end
     end
     always @* begin
         den_slv_req   = winner_valid && is_den_reg;
@@ -664,43 +948,111 @@ module m68k_bus #(
             dsk_len   <= 16'd0;
             kbd_inject_wr   <= 1'b0;
             kbd_inject_byte <= 8'd0;
-            bpl1pt          <= 32'd0;
-            bpl1dat         <= 16'd0;
+            for (mi = 0; mi < 6; mi = mi + 1) begin
+                bpl_pt[mi]  <= 32'd0;
+                bpl_dat[mi] <= 16'd0;
+            end
             bpl_fetches     <= 32'd0;
             bpl_fetch_tick  <= 10'd0;
+            bpl_plane_idx   <= 3'd0;
+            bplcon0_shadow  <= 16'd0;
+            bpl_was_active  <= 1'b0;
             agnus_v_prev    <= 10'd0;
+            canon_bltcon0   <= 16'd0;
+            canon_bltcon1   <= 16'd0;
+            canon_bltapt    <= 32'd0;
+            canon_bltbpt    <= 32'd0;
+            canon_bltcpt    <= 32'd0;
+            canon_bltdpt    <= 32'd0;
+            canon_cop1lc    <= 32'd0;
+            canon_cop2lc    <= 32'd0;
         end else begin
             // Default keyboard inject pulse to 0 each cycle; the write
             // path below asserts it for one cycle when triggered.
             kbd_inject_wr <= 1'b0;
 
-            // ----- Agnus bitplane DMA --------------------------------
-            // Reload bpl1pt at start of every scanline (agnus_v change)
-            // from the shadow chip_regs[$0E0/$0E2] = BPL1PTH/L.
-            agnus_v_prev <= agnus_v;
-            if (agnus_v != agnus_v_prev) begin
-                bpl1pt <= {chip_regs[9'h0E0], chip_regs[9'h0E2]};
+            // ----- Agnus bitplane DMA (multi-plane) ------------------
+            // On a 0->1 transition of "engine active" (BPLEN & DMAEN &
+            // BPU>0), reload all six running pointers from the BPLnPT
+            // chipset shadow.  Then, every BPL_FETCH_DIV host clocks,
+            // fetch one half-word for plane bpl_plane_idx, advance that
+            // plane's pointer, and rotate plane_idx through 0..BPU-1.
+            agnus_v_prev   <= agnus_v;
+            bpl_was_active <= bpl_active_now;
+            if (bpl_active_now && !bpl_was_active) begin
+                // Pre-load running pointers from chip_regs[$E0..$F6].
+                // BPLnPT high half lives at $E0+(n-1)*4, low half at +2.
+                bpl_pt[0] <= {chip_regs[9'h0E0], chip_regs[9'h0E2]};
+                bpl_pt[1] <= {chip_regs[9'h0E4], chip_regs[9'h0E6]};
+                bpl_pt[2] <= {chip_regs[9'h0E8], chip_regs[9'h0EA]};
+                bpl_pt[3] <= {chip_regs[9'h0EC], chip_regs[9'h0EE]};
+                bpl_pt[4] <= {chip_regs[9'h0F0], chip_regs[9'h0F2]};
+                bpl_pt[5] <= {chip_regs[9'h0F4], chip_regs[9'h0F6]};
                 bpl_fetch_tick <= 10'd0;
-            end else if (dmacon[8] && dmacon[9]) begin
-                // DMAEN + BPLEN: tick a fetch divider; on overflow grab
-                // one word from mem[bpl1pt] into BPL1DAT and advance.
+                bpl_plane_idx  <= 3'd0;
+            end else if (bpl_active_now) begin
                 if (bpl_fetch_tick == BPL_FETCH_DIV - 1) begin
                     bpl_fetch_tick <= 10'd0;
-                    // Read the half-word at bpl1pt out of mem[].  bpl1pt
-                    // is a byte address; the half-word lives in the
-                    // high or low 16 bits of mem[bpl1pt[31:2]] depending
-                    // on bpl1pt[1].
-                    if (bpl1pt[1] == 1'b0) begin
-                        bpl1dat <= mem[bpl1pt[AIDX_BITS+1:2]][31:16];
+                    // Fetch one half-word for the current plane.
+                    if (bpl_pt[bpl_plane_idx][1] == 1'b0) begin
+                        bpl_dat[bpl_plane_idx] <=
+                            mem[bpl_pt[bpl_plane_idx][AIDX_BITS+1:2]][31:16];
                     end else begin
-                        bpl1dat <= mem[bpl1pt[AIDX_BITS+1:2]][15:0];
+                        bpl_dat[bpl_plane_idx] <=
+                            mem[bpl_pt[bpl_plane_idx][AIDX_BITS+1:2]][15:0];
                     end
-                    bpl1pt <= bpl1pt + 32'd2;
+                    bpl_pt[bpl_plane_idx] <= bpl_pt[bpl_plane_idx] + 32'd2;
                     bpl_fetches <= bpl_fetches + 32'd1;
+                    // Rotate plane index mod BPU.
+                    if (bpl_plane_idx + 3'd1 >= bpu) bpl_plane_idx <= 3'd0;
+                    else                            bpl_plane_idx <= bpl_plane_idx + 3'd1;
                 end else begin
                     bpl_fetch_tick <= bpl_fetch_tick + 10'd1;
                 end
             end
+
+            // Snoop BPLCON0 writes (at canonical $DFF100) so the DMA
+            // engine sees the BPU bits.  Denise owns the same address
+            // for its own register file; this snoop is in parallel.
+            if (winner_valid && we[winner] && (addr[winner] == 32'h00DF_F100)) begin
+                // 16-bit BPLCON0 lives in the high half of the long
+                // at $DFF100 (addr[1]==0 -> high half).
+                if (be[winner][3] | be[winner][2])
+                    bplcon0_shadow <= wdata[winner][31:16];
+                else
+                    bplcon0_shadow <= wdata[winner][15:0];
+            end
+            // ----- Canonical Blitter/Copper shadow updates ------------
+            // The slave-port mux already composed the new 32-bit value
+            // for the internal blitter/copper this cycle (using the OLD
+            // canon_blt*/canon_cop* values).  Update the shadow now so
+            // the NEXT canonical write to the partner half of the same
+            // pointer/control sees the new piece.
+            if (winner_valid && we[winner] && is_blt_amiga) begin
+                case (blt_amiga_reg)
+                    5'd0:  canon_bltcon0       <= amiga_wdata_half;
+                    5'd1:  canon_bltcon1       <= amiga_wdata_half;
+                    5'd4:  canon_bltcpt[31:16] <= amiga_wdata_half;
+                    5'd5:  canon_bltcpt[15:0]  <= amiga_wdata_half;
+                    5'd6:  canon_bltbpt[31:16] <= amiga_wdata_half;
+                    5'd7:  canon_bltbpt[15:0]  <= amiga_wdata_half;
+                    5'd8:  canon_bltapt[31:16] <= amiga_wdata_half;
+                    5'd9:  canon_bltapt[15:0]  <= amiga_wdata_half;
+                    5'd10: canon_bltdpt[31:16] <= amiga_wdata_half;
+                    5'd11: canon_bltdpt[15:0]  <= amiga_wdata_half;
+                    default: ;
+                endcase
+            end
+            if (winner_valid && we[winner] && is_cop_amiga) begin
+                case (cop_amiga_reg)
+                    3'd0: canon_cop1lc[31:16] <= amiga_wdata_half;
+                    3'd1: canon_cop1lc[15:0]  <= amiga_wdata_half;
+                    3'd2: canon_cop2lc[31:16] <= amiga_wdata_half;
+                    3'd3: canon_cop2lc[15:0]  <= amiga_wdata_half;
+                    default: ;
+                endcase
+            end
+
             // Block-device DMA tick: while busy, copy one disk word to mem
             // per clock.  Two cycles of pre-arbiter access is fine — we
             // bypass the bus arbiter entirely (this is a "ghost" master that
@@ -918,7 +1270,7 @@ module m68k_bus #(
     reg [15:0] granted_shadow_hi_q;   // high half (long-aligned word)
     reg [15:0] granted_shadow_lo_q;   // low half (next word)
     reg granted_is_bpl_probe_q;
-    reg [1:0] granted_bpl_probe_sel_q;
+    reg [3:0] granted_bpl_probe_sel_q;   // 0..7 = fetch_cnt, BPL1..6 DAT, BPLCON0
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             granted_is_agnus_q  <= 1'b0;
@@ -934,7 +1286,7 @@ module m68k_bus #(
             granted_shadow_hi_q     <= 16'd0;
             granted_shadow_lo_q     <= 16'd0;
             granted_is_bpl_probe_q  <= 1'b0;
-            granted_bpl_probe_sel_q <= 2'd0;
+            granted_bpl_probe_sel_q <= 4'd0;
         end else begin
             granted_is_agnus_q  <= winner_valid && !we[winner] && is_agnus_reg
                                    && (addr[winner] != DMACON_ADDR);
@@ -958,7 +1310,14 @@ module m68k_bus #(
             granted_shadow_hi_q     <= chip_regs[{chip_idx[8:2], 2'b00}];
             granted_shadow_lo_q     <= chip_regs[{chip_idx[8:2], 2'b10}];
             granted_is_bpl_probe_q  <= winner_valid && !we[winner] && is_bpl_probe_reg;
-            granted_bpl_probe_sel_q <= (addr[winner] == BPL1DAT_PROBE_ADDR) ? 2'd1 : 2'd0;
+            granted_bpl_probe_sel_q <= (addr[winner] == BPL1DAT_PROBE_ADDR) ? 4'd1
+                                     : (addr[winner] == BPL2DAT_PROBE_ADDR) ? 4'd2
+                                     : (addr[winner] == BPL3DAT_PROBE_ADDR) ? 4'd3
+                                     : (addr[winner] == BPL4DAT_PROBE_ADDR) ? 4'd4
+                                     : (addr[winner] == BPL5DAT_PROBE_ADDR) ? 4'd5
+                                     : (addr[winner] == BPL6DAT_PROBE_ADDR) ? 4'd6
+                                     : (addr[winner] == BPLCON0_PROBE_ADDR) ? 4'd7
+                                     : 4'd0;
             granted_is_paula_ro_q  <= winner_valid && !we[winner] && is_paula_ro_reg;
             granted_paula_ro_val_q <=
                 (addr[winner] == SERDATR_ADDR) ? SERDATR_VAL
@@ -987,9 +1346,15 @@ module m68k_bus #(
         resp_valid = {N_PORTS{1'b0}};
         resp_data  = granted_is_irq_q       ? {29'd0, irq_level}
                    : granted_is_autoconfig_q ? 32'hFFFFFFFF
-                   : granted_is_bpl_probe_q  ? (granted_bpl_probe_sel_q == 2'd1
-                                                  ? {bpl1dat, 16'd0}
-                                                  : bpl_fetches)
+                   : granted_is_bpl_probe_q  ?
+                       ( (granted_bpl_probe_sel_q == 4'd1) ? {bpl_dat[0], 16'd0}
+                       : (granted_bpl_probe_sel_q == 4'd2) ? {bpl_dat[1], 16'd0}
+                       : (granted_bpl_probe_sel_q == 4'd3) ? {bpl_dat[2], 16'd0}
+                       : (granted_bpl_probe_sel_q == 4'd4) ? {bpl_dat[3], 16'd0}
+                       : (granted_bpl_probe_sel_q == 4'd5) ? {bpl_dat[4], 16'd0}
+                       : (granted_bpl_probe_sel_q == 4'd6) ? {bpl_dat[5], 16'd0}
+                       : (granted_bpl_probe_sel_q == 4'd7) ? {bplcon0_shadow, 16'd0}
+                       :                                     bpl_fetches )
                    : granted_is_shadow_q    ? {granted_shadow_hi_q, granted_shadow_lo_q}
                    : granted_is_agnus_q     ? agnus_resp_w
                    : granted_is_paula_ro_q  ? {16'd0, granted_paula_ro_val_q}
