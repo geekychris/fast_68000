@@ -5,7 +5,7 @@
 ;   - DDFSTRT ($DFF092) round-trips.
 ;   - DIWSTRT ($DFF08E) round-trips.
 ;   - COP1LCH ($DFF080) round-trips.
-;   - $E80000 autoconfig reads $FFFFFFFF ("no card present").
+;   - $E80000 autoconfig exposes our simulated FAST RAM card (type $E0).
 ;
 ; Pass = halt 0.  Failures: $BAD1..$BAD5.
         .org $400
@@ -37,9 +37,13 @@ core0:
         cmpi.l  #$00000038, D2
         bne     fail_ddf
 
-        ; Zorro autoconfig: $E80000 should read all-ones (= no card).
+        ; Zorro autoconfig: $E80000 returns the simulated FAST RAM type
+        ; byte ($E0) in the high lane.  Card stays visible until a
+        ; configure write at $E80048 -- see t83_autoconfig for the
+        ; full handshake.
         move.l  $00E80000, D3
-        cmpi.l  #$FFFFFFFF, D3
+        andi.l  #$FF000000, D3
+        cmpi.l  #$E0000000, D3
         bne     fail_acf
 
         stop    #0

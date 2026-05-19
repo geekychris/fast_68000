@@ -392,17 +392,29 @@ module m68k_bus #(
          (addr[winner] >= 32'h00DF_F0E0 && addr[winner] <= 32'h00DF_F0FF))
         && !is_dsk_reg;
 
-    // ----- Zorro II autoconfig stub --------------------------------
+    // ----- Zorro II autoconfig: simulated 8MB FAST RAM card --------
     // Real Amiga probes $E80000..$E8007F for autoconfig boards.  Each
-    // byte addresses a nibble (high nibble in [7:4]).  Empty (no card)
-    // is signalled by the type-byte's two high bits being 11 — i.e.
-    // any read returns $FF.  Kickstart reads the type byte at $E80000;
-    // seeing $FF means "no Zorro card here" and it moves on.
-    //
-    // We provide one byte of address decoding: every address in the
-    // window returns $FF, no writes have effect.
+    // 8-bit board register is exposed as two nibble reads (high at the
+    // base offset, low at +$100, both placed in the [7:4] of the byte).
+    // We greatly simplify: reads at the base offsets return the FULL
+    // byte (high nibble in [7:4]), and the +$100 mirror also works.
+    // Kickstart's expansion.library starts by reading the type byte at
+    // $E80000 -- $FF means "no card", anything else means a card to
+    // configure.  Our type byte is $E0:
+    //   bits 7..6 = 11  Zorro II
+    //   bit  5    =  1  MEMLIST (this card is RAM)
+    //   bits 4..3 =  0  no diag ROM, no chain
+    //   bits 2..0 =  0  size = 8 MB
+    // After Kickstart configures the card by writing the base address
+    // (high nibble at $E80048, low at $E8004A) the card "shuts up"
+    // (type byte reads back as $FF).  We don't actually back the
+    // assigned region with RAM; this is the autoconfig handshake only.
     localparam [31:0] AUTOCONFIG_BASE = 32'h00E8_0000;
     localparam [31:0] AUTOCONFIG_END  = 32'h00E8_FFFF;
+    localparam [7:0]  AUTOCONFIG_TYPE = 8'hE0;
+    reg        autoconfig_shutup;
+    reg [7:0]  autoconfig_base_hi;
+    reg [7:0]  autoconfig_base_lo;
 
     // ----- Keyboard byte injection register -------------------------
     // CPU writes a scan-code byte to $00FE_9000.  Pulses kbd_inject_wr
@@ -955,6 +967,9 @@ module m68k_bus #(
             blk_cur_dst <= 32'd0;
             dsk_pt    <= 32'd0;
             dsk_len   <= 16'd0;
+            autoconfig_shutup  <= 1'b0;
+            autoconfig_base_hi <= 8'd0;
+            autoconfig_base_lo <= 8'd0;
             kbd_inject_wr   <= 1'b0;
             kbd_inject_byte <= 8'd0;
             for (mi = 0; mi < 6; mi = mi + 1) begin
@@ -1137,8 +1152,25 @@ module m68k_bus #(
             end else if (winner_valid && we[winner] && is_paula_ro_reg) begin
                 // Paula read-only stubs swallow writes silently.
             end else if (winner_valid && we[winner] && is_autoconfig_reg) begin
-                // Autoconfig "shut up" writes (Kickstart writes a sentinel
-                // to step past a card) — we have no cards so just drop.
+                // Autoconfig configure or shutup write.  Kickstart writes
+                // the base-address nibbles at $48 / $4A, then the card
+                // "moves" to the new region and stops responding at $E80000.
+                // Writes to $4C are an explicit "shutup" (skip this card).
+                case (addr[winner][7:0])
+                    8'h48: begin
+                        // High nibble of base address.  Word write at $48
+                        // places the byte in the high lane (be[3]) since
+                        // $48 is long-aligned.
+                        if (be[winner][3]) autoconfig_base_hi <= wdata[winner][31:24];
+                        autoconfig_shutup <= 1'b1;     // configure ends shutup
+                    end
+                    8'h4A: begin
+                        if (be[winner][1]) autoconfig_base_lo <= wdata[winner][15:8];
+                        autoconfig_shutup <= 1'b1;
+                    end
+                    8'h4C: autoconfig_shutup <= 1'b1;
+                    default: ;
+                endcase
             end else if (winner_valid && we[winner] && is_shadow_reg) begin
                 // Shadow-store any chipset register Kickstart writes that
                 // we don't have a functional slave for.  16-bit writes
@@ -1352,10 +1384,27 @@ module m68k_bus #(
                                   // DMACONR
                                   : {16'd0, dmacon};
 
+    // Autoconfig read response.  Before shutup, byte $00 returns the
+    // type byte in the high lane; everything else returns 0.  After
+    // shutup (= after a $48/$4A/$4C write) every read returns $FFFFFFFF
+    // ("no card here") so Kickstart's scan moves on.
+    reg [31:0] autoconfig_resp_q;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) autoconfig_resp_q <= 32'hFFFFFFFF;
+        else if (winner_valid && !we[winner] && is_autoconfig_reg) begin
+            if (autoconfig_shutup)
+                autoconfig_resp_q <= 32'hFFFFFFFF;
+            else case (addr[winner][7:0])
+                8'h00: autoconfig_resp_q <= {AUTOCONFIG_TYPE, 24'd0};
+                default: autoconfig_resp_q <= 32'd0;
+            endcase
+        end
+    end
+
     always @* begin
         resp_valid = {N_PORTS{1'b0}};
         resp_data  = granted_is_irq_q       ? {29'd0, irq_level}
-                   : granted_is_autoconfig_q ? 32'hFFFFFFFF
+                   : granted_is_autoconfig_q ? autoconfig_resp_q
                    : granted_is_bpl_probe_q  ?
                        ( (granted_bpl_probe_sel_q == 4'd1) ? {bpl_dat[0], 16'd0}
                        : (granted_bpl_probe_sel_q == 4'd2) ? {bpl_dat[1], 16'd0}

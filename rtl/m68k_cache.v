@@ -93,7 +93,11 @@ module m68k_cache #(
                  (cpu_addr[31:16] == 16'h00FE) ||
                  (cpu_addr[31:12] == 20'h00DFF) ||
                  (cpu_addr[31:12] == 20'h00BFE) ||
-                 (cpu_addr[31:12] == 20'h00BFD);
+                 (cpu_addr[31:12] == 20'h00BFD) ||
+                 // Zorro autoconfig window: card-presence + base writes
+                 // change state, so caching would mask the post-shutup
+                 // $FFFFFFFF response.
+                 (cpu_addr[31:16] == 16'h00E8);
 
     // Combinational read-hit response (no state change).
     // Locked reads (TAS phase 0) always go to the bus so the arbiter sees
