@@ -316,6 +316,12 @@ module m68k_core #(
             ic_addr <= 32'd0;
             if_drain <= 1'b0;
         end else if (redirect_valid) begin
+`ifdef KICKSTART_BOOT_TRACE
+            // Trace any redirect to an address with bit 30 set -- these are
+            // definitely out of range on Amiga.  $42A80xxx, $50000xxx, etc.
+            if (redirect_pc[30] && redirect_pc != ex_pc)
+                $display("[BAD-PC] from=%h to=%h retired=%d kind=%d sp=%h", ex_pc, redirect_pc, retired, ex_kind, rf_rc_data);
+`endif
             // A speculative fetch may still be in flight to the cache. Mark
             // it for drain so the eventual ack is discarded before we start
             // the redirected fetch.
@@ -2332,10 +2338,37 @@ module m68k_core #(
             // USP write (MOVE An,USP — supervisor only, handled by planning).
             if (is_settled && usp_we_c) usp_shadow <= usp_data_c;
 
-            // STOP halts.
+            // STOP.  Real 68k: load imm into SR (privileged), then suspend
+            // until an interrupt arrives.  Our regression tests have always
+            // used STOP as "halt the simulator" with imm as the exit code.
+            // To support both:
+            //   - When the `KICKSTART_BOOT define is active we implement the
+            //     real semantics: update SR from imm and *don't* halt; the
+            //     IF stage stays parked at the STOP PC (via stop_now in the
+            //     redirect path) until an IRQ takes the CPU elsewhere.
+            //   - Otherwise (default) we halt with imm as the halt code.
             if (ex_valid && ex_kind == K_STOP && ex_state == S_RUN && !halted) begin
+`ifdef KICKSTART_BOOT
+                // Load imm[15:0] into SR.  Privileged check: in user mode
+                // we'd trap, but real Kickstart never executes STOP from
+                // user mode and our tests don't either.
+`ifdef KICKSTART_BOOT_TRACE
+                $display("[STOP] PC=%h imm=%h retired=%d sr_s=%b sr_i=%d sp=%h",
+                    ex_pc, ex_imm_raw[15:0], retired, sr_s, sr_i, rf_rc_data);
+`endif
+                if (sr_s) begin
+                    sr_t <= ex_imm_raw[`SR_T];
+                    sr_i <= ex_imm_raw[10:8];
+                    cc_x <= ex_imm_raw[`SR_X];
+                    cc_n <= ex_imm_raw[`SR_N];
+                    cc_z <= ex_imm_raw[`SR_Z];
+                    cc_v <= ex_imm_raw[`SR_V];
+                    cc_c <= ex_imm_raw[`SR_C];
+                end
+`else
                 halted <= 1'b1;
                 halt_code <= ex_imm_raw[15:0];
+`endif
             end
 
             case (ex_state)

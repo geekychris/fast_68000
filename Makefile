@@ -61,6 +61,7 @@ $(BUILD)/Vm68k_top: $(RTL_SRCS) $(TB_DIR)/sim_main.cpp
 	    $(if $(OVL_RESET),-GOVL_RESET=$(OVL_RESET),) \
 	    $(if $(DISK_WORDS),-GDISK_WORDS=$(DISK_WORDS),) \
 	    $(if $(DISK_HEXFILE),-GDISK_HEXFILE=\"$(DISK_HEXFILE)\",) \
+	    $(VERI_DEFS) \
 	    -I$(RTL_DIR) \
 	    --top-module m68k_top \
 	    -Mdir $(BUILD) \
@@ -432,6 +433,7 @@ test-boot-rom-bin:
 	$(PYTHON) tools/bin2rom.py --mem-words $(ROMSIZE_WORDS) $(ROMFILE) build_rom_bin/rom.hex
 	@$(MAKE) --no-print-directory build BUILD=build_rom_bin N_CORES=1 USE_CACHE=1 \
 	    MEM_WORDS=131072 ROM_WORDS=$(ROMSIZE_WORDS) ROM_HEXFILE=rom.hex OVL_RESET=1 \
+	    VERI_DEFS='+define+KICKSTART_BOOT' \
 	    >build_rom_bin/_build.log 2>&1
 	$(PYTHON) $(TB_DIR)/asm68k.py tests/t63_boot_rom.s build_rom_bin/program.hex
 	@echo "Running $(ROMFILE) for up to 10M cycles..."
