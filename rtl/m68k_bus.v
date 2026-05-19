@@ -1253,7 +1253,12 @@ module m68k_bus #(
                 granted_rom_data_q <= rom[rom_idx];
 
             // OVL clears the first time CIA-A drives the /OVL line low.
-            if (ovl_clr_i) ovl_active <= 1'b0;
+            if (ovl_clr_i && ovl_active) begin
+                ovl_active <= 1'b0;
+`ifdef KICKSTART_BOOT_PC_TRACE
+                $display("[OVL] cleared");
+`endif
+            end
 
             // Round-robin advance.
             if (winner_valid && !lock_pending) begin

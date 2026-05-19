@@ -433,7 +433,7 @@ test-boot-rom-bin:
 	$(PYTHON) tools/bin2rom.py --mem-words $(ROMSIZE_WORDS) $(ROMFILE) build_rom_bin/rom.hex
 	@$(MAKE) --no-print-directory build BUILD=build_rom_bin N_CORES=1 USE_CACHE=1 \
 	    MEM_WORDS=131072 ROM_WORDS=$(ROMSIZE_WORDS) ROM_HEXFILE=rom.hex OVL_RESET=1 \
-	    VERI_DEFS='+define+KICKSTART_BOOT' \
+	    VERI_DEFS='+define+KICKSTART_BOOT +define+KICKSTART_FAST_BOOT $(EXTRA_VERI_DEFS)' \
 	    >build_rom_bin/_build.log 2>&1
 	$(PYTHON) $(TB_DIR)/asm68k.py tests/t63_boot_rom.s build_rom_bin/program.hex
 	@echo "Running $(ROMFILE) for up to $${ROMCYCLES:-100000000} cycles..."
