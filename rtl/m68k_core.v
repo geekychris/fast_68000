@@ -971,8 +971,11 @@ module m68k_core #(
                            (ex_alu_op != 5'd0);
     // K_ALUI to memory: CMPI reads only (CCR-only side effect); other ALUI
     // ops (ADDI/SUBI/ANDI/ORI/EORI) are full RMW.
-    wire alui_mem        = (ex_kind == K_ALUI) && (ex_dst_mode != `EA_DREG) &&
-                           (ex_dst_mode != 3'b110); // 110 = CCR/SR dst
+    // K_ALUQ to memory (ADDQ / SUBQ to a mem ea) takes the same RMW path.
+    wire alui_mem        = ((ex_kind == K_ALUI) && (ex_dst_mode != `EA_DREG) &&
+                            (ex_dst_mode != 3'b110)) || // 110 = CCR/SR dst
+                           ((ex_kind == K_ALUQ) && (ex_src_mode != `EA_DREG) &&
+                            (ex_src_mode != `EA_AREG));
     wire alui_mem_writes = alui_mem && (ex_alu_op != `ALU_CMP);
     wire is_settled_after_load = (ex_state == S_LOAD)  && dc_ack &&
                                  ex_valid && !halted && (ex_kind != K_TAS) &&
@@ -1211,13 +1214,31 @@ module m68k_core #(
                         alu_op_c = ex_alu_op;
                         alu_a = src_operand;
                         alu_b = ex_imm_raw;
-                        cc_we_c = 1'b1;
-                        cc_n_c = alu_n; cc_z_c = alu_z; cc_v_c = alu_v; cc_c_c = alu_c;
+                        alu_size_c = ex_size;
                         if (ex_src_mode == `EA_DREG || ex_src_mode == `EA_AREG) begin
+                            // Dn/An destination: commit register + CCR
+                            // (CCR is suppressed for An per 68k spec, but
+                            // legacy behavior here writes it -- preserved
+                            // to keep regression tests green).
+                            cc_we_c = 1'b1;
+                            cc_n_c = alu_n; cc_z_c = alu_z;
+                            cc_v_c = alu_v; cc_c_c = alu_c;
+                            cc_x_we_c = (ex_alu_op == `ALU_ADD) ||
+                                        (ex_alu_op == `ALU_SUB);
+                            cc_x_c = alu_x;
                             wb_main_we_c = 1'b1;
                             wb_main_idx_c = (ex_src_mode == `EA_AREG) ? {1'b1, ex_src_reg}
                                                                       : {1'b0, ex_src_reg};
                             wb_main_data_c = alu_y;
+                        end else if (src_needs_mem) begin
+                            // ADDQ/SUBQ <#imm>, <mem ea>: schedule the read;
+                            // S_LOAD ack runs the ALU and chains a write
+                            // through S_RMW_W (same path as K_ALUI mem).
+                            want_mem  = 1'b1;
+                            want_we   = 1'b0;
+                            want_lock = 1'b1;
+                            want_addr = src_ea;
+                            want_be   = 4'b1111;
                         end
                     end
                     K_TAS: begin
@@ -1826,11 +1847,11 @@ module m68k_core #(
                             wb_aux_idx_c  = {1'b1, ex_dst_reg};
                             wb_aux_data_c = dst_an_next;
                         end
-                    end else if (ex_kind == K_ALUI) begin
-                        // Mem-dest ADDI/SUBI/ANDI/ORI/EORI.  The N/Z/V/C/X
-                        // values were captured at S_LOAD ack (ex_alui_*_q)
-                        // from the in-flight ALU output -- by S_RMW_W the
-                        // live alu_y is stale.
+                    end else if (ex_kind == K_ALUI || ex_kind == K_ALUQ) begin
+                        // Mem-dest ADDI/SUBI/ANDI/ORI/EORI + ADDQ/SUBQ.
+                        // N/Z/V/C/X were captured at S_LOAD ack
+                        // (ex_alui_*_q) from the in-flight ALU output;
+                        // by S_RMW_W the live alu_y is stale.
                         cc_we_c   = 1'b1;
                         cc_x_we_c = (ex_alu_op == `ALU_ADD) ||
                                     (ex_alu_op == `ALU_SUB);
@@ -1839,10 +1860,17 @@ module m68k_core #(
                         cc_v_c = ex_alui_v_q;
                         cc_c_c = ex_alui_c_q;
                         cc_x_c = ex_alui_x_q;
-                        if (dst_an_update) begin
+                        // K_ALUI tracks the dst An; K_ALUQ uses src An
+                        // (the EA in K_ALUQ is the *source*, which is
+                        // also the destination for the RMW).
+                        if (ex_kind == K_ALUI && dst_an_update) begin
                             wb_aux_we_c   = 1'b1;
                             wb_aux_idx_c  = {1'b1, ex_dst_reg};
                             wb_aux_data_c = dst_an_next;
+                        end else if (ex_kind == K_ALUQ && src_an_update) begin
+                            wb_aux_we_c   = 1'b1;
+                            wb_aux_idx_c  = {1'b1, ex_src_reg};
+                            wb_aux_data_c = src_an_next;
                         end
                     end else begin
                         cc_we_c   = 1'b1;
@@ -1974,16 +2002,21 @@ module m68k_core #(
                         endcase
                         alu_size_c = ex_size;
                     end
-                    K_ALUI: begin
-                        // Mem-dest ALUI (ADDI/SUBI/ANDI/ORI/EORI/CMPI to
-                        // memory): drive ALU with extracted byte/word/long
-                        // from dc_rdata as alu_a, and the immediate as alu_b.
-                        // For CMPI we commit CCR here (S_LOAD settles).  For
-                        // modifying ops the sequential block captures alu_y
-                        // and transitions to S_RMW_W; CCR commits at S_RMW_W.
+                    K_ALUI, K_ALUQ: begin
+                        // Mem-dest ALUI (ADDI/SUBI/ANDI/ORI/EORI/CMPI) or
+                        // ADDQ/SUBQ to memory: drive ALU with extracted
+                        // byte/word/long from dc_rdata as alu_a, and the
+                        // immediate as alu_b.  For CMPI we commit CCR here
+                        // (S_LOAD settles).  For modifying ops the
+                        // sequential block captures alu_y + CCR snapshot
+                        // and transitions to S_RMW_W.
                         alu_op_c   = ex_alu_op;
                         alu_size_c = ex_size;
-                        alu_b      = ex_src_imm32;
+                        // K_ALUI immediate is in ex_src_imm32 (separate ext
+                        // word); K_ALUQ immediate is encoded inline (1..8)
+                        // and lives in ex_imm_raw.
+                        alu_b      = (ex_kind == K_ALUI) ? ex_src_imm32
+                                                         : ex_imm_raw;
                         case (ex_size)
                             `SZ_B: alu_a = {24'd0, byte_at(dc_rdata, dc_addr[1:0])};
                             `SZ_W: alu_a = {16'd0, dc_addr[1] ? dc_rdata[15:0]

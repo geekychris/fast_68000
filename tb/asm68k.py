@@ -434,14 +434,16 @@ class Asm:
             op = (0b0100_0000 << 8) | (ss << 6) | (ea[0] << 3) | ea[1]
             self.emit(op)
             self.emit_ea_ext_sized(ea, sz)
-        elif mnem == 'addq.l' or mnem == 'subq.l':
+        elif mnem in ('addq.b', 'addq.w', 'addq.l', 'subq.b', 'subq.w', 'subq.l'):
+            family, _, sz = mnem.partition('.')
+            ss = {'b': 0b00, 'w': 0b01, 'l': 0b10}[sz]
             imm = self.parse_int(operands[0])
             ea = self.parse_ea(operands[1])
             iii = 0 if imm == 8 else (imm & 7)
-            d = 1 if mnem == 'subq.l' else 0
-            op = (0b0101 << 12) | (iii << 9) | (d << 8) | (0b10 << 6) | (ea[0] << 3) | ea[1]
+            d = 1 if family == 'subq' else 0
+            op = (0b0101 << 12) | (iii << 9) | (d << 8) | (ss << 6) | (ea[0] << 3) | ea[1]
             self.emit(op)
-            self.emit_ea_ext(ea)
+            self.emit_ea_ext_sized(ea, sz)
         elif mnem == 'tas':
             ea = self.parse_ea(operands[0])
             op = (0b0100_1010 << 8) | (0b11 << 6) | (ea[0] << 3) | ea[1]
