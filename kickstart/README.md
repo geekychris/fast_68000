@@ -42,6 +42,27 @@ uncached ROM data while the I-cache is fetching the same loop body
 nearby.  Workaround: `KICKSTART_FAST_BOOT` skips the BNE that gates
 on this so we proceed past stage 1.
 
+### 3. Library jump-table called before init — open
+Past the vector init and memory probe ($4000..$80000), Kickstart sets
+up a library base in `A6=$4628` and then calls `JSR -$27C(A6)` at
+`$F81CB0`.  Target `$000043AC` is in uninitialized low RAM, so the
+CPU executes ~130K `ORI #imm,Dn` pseudo-instructions worth of zeros,
+eventually trips a CHK at `$00080006`, vectors to the default handler
+($F80416), LED-blink, RESET, restart.  Either Kickstart's exec
+library hasn't laid down its jump vectors yet by this point, or A6
+is bogus.  Needs more digging into the boot sequence
+`$F80238-$F81CB0`.
+
+### 4. Address-error too strict — FIXED
+The CPU was trapping `.L` accesses on any address with `bits[1:0] !=
+00`.  Real 68000 only traps when bit 0 is 1 (odd byte); even-but-not-
+mod-4 addresses are legal `.L` accesses (the CPU does two consecutive
+word reads).  Kickstart's `ADD.L $26(A6), D1` at `$F801EE` (A6=0,
+EA=$26) was incorrectly trapping to vector 3 which routed to the
+default LED-blink handler.  Fixed in `rtl/m68k_core.v` by relaxing
+the `.L` check to only test bit 0.  `tests/t77_addr_error.s` updated
+to match real 68k semantics.
+
 ### 2. Vector-table readback fails — FIXED
 After OVL clears, the vector-init at `$F801B2` writes 46 vectors to
 `$0008..$00C0` via `move.l A1, (A0)+`, then reads them back at

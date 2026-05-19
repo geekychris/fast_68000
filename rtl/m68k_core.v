@@ -2246,7 +2246,9 @@ module m68k_core #(
         // with a size that doesn't match the address's alignment traps to
         // VEC_ADDR_ERROR (vector 3).  68000 semantics:
         //   - .W requires bit 0 == 0
-        //   - .L requires bits 1:0 == 0
+        //   - .L requires bit 0 == 0  (the 68000 does two consecutive word
+        //     reads under the hood, so addresses with bits[1:0]==10 are
+        //     legal — only odd bytes trap)
         //   - .B always OK
         // We suppress the access (want_mem <= 0) and reroute to exc_launch.
         // Note: this is a partial implementation — it only catches
@@ -2255,7 +2257,7 @@ module m68k_core #(
         // dc_* dispatch and don't hit this check yet.
         if (ex_valid && !halted && want_mem) begin
             if ((ex_size == `SZ_W && want_addr[0]) ||
-                (ex_size == `SZ_L && (want_addr[1:0] != 2'b00))) begin
+                (ex_size == `SZ_L && want_addr[0])) begin
                 exc_launch_c   = 1'b1;
                 exc_vector_c   = 8'd`VEC_ADDR_ERROR;
                 // Save the PC AFTER the faulting instruction so RTE returns

@@ -25,12 +25,12 @@ core0:
         move.l  #$00010001, A0            ; odd address
         move.w  (A0), D1                  ; <-- triggers VEC_ADDR_ERROR
 
-        ; ---- Misaligned long read ----
-        move.l  #$00010002, A0            ; addr[1:0] = 10 (not mod 4)
+        ; ---- Misaligned long read at ODD address ----
+        move.l  #$00010003, A0            ; addr bit 0 = 1
         move.l  (A0), D1                  ; <-- triggers VEC_ADDR_ERROR
 
         ; ---- Misaligned word write ----
-        move.l  #$00010003, A0            ; odd address
+        move.l  #$00010005, A0            ; odd address
         move.w  #$1234, (A0)              ; <-- triggers VEC_ADDR_ERROR
 
         ; Counter should be 3.
@@ -39,9 +39,12 @@ core0:
         bne     fail_count
 
         ; Confirm aligned accesses DON'T trap.
-        move.l  #$00010008, A0            ; long-aligned
-        move.l  $00010008, D1             ; (read; no trap)
-        move.w  #$5678, $00010010         ; word at even addr (no trap)
+        ;   - long-aligned (mod-4) and word-aligned-but-not-mod-4 (.L at $02)
+        ;     must both work; real 68000 only traps on odd addresses.
+        move.l  #$00010008, A0
+        move.l  $00010008, D1             ; .L at mod-4 — no trap
+        move.l  $00010002, D1             ; .L at even-but-not-mod-4 — no trap
+        move.w  #$5678, $00010010         ; .W at even — no trap
         move.l  $00010000, D2
         cmpi.l  #3, D2                    ; counter unchanged
         bne     fail_extra
