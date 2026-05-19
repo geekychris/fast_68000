@@ -132,9 +132,14 @@ module m68k_bus #(
 
     // Vertical-blank pulse from Agnus beam counter (one host clock high
     // per frame, on the cycle (agnus_h, agnus_v) = (LAST_H, LAST_V)).
+    // DSKBLK pulse: high for one cycle when the block-DMA engine finishes
+    // (blk_busy 1->0).  Wired into Paula's dskblk_int_i so the floppy
+    // completion interrupt (INTREQ bit 1, IPL 1) fires when DSKLEN-style
+    // DMA completes.
     // Wire into Paula's vblank_int_i so the system-tick interrupt (VERTB,
     // INTREQ bit 5, IPL 3) fires once per frame.
-    output wire                           vblank_pulse_o
+    output wire                           vblank_pulse_o,
+    output wire                           dskblk_pulse_o
 );
     localparam [31:0] IRQ_REG_ADDR  = 32'hFFFF_FFFC;
     localparam [31:0] BLT_BASE      = 32'h00FE_0000;
@@ -229,6 +234,9 @@ module m68k_bus #(
     reg        blk_busy;
     reg [31:0] blk_cur_off; // current disk word offset
     reg [31:0] blk_cur_dst; // current dest byte addr
+    reg        blk_busy_last;
+    // One-cycle pulse on the busy 1->0 transition (DMA completion).
+    assign dskblk_pulse_o = blk_busy_last && !blk_busy;
 
     // OVL latch: set on reset, cleared the first time CIA-A drives /OVL low.
     reg ovl_active;
@@ -942,6 +950,7 @@ module m68k_bus #(
             blk_dst   <= 32'd0;
             blk_cnt   <= 32'd0;
             blk_busy  <= 1'b0;
+            blk_busy_last <= 1'b0;
             blk_cur_off <= 32'd0;
             blk_cur_dst <= 32'd0;
             dsk_pt    <= 32'd0;
@@ -1066,6 +1075,7 @@ module m68k_bus #(
                     blk_cur_dst <= blk_cur_dst + 32'd4;
                 end
             end
+            blk_busy_last <= blk_busy;
             // Writes to the IRQ register update irq_level (sticky) and do NOT
             // commit to main memory. Writes to the blitter register region
             // are handled by the combinational slave port (no memory write).

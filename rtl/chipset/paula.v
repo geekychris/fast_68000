@@ -55,6 +55,7 @@ module paula (
     input  wire        blt_int_i,      // BLIT   (bit 6,  IPL 3)
     input  wire        cop_int_i,      // COPER  (bit 4,  IPL 3)
     input  wire        vblank_int_i,   // VERTB  (bit 5,  IPL 3)
+    input  wire        dskblk_int_i,   // DSKBLK (bit 1,  IPL 1) — floppy DMA done
 
     // 3-bit IPL output for the CPU's IRQ controller.  Computed from the
     // priority of INTREQ & INTENA bits when INTEN (intena[14]) is set.
@@ -79,11 +80,13 @@ module paula (
 
     // Edge-detect external pins; the rising-edge OR into INTREQ.
     reg cia_a_int_last, cia_b_int_last, blt_int_last, cop_int_last, vblank_int_last;
+    reg dskblk_int_last;
     wire cia_a_edge  = cia_a_int_i  & ~cia_a_int_last;
     wire cia_b_edge  = cia_b_int_i  & ~cia_b_int_last;
     wire blt_edge    = blt_int_i    & ~blt_int_last;
     wire cop_edge    = cop_int_i    & ~cop_int_last;
     wire vblank_edge = vblank_int_i & ~vblank_int_last;
+    wire dskblk_edge = dskblk_int_i & ~dskblk_int_last;
 
     wire [13:0] intreq_hw_set = {
         cia_b_edge,           // 13 EXTER
@@ -98,7 +101,7 @@ module paula (
         cop_edge,             // 4 COPER
         cia_a_edge,           // 3 PORTS
         1'b0,                 // 2 SOFT
-        1'b0,                 // 1 DSKBLK
+        dskblk_edge,          // 1 DSKBLK
         1'b0                  // 0 TBE
     };
 
@@ -236,6 +239,7 @@ module paula (
             blt_int_last    <= 1'b0;
             cop_int_last    <= 1'b0;
             vblank_int_last <= 1'b0;
+            dskblk_int_last <= 1'b0;
         end else begin
             // Latch external interrupt-source pins one cycle for edge detect.
             cia_a_int_last  <= cia_a_int_i;
@@ -243,6 +247,7 @@ module paula (
             blt_int_last    <= blt_int_i;
             cop_int_last    <= cop_int_i;
             vblank_int_last <= vblank_int_i;
+            dskblk_int_last <= dskblk_int_i;
 
             // Hardware sources rising-edge OR into INTREQ every cycle.  A
             // simultaneous software write below can further set/clear bits;

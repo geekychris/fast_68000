@@ -187,7 +187,8 @@ module m68k_top #(
         .ovl_clr_i      (ovl_clr),
         .kbd_inject_wr  (cia_a_kbd_wr),
         .kbd_inject_byte(cia_a_kbd_byte),
-        .vblank_pulse_o (vblank_pulse)
+        .vblank_pulse_o (vblank_pulse),
+        .dskblk_pulse_o (dskblk_pulse)
     );
 
     // CIA-A and CIA-B.  Tick every bus cycle for now (10x real Amiga rate)
@@ -364,6 +365,7 @@ module m68k_top #(
 
     wire [2:0] paula_irq_level;
     wire       vblank_pulse;
+    wire       dskblk_pulse;
 
     paula u_pau (
         .clk        (clk),
@@ -388,6 +390,7 @@ module m68k_top #(
         .blt_int_i   (blt_int),
         .cop_int_i   (1'b0),           // copper int not wired yet
         .vblank_int_i(vblank_pulse),
+        .dskblk_int_i(dskblk_pulse),
         .irq_level_o (paula_irq_level)
     );
 
