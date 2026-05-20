@@ -414,8 +414,30 @@ confirms the supervisor-stack sentinel is untouched, then takes a
 TRAP back to supervisor and re-verifies A7.
 
 With this fix Kickstart's boot reaches ~17M+ retired instructions
-in 100M cycles with no BAD-PC.  Likely now stuck in a SERDATR /
-disk-insert poll loop (as documented in section 13).
+in 100M cycles with no BAD-PC.
+
+### Where the boot now spends its time
+Profiling at 1B cycles (169M retired): the boot sits entirely
+inside a memory-rotate / display-update loop at
+`$F86EBE`–`$F86F9A`, dispatched from `$F81168` (a PC-relative
+jump-table dispatch driven by a byte stream at `(A1)`).  The inner
+body is an 8x-unrolled `MOVE.L (A5)+, (A6)` block fanning out to
+five destination pointers (`A0`–`A4`), interleaved with `ROL.W
+(An)` rotates on those buffers and a `DBF D3` inner-loop counter.
+The outer counter at `8(A7)` runs `BNE.W $F86EBE` for up to 65 535
+iterations; in 1B cycles we complete 322 of them.
+
+The shape — five parallel write streams + per-buffer rotate +
+two-level nested counter — is consistent with the Kickstart
+**bitplane "scroll the prompt"** routine that animates the
+floppy-insert screen.  No CPU bug; this is real work that takes
+a long time in our slow Verilator simulation.
+
+Reaching this routine without any BAD-PC, illegal-instruction trap,
+or stack corruption confirms the strap.lib → exec.library →
+display setup path is now sound end-to-end.  Further progress
+requires a real boot device (an MFM trackdisk image) so Kickstart
+exits the prompt loop into bootblock execution.
 
 ### Open: Task's saved PC computed as $0C3400F8 (pre-MOVE-FROM-SR fix)
 With all the above, Kickstart now runs to ~2.4M retired but
