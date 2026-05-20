@@ -231,3 +231,87 @@ isn't, our InitResident scan missed it (probably a cache /
 unaligned-read issue in the scan).  The earlier README confirmed
 trackdisk WAS found by InitResident before; the question is
 whether that's still true in the post-Scc-fix execution path.
+
+### S6: InitCode visits only 2 residents -- ResModules under-populated
+
+Goal: figure out why InitCode's RTF_COLDSTART chain returns without
+running trackdisk's init.
+
+- Traced the JSR at `$F807E8` (the `JSR $FFB8(A6)` = InitCode call).
+  The JT slot in low RAM is at `$0000_4ADC`; its JMP target is the
+  real InitCode body at `$00F8_102A`.
+
+- Disassembled InitCode (`tools/disasm68k.py 0xF8102A --bytes 64`):
+  it loads `A2 = $12C(A6)` (= `ExecBase->ResModules`, a list of
+  resident-tag pointers), walks `(A2)+` reading entries.  Zero
+  entry = list terminator (BEQ to RTS).  Positive entry =
+  resident-tag pointer; check `RT_VERSION` byte at offset $B
+  against D3, check `RT_FLAGS` byte at offset $A AND'd with D2
+  (startClass).  If both check, JSR `$FF9A(A6)` = InitResident.
+  Negative entry = redirect (`BCLR #$1F`, then `MOVEA.L D0, A2`
+  to follow a sub-list).
+
+- Traced `[InitRes] resident=...` at the per-entry InitResident
+  call (`$F81056`):
+    - resident=`$000043AC`  (a chip-RAM struct)
+    - resident=`$00004B24`  (ExecBase itself)
+    - resident=`$00004B24`  again (one of the sub-list passes hits
+                                  the same pointer)
+  **Only 2 unique residents** get cold-start init.  The 8 standard
+  Kickstart 1.3 ROM residents that the older README listed
+  (exec / expansion / ramlib / audio / console / trackdisk /
+  gameport / keyboard at $F800B2 / $F841DE / $F84CBE / $FA8C72 /
+  $FB9EFE / $FBC6E6 / $FC2486 / $FC9A96) are **NOT** in the list.
+
+- Traced any JSR/BSR landing in the `$F86E80..$F86F00` range (the
+  resident-scan loop body that does `CMP.W #$4AFC, (A4)+`).
+  **Zero hits.**  The scan never runs in our boot.
+
+- Searched the whole ROM for `JSR $F86E88` or `BSR $F86E88`
+  (the scan-loop's function entry): **no static callers**.
+  Either the entry is reached via JSR (An) where An was loaded
+  somewhere we didn't catch, or it's reached via the bytecode
+  dispatcher's opcode handler that we missed, or it's not
+  actually a function entry (just data that the old broken
+  PC-IDX path *interpreted* as code).
+
+- Insight: the OLD broken-PC-IDX execution accidentally drove
+  the boot through `$F86EEE` (mid-body of the scan loop).
+  Memory pointers `A0..A4` ended up walking low chip RAM,
+  appending the chip-RAM "residents" we now see ($43AC and
+  $4B24).  In the previously-broken path the 8 ROM residents
+  the old README mentioned probably came from a DIFFERENT
+  execution that ran *more* of the scan (or via the
+  Switch-driven path that's now bypassed too).
+
+- Bytecode dispatcher at `$F81138..$F81194` reads its byte
+  stream from `A1 = $FBCA88` (a ROM data area).  Dump:
+    ```
+    A0 08 03 00  80 0A 00 FB C7 64  A0 0E 06 00  90 14 00 28
+    90 16 00 01  80 2C 00 FB CA DA  80 30 00 FB CB 12
+    ```
+  Each "opcode" high nibble selects an action; low nibble +
+  next bytes are operands.  $A0 = byte-copy N+1 bytes; $80 =
+  word-copy; $90 = some other variant.  The bytes that look
+  like 24-bit ROM addresses ($FBC764, $FBCADA, $FBCB12) suggest
+  the stream DOES embed pointers -- likely populating exec.library
+  jump-tables and small struct fields, NOT the ResModules
+  resident list.
+
+- Conclusion: this bytecode stream initialises exec.library
+  itself.  Building the *full* ResModules list -- the cold-start
+  resident chain -- requires a separate scan step that real
+  Kickstart 1.3 does via something other than the bytecode VM,
+  and that step isn't being driven in our boot post the
+  PC-IDX/Scc fixes.
+
+- The CPU is correct; the missing piece is whatever Kickstart
+  function-call chain was supposed to populate ResModules with
+  ROM-resident-tag pointers (exec/expansion/.../keyboard).  Best
+  next probe: identify the function in the ROM that does
+  `FindResident` in a loop and `Enqueue` results into ResModules,
+  and figure out who's supposed to call it in our post-fix path.
+
+Status: 91/91 regression tests pass.  Boot still parks on the
+Alert tail.  ResModules under-population is documented as the
+next concrete blocker.
