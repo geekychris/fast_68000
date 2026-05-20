@@ -436,3 +436,84 @@ decoder ILLEGAL/TAS ordering, K_ALU mem-byte alignment).
 `strap` now fires; the floppy boot-load chain is no longer
 gated on these CPU correctness fixes.  Next blocker is
 whatever strap's init reaches into.
+
+### S8: post-K_ALU boot dies in cold-boot AllocMem -- heap reports 507KB free but every chunk is 24 bytes
+
+Goal: chase the `[BAD-PC] from=$F82700` chain from S7 to its
+proximate cause.
+
+- `$F82700: MOVEA.L $0114(A6), A1` reads the `ThisTask` slot
+  from ExecBase.  At the moment it fires, A6 = **0**, so it
+  actually reads the longword at absolute `$0114` (which is
+  vector-table noise) and gets `$8001_0001`.  The follow-up
+  `MOVE.L D0, $0016(A1)` writes to `$8001_0017` -- a bogus
+  high address that bounces back through bus / address-error
+  vectors and recursively eats the stack.
+
+- Tracked A6 backwards.  ExecBase is `$43AC` in chip RAM, set
+  early in cold boot.  At `$F805E0: MOVE.L A6, $0004.W` we
+  see Kickstart write `$43AC` to absolute `$0004` (the
+  canonical ExecBase pointer).  That stuck for ~1000 cycles,
+  then `[Wr$4] r=1523006 pc=$F817AA wdata=$00000000 be=1111`
+  CLEARED `$0004` to 0.
+
+- `$F817AA: CLR.L (A2)` is inside `$F8178A`, which is called
+  from the cold-boot main at `$F8072C: BSR $F8178A`.  The
+  routine does:
+    ```
+    $F8178E: MOVEQ #80, D0       ; want 80 bytes
+    $F81790: MOVE.L #$10001, D1   ; MEMF_PUBLIC | MEMF_CLEAR
+    $F81796: BSR $F81EBC          ; AllocMem-equivalent
+    $F8179C: MOVEA.L D0, A2       ; A2 = alloc result, NO null check
+    $F8179A: MOVEQ #4, D2
+    $F817A4: MOVE.L A2, $0008(A2) ; writes via (A2)
+    $F817A8: ADDQ.L #4, A2        ; A2 = 4 (since D0=0 -> A2=0)
+    $F817AA: CLR.L (A2)           ; CLEARS $0004 (= ExecBase ptr!)
+    ```
+  So the proximate cause is that AllocMem returns **0** and
+  Kickstart blindly trusts the return value (no `BEQ` check).
+  AllocMem failure -> NULL deref -> $0004 clobber -> ExecBase
+  ptr lost -> downstream wild PCs.
+
+- Traced AllocMem internals.  At the call:
+    - `mh_Free` reads as `$0007_BFE0` = **507,872 bytes free**.
+    - The MemHeader at `$00004000` says there's plenty.
+  But the free-chunk list walker iterates 11 chunks, every
+  single one with `mc_Bytes = $18 = 24`.  D0 (80) > 24, so
+  every chunk is rejected.  Walker exhausts and returns 0.
+
+- Traced writes that set `mc_Bytes = $18`.  All come from
+  `$F81D28: MOVE.L D0, $0004(A1)` (FreeMem's "insert chunk"
+  path), with `D0 = $18` every call.  So something in
+  cold-boot is calling FreeMem with `size = 24` over and
+  over (>40 times by the failure point), producing tiny
+  fragments.  Each chunk's `mc_Next` field claims a small
+  free-list of 11 chunks; the other ~507,600 bytes of
+  `mh_Free` are stranded somewhere.
+
+- Could not finish identifying *which* code path is the
+  FreeMem-of-24-bytes loop.  Two leading suspicions:
+    1. The K_ALU mem-byte fix in S7 changed flag results for
+       a CMP.B / CMP.W somewhere in MakeLibrary that flips a
+       branch -- and now we hit a free-each-slot-individually
+       path that didn't run pre-fix (when the boot died at
+       the no-boot Alert tail instead).
+    2. There's a *separate* CPU correctness gap (still-buggy
+       byte op, missing operation, exception-frame layout)
+       that turns a single FreeMem(big) into FreeMem(24)x40.
+
+- Tools added this session: `[Wr$4]`, `[ThisTask-W/R/USE]`,
+  `[ExpansionInit]`, `[ExecInit]`, `[ExecBaseWrite]`,
+  `[BadRead]`, `[Alloc-CALL/RET/CHECK/ATTR/SIZE]`,
+  `[Inner-CALL/WALK/CHUNK/LOAD/CMP/FAIL/OK]`,
+  `[mh_Free-read]`, `[Wr-18]`, `[Wr-mhFirst]`,
+  `[IC_LOOP/IC_ENTRY]`, `[INITRES]`, `[SCAN]`, `[BRA]`,
+  `[A6sample]` -- all temporary scopes that have been
+  removed; landing only `[EXC]` permanently so next session's
+  trace can start small.
+
+Status: 93/93 tests pass.  Boot still loops in recursive
+exception storm after AllocMem returns 0.  Next: identify the
+FreeMem-of-24-bytes loop in cold boot and figure out whether
+it's a CPU bug or a real Kickstart behavior we're feeding
+wrong input to.
