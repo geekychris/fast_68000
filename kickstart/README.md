@@ -263,6 +263,51 @@ the driver's UNLK A5 lands on the proper saved A5, and boot
 runs to ~42M retired instructions before hitting a new failure
 (BAD-PC from JT slot `$00004024` to `$038F_0305`).
 
+### 10. RTE/RTR PC pop missed dc_is_long — FIXED (preventive)
+The RTE/RTR state machine (`S_RTE_POP_SR` → `S_RTE_POP_PC`) sets
+`dc_req_r` / `dc_we` / `dc_addr` / `dc_be` but didn't drive
+`dc_is_long`.  The PC pop is .L from `SP+2` (SP was .L-aligned,
+SR pop bumped it by 2), so the read address is always
+word-aligned-but-not-mod-4 — the same unaligned-.L case the
+MOVEM fix above addresses.  Without `dc_is_long` set the bus
+returned `mem[idx]` verbatim (= the wrong half) and the redirect
+landed in garbage on the first exception that came through RTE.
+
+Fix in `rtl/m68k_core.v`: clear `dc_is_long` for the SR pop (it's
+.W) and set it for the PC pop (always unaligned .L).  No new
+regression test — `tests/t96_irq_savereg.s` already exercises
+the RTE path but didn't trip the bug because its supervisor
+stack happened to stay .L-aligned at RTE entry.
+
+### 11. Slow/Expansion-RAM probe writes aliased into vectors — FIXED
+Kickstart's memory probe writes patterns at $00C0_xxxx /
+$00D0_xxxx (the slow/expansion RAM regions) and reads them back
+to size the RAM.  Our bus uses `mem_idx = addr[18:2]`, which
+silently truncates the upper address bits — so a write to
+$00C0_000A landed at `mem[$2]` (vector 2) and a write to
+$00C0_000E landed at `mem[$3]` (vector 3).  Kickstart's probe
+saw consistent write/read (because both sides aliased) and
+concluded slow RAM was present — but the writes had already
+clobbered the exception vector table.  Vector 3 (address error)
+ended up holding `$038F_0305`, so every address-error trap
+landed in garbage and the boot dropped into an exception storm.
+
+Fix in `rtl/m68k_bus.v` (gated on `+define+KICKSTART_BOOT` so
+bench tests that intentionally use high addresses as fake RAM
+still alias): writes to `addr >= (MEM_WORDS << 2)` are dropped,
+and reads return 0.  Existing chipset / CIA / ROM / autoconfig
+slaves run first in the if-else chain so they're unaffected;
+the guard only fires when the access has fallen through to the
+main-RAM default and the address is outside the populated
+window.
+
+With this fix Kickstart progresses through chip-RAM init,
+exception-vector setup, and into the strap.lib boot-device
+search.  Boot now runs to ~5.3M retired before tripping a new
+BAD-PC: RTS at $F80BE6 pops `$0B0C_00F8` from the supervisor
+stack at $FFE0 — i.e. the saved return address is still
+corrupt.  Next thing to chase.
+
 ### Open: AllocMem starts allocating from low-mem $20+
 Tracing shows AllocMem returning $20, $38, $50, $68, $80, $98,
 $B0, $C8 — each 24 bytes apart, starting from $20.  $20 is

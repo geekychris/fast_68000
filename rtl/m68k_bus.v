@@ -1262,6 +1262,19 @@ module m68k_bus #(
                 // ROM region is read-only; silently drop the write.
             end else if (winner_valid && we[winner] && is_disk_read) begin
                 // Disk image is read-only; silently drop the write.
+`ifdef KICKSTART_BOOT
+            end else if (winner_valid && we[winner] &&
+                        (addr[winner] >= (MEM_WORDS << 2))) begin
+                // Under Kickstart the address space includes slow/expansion
+                // regions ($00C0_xxxx, $00D0_xxxx) that Kickstart's memory
+                // probe touches; without this guard those writes alias back
+                // into mem[] via the truncated mem_idx and silently corrupt
+                // the exception vector table (vector 3 at $0C ended up
+                // holding $038F_0305, so every address-error trap landed in
+                // garbage).  Bench tests deliberately use high addresses as
+                // "fake RAM" via the alias, so the guard is gated on
+                // KICKSTART_BOOT only.
+`endif
             end else if (winner_valid && we[winner]) begin
                 // Unaligned .L write (addr[1:0]==10, all four bytes enabled)
                 // straddles two mem[] entries on real 68000 silicon -- two
@@ -1525,6 +1538,14 @@ module m68k_bus #(
                    : granted_is_ciaa_q  ? ciaa_resp_w
                    : granted_is_ciab_q  ? ciab_resp_w
                    : granted_is_rom_q   ? granted_rom_data_q
+`ifdef KICKSTART_BOOT
+                   // Under Kickstart, drop reads of unmapped addresses (above
+                   // the populated mem[] window) to $0 so Kickstart's chip-
+                   // RAM probe sees consistent "no memory here" (matching the
+                   // write-side drop) rather than aliased mem[] data.  Real
+                   // hardware would float here.
+                   : (granted_addr_q >= (MEM_WORDS << 2)) ? 32'h0000_0000
+`endif
                    // Unaligned .L read: caller signals genuine .L via
                    // granted_is_long_q.  Assemble from low half of mem[idx]
                    // and high half of mem[idx+1] -- matches the 68000's

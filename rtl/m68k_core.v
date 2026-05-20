@@ -2504,6 +2504,10 @@ module m68k_core #(
                         dc_lock  <= 1'b0;
                         dc_addr  <= rf_rc_data;
                         dc_be    <= 4'b1111;
+                        // SR pop is .W, but the bus uses dc_is_long for its
+                        // unaligned-.L read-assembly gate; clear it here so
+                        // the SR read doesn't trip into the assembly path.
+                        dc_is_long <= 1'b0;
                         ex_state <= S_RTE_POP_SR;
                     end else if (ex_valid && !halted && want_mem) begin
                         dc_req_r <= 1'b1;
@@ -2833,6 +2837,13 @@ module m68k_core #(
                         dc_we    <= 1'b0;
                         dc_addr  <= working_sp + 32'd2;
                         dc_be    <= 4'b1111;
+                        // PC pop is .L from working_sp+2, which is always
+                        // word-aligned-but-not-mod-4 (SR was 2 bytes,
+                        // pre-SR-pop SP was .L-aligned).  Set dc_is_long so
+                        // the bus's unaligned-.L read assembly fires --
+                        // otherwise the PC pop returns the wrong half and
+                        // the redirect lands in garbage.
+                        dc_is_long <= 1'b1;
                         ex_state <= S_RTE_POP_PC;
                     end
                 end
