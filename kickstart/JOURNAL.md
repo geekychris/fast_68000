@@ -20,11 +20,52 @@ ROMFILE=kickstart/kick.bin ROMSIZE_WORDS=131072` (or
 
 ---
 
-## Session log
+## Current state (TL;DR)
 
-Convention: each session opens with a one-line goal and closes with
-a `Status:` line describing what runs.  Within a session, each
-discovery / hypothesis / experiment is its own bullet.
+- **91/91** regression tests pass.
+- Kickstart 1.3 boot retires **~190M instructions cleanly** at
+  IPC ~0.96, then parks on its intentional **"yellow Guru" Alert
+  hang** at `$F807F4` (`MOVE.W #$0F0F, COLOR00; BRA self`).
+- The hang is not a crash -- it's Kickstart's "no boot found" tail
+  after `InitCode(RTF_COLDSTART, 0)` returns.  See S5.
+- The boot does NOT write `DSKLEN` because `ResModules` is
+  under-populated (only 2 chip-RAM entries instead of the 8 ROM
+  residents that real Kickstart would have).  The MFM bootblock
+  pipeline is plumbed and working, just never triggered.  See S6.
+
+CPU fixes landed during the bring-up (all keep regression
+tests green; each has a dedicated regression test):
+
+| Bug | Commit | Test |
+|---|---|---|
+| `MOVE-FROM-SR` to memory was a silent no-op | 6020a09 | `t104_movefromsr_mem.s` |
+| SR-write S=1→0 didn't swap A7 with usp_shadow | cc6e450 | `t105_sr_user_swap.s` |
+| `SUBQ.W d16(An)` worked, but exposed how `d16(An)` byte writes interact | — | `t106_subqw_d16an.s` |
+| `JMP $d8(PC, Xn)` used A7 as the index register | 4d43e26 | `t107_jmp_pc_idx.s` |
+| `Scc <ea>` to memory was a silent no-op | e1591ab | `t108_st_tst_d16an.s` |
+
+Other infrastructure added:
+
+- `tools/disasm68k.py` -- m68k disassembler for ROM exploration.
+  Handles all the opcode families we've encountered so far; new
+  ones are added when they show up.  Unknown opcodes fall back to
+  `DC.W` so we always make forward progress.
+- `tools/mkbootblock.py` -- builds a 1024-byte Amiga DOS bootblock
+  with `DOS\0` magic + valid additive checksum + 14 bytes of code
+  that writes `$CAFEBABE` to `$00050000` and RTSes.
+- `make test-kickstart-boot ROMFILE=kickstart/kick.bin` -- end-to-end
+  target: build bootblock, MFM-encode, load into `disk[]`, run
+  Kickstart, grep for `[BOOTBLOCK]` in the sim output.
+- `rtl/m68k_top.v` -- drives CIA-A `pa_in` bit 2 (`/DSKCHANGE`) low
+  so trackdisk would treat the drive as freshly-loaded.
+
+## How to navigate this file
+
+Each session is an `### Sn:` block, newest at the bottom.  Each
+opens with a one-line **Goal**, runs through discoveries / hypotheses
+/ experiments as bullets, and closes with a `Status:` line.
+
+## Session log
 
 ### S2: `JMP $disp(PC, Xn)` was using A7 as the index
 

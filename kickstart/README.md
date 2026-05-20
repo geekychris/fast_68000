@@ -1,5 +1,23 @@
 # Kickstart boot on the sim
 
+For the running narrative of *how* each fix was found, see
+`kickstart/JOURNAL.md`.  This file is the stable summary: where
+the boot gets to, what fixes landed, what's still open.
+
+## Current state (snapshot)
+
+Boot retires **~190M instructions cleanly** at IPC ~0.96, then
+parks on Kickstart's intentional **"yellow Guru" Alert hang** at
+`$F807F4` (`MOVE.W #$0F0F, COLOR00; BRA self`).  This is the
+"InitCode returned, no boot found" tail -- not a crash.  See
+section 16 below for the diagnosis.
+
+`make test-kickstart-boot ROMFILE=kickstart/kick.bin
+ROMSIZE_WORDS=131072` runs the full pipeline (bootblock builder
++ MFM encode + sim) and greps for the `[BOOTBLOCK]` magic write
+-- it still fails because nothing in the boot path JSRs into a
+disk-read.  91/91 regression tests pass.
+
 ## What works
 - ROM decryption: `tools/rom_decrypt.py` strips the `AMIROMTYPE1`
   header and XORs the encrypted ROM against `rom.key`.
@@ -21,6 +39,40 @@
     pass takes seconds instead of hours of sim time.
   - Skips the post-checksum BNE at `$F801AA` (see "Known issues").
 
+## Tools
+
+Built up over the bring-up; each one is small and standalone.
+
+- `tools/rom_decrypt.py` -- strip `AMIROMTYPE1` header + XOR an
+  encrypted Kickstart ROM against its `rom.key`.
+- `tools/bin2rom.py` -- convert a raw ROM image to a Verilator-
+  loadable `$readmemh` hex.
+- `tools/disasm68k.py` -- m68k disassembler for ROM exploration.
+  Handles MOVE/MOVEA, BSR/BRA/Bcc, DBcc/Scc, ADDQ/SUBQ, MOVEQ,
+  LEA, PEA, JMP/JSR, RTS/RTE/RTR, LINK/UNLK, MOVE USP, MOVE
+  SR/CCR, MOVEM, ORI/ANDI/SUBI/ADDI/EORI/CMPI, register-ALU
+  forms, shift family, TST, CLR, SWAP, EXT.  Unknown opcodes
+  fall back to `DC.W $xxxx` so reading never stalls.
+- `tools/mkbootblock.py` -- build a 1024-byte Amiga DOS bootblock
+  with `DOS\0` magic, valid additive-with-carry checksum, and a
+  14-byte payload that writes `$CAFEBABE` to `$00050000` and
+  RTSes.
+- `tools/adf2mfm.py` -- MFM-encode an ADF for the floppy DMA stub.
+
+## Make targets
+
+- `make test-boot-rom-bin ROMFILE=kickstart/kick.bin` -- run
+  Kickstart with no disk; see how far it gets.
+- `make test-kickstart-boot ROMFILE=kickstart/kick.bin
+  ROMSIZE_WORDS=131072` -- full end-to-end: build a fake
+  `DOS\0` bootblock, MFM-encode track 0, load into `disk[]`,
+  run Kickstart with `+define+KICKSTART_BOOT_TRACE`, and grep
+  the log for `[BOOTBLOCK]` to confirm Kickstart called the
+  bootblock code.  Currently fails because no `DSKLEN` write
+  fires.
+- `make test` -- the 91-case regression suite.  Must stay green
+  through every CPU fix landed for the boot.
+
 ## Verified end-to-end
 - Reset → LEA SSP → enter `$F800D2` cleanly.
 - ROM checksum loop runs (~131K longs, with carry-round addition).
@@ -29,7 +81,40 @@
   `$display` trace: `PRA=00`, `DDRA=03`, `OVL cleared`.
 - Power-on LED blink writes succeed on the CIA-A slave.
 
-## Known issues blocking further progress
+## Open items
+
+The active investigation is in `kickstart/JOURNAL.md` (newest
+session entry has the live thread).  TL;DR:
+
+1. **InitCode visits only 2 residents.**  `ExecBase->ResModules`
+   is under-populated -- it contains a chip-RAM struct at `$43AC`
+   and ExecBase itself at `$4B24`, NOT the 8 ROM-resident modules
+   real Kickstart 1.3 has (exec, expansion, ramlib, audio,
+   console, trackdisk, gameport, keyboard).  So `InitCode(RTF_
+   COLDSTART, 0)` at `$F807E8` returns without anyone JSR'ing
+   into trackdisk's RT_INIT, no `DSKLEN` is written, and the
+   boot falls into the "no boot found" Alert at `$F807F4`.
+2. **The ROM resident-tag scan at `$F86E80..$F86F00` is never
+   called** in our boot.  Older session notes assumed it ran
+   (and that was based on the OLD broken-`d8(PC,Xn)` execution
+   *accidentally* JMP'ing mid-body of that scan and walking
+   chip-RAM with bad pointers).  With the PC-IDX fix, the
+   accidental scan is gone -- but nothing replaces it.
+3. **Finding the correct caller of the scan** (or whatever
+   function builds the full ResModules list) is the next
+   concrete probe.  Per JOURNAL.md S6, the bytecode dispatcher
+   at `$F81138` walks a byte stream from ROM `$FBCA88` that
+   initialises exec.library's own struct fields; it does NOT
+   populate ResModules with the 8 ROM residents.  The function
+   that should is somewhere else in the ROM.
+
+The MFM bootblock pipeline (built in commit `da01fb0`) is
+plumbed and verified in isolation -- the moment Kickstart writes
+DSKLEN, it WILL deliver our fake `DOS\0` bootblock and the JSR
+at offset +12 will write `$CAFEBABE` to `$00050000` and the
+`[BOOTBLOCK]` trace will fire.
+
+## Known issues (history of CPU fixes that landed)
 
 ### 1. Checksum diverges from $FFFFFFFF around iter ~100K — FIXED
 Root cause: the legacy chipset / block-device / keyboard-inject /
@@ -491,6 +576,85 @@ above `$5D60` and never touch the counter.
 `tests/t106_subqw_d16an.s` rules out a CPU `SUBQ.W d16(An)` bug —
 the operation itself works perfectly; the corruption is purely
 from the AllocMem mis-allocation upstream.
+
+### 16. `JMP $d8(PC, Xn)` was using A7 as the index — FIXED
+
+Addressing mode 7/reg 3 (`EA_EXT` / `EA7_PCIDX` =
+`d8(PC, Xn.size)`) takes a brief extension word whose top nibble
+names the index register Xn -- any of D0..D7/A0..A7.  Our
+`id_rc_idx` mux only routed the rc port to Xn for `EA_IDX`
+(mode 6, `d8(An,Xn)`); for mode 7/reg 3 it defaulted to A7,
+so every `d8(PC, Xn)` op (including `JMP`/`MOVE.W` etc.) used
+A7's value as the index.
+
+This was masking everything downstream of the render loop:
+Kickstart's bytecode-dispatch routine at `$F81168`
+(`JMP $2C(PC, D1.W)`) read A7 instead of D1 and jumped
+~`$5D58` bytes too far -- right into the long bitplane-scroll
+function at `$F86EEE` which then never terminated because A0..A4
+walked through chip RAM clobbering the supervisor stack.
+
+Fix in `rtl/m68k_core.v`: extend `id_src_is_idx` /
+`id_dst_is_idx` to fire on the `EA_EXT / EA7_PCIDX` subtype as
+well, so the brief-extension Xn register flows through the rc
+port like `EA_IDX` already did.
+
+Regression: `tests/t107_jmp_pc_idx.s` sets D1 explicitly and
+uses `JMP $tab(PC, D1.W)` to land in a small per-D1 jump table.
+
+With this fix the render loop is gone -- the bytecode dispatcher
+JMPs to the correct small case-handler in the same routine.
+
+### 17. `Scc <ea>` to memory was a silent no-op — FIXED
+
+Same pattern as the MOVE-FROM-SR fix (section 14).  K_SCC only
+handled `EA_DREG` destinations; memory destinations dropped on
+the floor.  Kickstart 1.3's library-create wrapper at `$F8086A`
+uses `ST $1F(A2)` as a fail-default flag and `TST.B $1F(A2)` +
+`BNE` to detect failure.  With the ST being a no-op the flag
+stayed 0, BNE didn't take, and a later `JSR $FFFA(A6)` fired
+with A6 = 0.
+
+Fix in `rtl/m68k_core.v`: add the `src_needs_mem` branch to
+K_SCC's planning + a K_SCC case in S_STORE for `src_an_update`
+(predec/postinc).
+
+Regression: `tests/t108_st_tst_d16an.s` does `ST $1F(A2)` +
+checks the byte is `$FF`, neighbours intact, `TST.B` correct,
+`CLR.B` + `TST.B` correct.
+
+**Combined impact of #16 + #17**: IPC jumped from 0.17 to 0.96
+and retired instruction count jumped from ~2.4M (crashing) to
+~192M in 200M cycles (clean).  Boot now reaches `$F807F4` --
+Kickstart's intentional "yellow Guru" Alert hang.
+
+### 18. The `$F807F4` hang is NOT a crash
+
+Disassembly of `$F80700..$F807F4` shows the routine is exec's
+task-bringup tail:
+
+1. `AllocEntry` for the boot task's memlist (succeeds).
+2. Build the boot-task struct.
+3. `AddHead` / `RemTask` / Permit.
+4. Check `CoolCapture` (= `$2E(A6)`); if non-zero, JSR to it.
+5. `InitCode(RTF_COLDSTART, 0)` -- run all cold-start residents.
+6. After InitCode returns: `MOVE.W #$0F0F, COLOR00; BRA self`.
+
+So the Alert hang is the deliberate "I ran all my residents and
+none of them booted from a disk" tail.  See the **Open items**
+section at the top and `kickstart/JOURNAL.md` S5/S6 for why
+InitCode returns without anyone driving trackdisk.
+
+### Historical (pre-#16/#17): render loop blocker
+
+The sections below described the render loop's apparent
+"counter clobbered by AllocMem" bug.  That analysis was
+correct in mechanism but wrong in attribution -- the real
+root cause was bug #16 (PC-IDX using A7) accidentally JMP'ing
+the boot into mid-body of the resident-scan loop, where A0..A4
+were pre-loaded with low chip-RAM addresses.  Once #16 was
+fixed the whole apparent render-loop block disappeared.
+Sections below kept for the diagnosis-history trail.
 
 ### Next: trace why the render loop's dest pointers land in the stack
 
