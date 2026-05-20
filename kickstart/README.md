@@ -492,19 +492,33 @@ above `$5D60` and never touch the counter.
 the operation itself works perfectly; the corruption is purely
 from the AllocMem mis-allocation upstream.
 
-### Next: fix the memory probe / AllocMem mh_Lower
-Kickstart's chip-RAM probe writes patterns at increasing addresses
-and reads them back to detect the upper bound.  Our bus's
-`KICKSTART_BOOT` guard drops writes past `MEM_WORDS<<2` and returns
-0 on reads, which the probe should treat as "RAM ends here".  But
-the resulting MemList apparently has `mh_Lower = $20` (rather than
-a high free address), so AllocMem hands out the bottom of memory.
-Fixing this likely unblocks the entire downstream path through
-trackdisk to the bootblock JSR.  Increasing `MEM_WORDS` from 512 KB
-(131072) to 2 MB (524288) doesn't change the symptom, so the
-probe isn't simply measuring memory size — there is a structural
-issue in how Kickstart builds the MemHeader from the probe results
-in our environment.
+### Next: trace why the render loop's dest pointers land in the stack
+
+Watching writes to `mem[$4]` (the ExecBase pointer) reveals
+ExecBase = `$4B24` in our boot — a relatively low chip-RAM address.
+The `$20+` low-RAM writes the README's older "AllocMem returning
+$20" note pointed at are **not** AllocMem at all (`$20 << $4B24`);
+they're Kickstart's own early-init struct placements (vector
+table + ROM-resident node fill), which is expected and harmless
+on a fresh boot.
+
+The actual render-loop counter corruption at `$5D60` comes from
+`MOVE.L (A6), (A0)+ / (A1)+ / (A2)+ / (A3)+ / (A4)+` where one of
+`A0`..`A4` happens to point into the supervisor stack frame.
+Where do `A0`..`A4` come from?  The JT-dispatcher at `$F81168`
+calls `$F86EEE` with those registers pre-set — tracing back the
+caller's pointer-load sequence (likely from an exec.library
+struct populated during init) should find the field that should
+hold a high free-RAM address but instead holds something in the
+`$5DXX` range.
+
+Trying `MEM_WORDS` of 256 KB / 512 KB / 1 MB / 2 MB all leaves the
+boot stuck in the same render loop with the same `$5D60`
+collision — so the issue isn't RAM size or where the probe finds
+the upper bound, it's structurally one of those `A0..A4` pointers
+pointing at the stack.  This needs a Kickstart ROM disassembly +
+trace back from the `$F81168` JT to find which exec.library struct
+field is set to `$5DXX` instead of a high free-RAM address.
 
 ### Open: Task's saved PC computed as $0C3400F8 (pre-MOVE-FROM-SR fix)
 With all the above, Kickstart now runs to ~2.4M retired but
