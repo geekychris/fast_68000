@@ -517,3 +517,82 @@ exception storm after AllocMem returns 0.  Next: identify the
 FreeMem-of-24-bytes loop in cold boot and figure out whether
 it's a CPU bug or a real Kickstart behavior we're feeding
 wrong input to.
+
+### S9: the FreeMem(24) "loop" was a misread; sibling lane bugs landed
+
+Goal: identify the FreeMem-of-24 caller hypothesized in S8.
+
+- A/B'd by checking out `96ce886` (just before the K_ALU
+  byte/word fix) and re-ran kickstart-boot with a `[Wr-18]` trace
+  for any chip-RAM write of `$00000018`.  **27 hits, same PCs**
+  (`$F81D28 / $F81D2C`).  The "FreeMem(24)-loop" exists pre-fix
+  too -- not introduced by the K_ALU change; the K_ALU fix just
+  lets boot reach the consequence (the AllocMem(80) failure).
+
+- Wider trace: `$F81D28: MOVE.L D0, $0004(A1)` writes 24 to a
+  chunk's `mc_Bytes`, but it's reached from the allocator's
+  *coalesce-or-insert* path inside FreeMem (`$F81CE0..$F81E0E`),
+  which has dual roles.  The `D0 = $18` constant comes from
+  AllocMem's rounding (`ADDQ.L #7, D0; AND.W #$FFF8, D0` rounds
+  size up to a multiple of 8; request of 18 -> 24).
+
+- The caller of every AllocMem(18) hit is **PC = `$F80EFA`**,
+  inside the cold-boot resident-list builder:
+    ```
+    $F80EF6: MOVEQ #0, D1
+    $F80EF8: MOVEQ #18, D0          ; size of ListNode + back-ptr
+    $F80EFA: JSR   $FF3A(A6)         ; AllocMem(18, 0)
+    $F80EFE: TST.L D0; BEQ fail
+    $F80F02: MOVEA.L D0, A1          ; new node
+    $F80F04: MOVE.B $D(A5), $9(A1)   ; node.Pri = resident.Pri
+    $F80F0A: MOVE.L $E(A5), $A(A1)   ; node.Name = resident.Name
+    $F80F10: MOVE.L A5, $E(A1)       ; node back-ptr to resident
+    $F80F16: BSR   $F81A0A           ; Enqueue
+    ```
+  This is the ResModules-list builder: 14-byte ListNode +
+  4-byte back-pointer per ROM resident.  10-11 allocations is
+  the expected number of residents.  **Normal exec behavior, not
+  a bug.**
+
+- **The real bug**: `mh_Free` reports `$0007BFE0` = 507,872
+  bytes, but the free-chunk walker visits exactly 11 chunks of
+  size 24 (= 264 bytes total) before hitting NULL `mc_Next` at
+  chunk `$4D08`.  The list is **structurally truncated** --
+  more chunks (or one big residue) should account for the
+  other 507,608 bytes, but they're unreachable from `mh_First`.
+
+- Hypotheses for the truncation:
+  1. Something writes 0 to `(mc_Next)` of chunk `$4D08` (or a
+     predecessor), severing the chain.  Could be a library JT
+     being built *downward* (`$F81C90: MOVE.L A3, -(A0)`)
+     across a free-chunk header.
+  2. AllocMem's "consume whole chunk" path (`$F81E10: MOVE.L
+     (A1),(A2)`) miscomputes the splice in some edge case.
+  3. `mh_Free` is updated independently of `mc_Bytes` (e.g.,
+     an allocation that adjusts `mh_Free` without removing the
+     chunk from the list), letting the two drift.
+
+- Side investigation: sibling-kind audit (parallel agent) caught
+  five more S_LOAD lane bugs of the same shape as the K_ALU fix:
+  **K_MOVEA.W, K_MULU, K_MULS, K_DIVU, K_DIVS** all assumed the
+  word operand sat in `dc_rdata[15:0]` instead of `[31:16]` when
+  `dc_addr[1]==0`.  Fixed via a single `mem_word_w` wire (commit
+  `3d582b0`); `tests/t111_movea_w_mem.s` exercises MOVEA.W at
+  both word lanes plus sign-extend boundaries.  Also flagged:
+  K_CHK with memory source schedules a load but has no S_LOAD
+  case -- the bound check, exception launch, and N-flag commit
+  never run.  Tried to add one but `exc_launch_c` is only
+  sampled from `S_RUN`, so launching a CHK trap from `S_LOAD`
+  doesn't fire.  Deferred.
+
+- After the MOVEA / MULU / MULS / DIVU / DIVS fixes,
+  kickstart-boot trace is **byte-identical** to pre-fix at the
+  failure point: same 11 free chunks, same NULL `mc_Next` at
+  `$4D08`, same recursive exception storm.  So the truncation
+  isn't caused by any of these lane bugs.
+
+Status: 92/92 tests pass (added t111_movea_w_mem).  Boot wall
+unchanged: AllocMem fails because the free-list chain is
+truncated at chunk `$4D08`.  Next session: bus-trace 4-byte
+writes at `$4D08` (and the other free-chunk header addresses)
+to pinpoint what severs the chain.
