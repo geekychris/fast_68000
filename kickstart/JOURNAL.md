@@ -22,16 +22,17 @@ ROMFILE=kickstart/kick.bin ROMSIZE_WORDS=131072` (or
 
 ## Current state (TL;DR)
 
-- **91/91** regression tests pass.
-- Kickstart 1.3 boot retires **~190M instructions cleanly** at
-  IPC ~0.96, then parks on its intentional **"yellow Guru" Alert
-  hang** at `$F807F4` (`MOVE.W #$0F0F, COLOR00; BRA self`).
-- The hang is not a crash -- it's Kickstart's "no boot found" tail
-  after `InitCode(RTF_COLDSTART, 0)` returns.  See S5.
-- The boot does NOT write `DSKLEN` because `ResModules` is
-  under-populated (only 2 chip-RAM entries instead of the 8 ROM
-  residents that real Kickstart would have).  The MFM bootblock
-  pipeline is plumbed and working, just never triggered.  See S6.
+- **93/93** regression tests pass (+`t109_illegal_trap.s`,
+  +`t110_cmp_b_d16an.s`).
+- Kickstart 1.3 cold boot now correctly init's `exec.library`,
+  scans the ROM, builds the full 9-entry ResModules list, and
+  starts walking COLDSTART residents -- `keyboard.device`,
+  `diag init`, and (post-fix) `strap` all fire.  See S7.
+- After `strap` fires Kickstart heads off into wild PC space
+  (`[BAD-PC]` triggers with PC in $80xxxxxx / $23xxxxxx).
+  Likely strap's init touches kicktag / ColdCapture vectors we
+  haven't wired, or the bootstrap task crashes due to a still-
+  missing CPU detail.  Next session's target.
 
 CPU fixes landed during the bring-up (all keep regression
 tests green; each has a dedicated regression test):
@@ -43,6 +44,8 @@ tests green; each has a dedicated regression test):
 | `SUBQ.W d16(An)` worked, but exposed how `d16(An)` byte writes interact | — | `t106_subqw_d16an.s` |
 | `JMP $d8(PC, Xn)` used A7 as the index register | 4d43e26 | `t107_jmp_pc_idx.s` |
 | `Scc <ea>` to memory was a silent no-op | e1591ab | `t108_st_tst_d16an.s` |
+| K_BAD (unknown opcode) was a silent no-op; decoder ordered TAS before ILLEGAL so $4AFC mis-decoded | 96ce886 | `t109_illegal_trap.s` |
+| K_ALU mem source took low byte of dc_rdata instead of byte at dc_addr[1:0] | a1ebc56 | `t110_cmp_b_d16an.s` |
 
 Other infrastructure added:
 
@@ -356,3 +359,80 @@ running trackdisk's init.
 Status: 91/91 regression tests pass.  Boot still parks on the
 Alert tail.  ResModules under-population is documented as the
 next concrete blocker.
+
+### S7: ResModules under-population was a CPU bug, not a missing call
+
+Goal: figure out who populates ResModules with the ROM residents
+(S6 left this as "no static caller of the scan loop").
+
+- **First fix (K_BAD):** the decoder collapsed every opcode it
+  didn't recognise into `K_BAD`, which was a silent no-op.  Real
+  68000 raises ILLEGAL (vec 4) for unknowns, with A-line / F-line
+  routed to vectors 10 / 11.  Kickstart 1.3 uses $4E7A (MOVEC),
+  $F2xx (F-line), $4AFC (hard illegal) as CPU-feature probes.
+  Without a trap they all succeed silently and Kickstart picks
+  the 68030+ path through ResModules.  Added `K_BAD ->
+  ILLEGAL/LINEA/LINEF` exception launch in `rtl/m68k_core.v`.
+
+- **Second fix (decoder ordering):** while testing, $4AFC kept
+  decoding as `K_TAS` because the broad TAS pattern
+  `16'b0100_1010_11_??_????` matched before the more specific
+  ILLEGAL pattern `16'b0100_1010_1111_1100`.  Moved ILLEGAL above
+  TAS in `m68k_decoder.v`.  Landed `tests/t109_illegal_trap.s`.
+
+- After both fixes the boot ran 300M cycles without ever
+  emitting a STOP (vs the prior Alert-hang STOP at $F807F4).
+  Added a temporary `[BRA]` trace of every redirect into
+  `$F803xx/$F806xx/$F807xx` -- found the boot DOES take the
+  good cold-boot path through `$F80354` (BSR scan; MOVE.L D0,
+  $12C(A6)).  So the scan WAS running -- ResModules wasn't
+  under-populated, it was just being walked wrong by something
+  downstream.
+
+- Traced `[INITRES]` (PC=$F81056 = JSR `$FF9A(A6)` =
+  InitResident inside InitCode body).  In the second InitCode
+  call (`InitCode(D0=1, D1=0)`) only 3 of 9 residents fired:
+  `keyboard.device`, `diag init`, `exec.library` (already done).
+  The 4th entry -- `strap` -- did NOT fire.  Strap is the
+  trackdisk boot loader; no strap = no DSKLEN = no [BOOTBLOCK].
+
+- Added per-instruction CC trace through the InitCode body and
+  caught the bug at `$F81046: CMP.B $0B(A1), D3` where D3=0 and
+  $0B(A1) = strap's `RT_VERSION` = $28.  Expected `0 - $28 =
+  $D8`, N=1.  Got `cc=N0Z0V0C1`.  N WRONG, so the next `BGT
+  $F81036` skipped strap.
+
+- For exec ($F800B2) the same CMP.B ran fine because exec's
+  RT_VERSION lives at $F800BD (within the longword $022D0969 at
+  $F800BC).  Both the byte at offset 1 ($2D) and the byte at
+  offset 3 ($69) are negative-byte values -- the bug was
+  masked.  For strap (longword $012800C4 at $F84CC8) offset 1
+  = $28 (positive byte after CMP) but offset 3 = $C4
+  (positive byte after CMP), so picking the wrong offset
+  flipped N=0.
+
+- **Third fix (the real one):** in `m68k_core.v` S_LOAD handler
+  for `K_ALU`, alu_b was set to raw `dc_rdata` (a 32-bit
+  aligned longword).  The ALU's `mask` logic then took the
+  LOW byte (`dc_rdata[7:0]`).  But byte at addr offset N lives
+  at bits[(31-8*N):(24-8*N)], not always [7:0].  Replaced with
+  `byte_at(dc_rdata, dc_addr[1:0])` for `SZ_B` and the
+  matching word slice for `SZ_W` (same shape K_TST / K_NEG /
+  K_NOT / K_ALUI already use).  Regression test
+  `tests/t110_cmp_b_d16an.s` lays down the exact strap byte
+  pattern and verifies CMP.B at each offset.
+
+- Post-fix boot now skips PAST strap-skip and gets further --
+  but immediately runs into `[BAD-PC]` events:
+    `[BAD-PC] from=80400043 to=23402708 retired=74825891 kind=0`
+    `[BAD-PC] from=00f8270c to=80010017 retired=74826111 kind=10`
+  Stack pointer at the time is `$FFFFF8EE` -- bottom of 32-bit
+  space.  Strap likely jumps into a function that uses
+  ColdCapture / KickTag pointers we haven't populated, OR a
+  CPU detail still missing.  Next session.
+
+Status: 93/93 tests pass.  Three CPU bugs landed (K_BAD trap,
+decoder ILLEGAL/TAS ordering, K_ALU mem-byte alignment).
+`strap` now fires; the floppy boot-load chain is no longer
+gated on these CPU correctness fixes.  Next blocker is
+whatever strap's init reaches into.
