@@ -511,8 +511,21 @@ module m68k_core #(
     // the default-decoded m3 = opcode[5:3] which can equal EA_IDX (3'd6)
     // even though there's no EA in play.  Gating on src_ext_words avoids
     // hijacking rc and breaking SP-using kinds.
-    wire        id_src_is_idx = (idec_src_mode == `EA_IDX) && (idec_src_ext_words != 2'd0);
-    wire        id_dst_is_idx = (idec_dst_mode == `EA_IDX) && (idec_dst_ext_words != 2'd0);
+    // Both EA_IDX (mode 6, d8(An,Xn)) and EA7_PCIDX (mode 7/reg 3,
+    // d8(PC,Xn)) take a brief extension word whose top nibble names
+    // the index register Xn -- any of D0..D7/A0..A7.  Route Xn
+    // through the rc regfile port so the EX stage gets its value
+    // in ex_sp.  Originally only EA_IDX did this, so JMP $X(PC,Xn)
+    // (the Kickstart 1.3 bytecode-dispatcher form) defaulted to
+    // reading A7 and computed a wrong target.
+    wire        id_src_is_idx =
+        ((idec_src_mode == `EA_IDX) && (idec_src_ext_words != 2'd0)) ||
+        ((idec_src_mode == `EA_EXT) && (idec_src_reg == `EA7_PCIDX) &&
+         (idec_src_ext_words != 2'd0));
+    wire        id_dst_is_idx =
+        ((idec_dst_mode == `EA_IDX) && (idec_dst_ext_words != 2'd0)) ||
+        ((idec_dst_mode == `EA_EXT) && (idec_dst_reg == `EA7_PCIDX) &&
+         (idec_dst_ext_words != 2'd0));
     wire [15:0] id_src_ext0 = id_ext[0];
     wire [15:0] id_dst_ext0 = id_ext[idec_src_ext_words];
     wire [3:0]  id_src_xreg = {id_src_ext0[15], id_src_ext0[14:12]};
