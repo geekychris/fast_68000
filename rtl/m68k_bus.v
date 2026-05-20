@@ -429,7 +429,16 @@ module m68k_bus #(
     // assigned region with RAM; this is the autoconfig handshake only.
     localparam [31:0] AUTOCONFIG_BASE = 32'h00E8_0000;
     localparam [31:0] AUTOCONFIG_END  = 32'h00E8_FFFF;
+`ifdef KICKSTART_BOOT
+    // Under Kickstart we don't actually back the autoconfig-assigned
+    // region with memory, so advertising the card as Z2 RAM gets
+    // Kickstart to AddMemList() a phantom 8MB region; subsequent
+    // AllocMem returns pointers there and writes/reads silently corrupt.
+    // Returning $FF says "no card here" so Kickstart skips the slot.
+    localparam [7:0]  AUTOCONFIG_TYPE = 8'hFF;
+`else
     localparam [7:0]  AUTOCONFIG_TYPE = 8'hE0;
+`endif
     reg        autoconfig_shutup;
     reg [7:0]  autoconfig_base_hi;
     reg [7:0]  autoconfig_base_lo;

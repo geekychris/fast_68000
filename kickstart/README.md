@@ -220,11 +220,33 @@ With this fix Kickstart's InitResident finds all 8 ROM-resident
 modules (exec, expansion, ramlib, audio, console, trackdisk,
 gameport, keyboard at $F800B2/$F841DE/$F84CBE/$FA8C72/$FB9EFE/
 $FBC6E6/$FC2486/$FC9A96), AllocMem returns valid pointers, and
-the boot runs to ~1.4M retired instructions before jumping into
-an apparent garbage region around `$038F_Axxx` (= Z2 FastRAM
-area).  That's the next thing to chase — probably an early
-resident's Init function reading bogus values from our autoconfig
-or FastRAM stub.
+the boot runs to ~1.4M retired instructions.
+
+### Open: AllocMem starts allocating from low-mem $20+
+Tracing shows AllocMem returning $20, $38, $50, $68, $80, $98,
+$B0, $C8 — each 24 bytes apart, starting from $20.  $20 is
+vector 8 (privilege violation).  Kickstart's per-resident node
+fill then writes ln_Pri/ln_Name/etc. to those low-mem offsets,
+clobbering Kickstart's own vector table.  Eventually the saved
+A5 frame pointer in the MOVEM-spill area at mem[$3CA] also gets
+overwritten (to $FFFB_0000 and later $FFFF_FFFB), so when the
+InitResident driver's UNLK A5 runs at $F80E58 it pops A5 =
+$FFFFFFFB and the following MOVEM/RTS land in $038F_xxxx garbage.
+
+Root cause likely on our side: chip-RAM memory probe runs in
+Kickstart's early init and uses our `mem[]` (which returns 0 for
+unwritten cells and accepts every write).  The probe seems to be
+reporting a MemHeader whose `mh_Lower` includes the vector
+area.  Possibilities to investigate next: (a) Kickstart's probe
+relies on a write-fails-at-top-of-chip behavior we don't emulate,
+so it computes the wrong free bounds; (b) `mh_Lower` got
+truncated somewhere in our exec init.
+
+Under `+define+KICKSTART_BOOT` the sim now returns $FF for the
+Zorro II autoconfig type byte ($E80000) so Kickstart doesn't
+AddMemList() the phantom 8MB FastRAM card (we don't back the
+assigned region with memory anyway).  Standalone autoconfig
+test still passes because it doesn't define KICKSTART_BOOT.
 
 ### 4. Address-error too strict — FIXED
 The CPU was trapping `.L` accesses on any address with `bits[1:0] !=
