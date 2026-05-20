@@ -374,17 +374,54 @@ checking CIA-A bits — looks like the "insert disk" prompt or a
 keyboard wait.  146M retired in 500M cycles without crashing,
 no DSKLEN write yet.
 
-### Next: simulate disk insertion / keypress
-The polling loop checks D1 against $1B and $AF — looks like
-keyboard scancode tests.  To unstick the boot we need either:
-- A pulse on CIA-A `/DSKCHANGE` (currently held high by the
-  port-input wiring) to signal "new disk inserted", or
-- A simulated keyboard scancode delivered via the CIA-A SP/CNT
-  handshake.
+### Investigation: SERDATR poll loop is in strap.lib, not the keyboard wait
+Tracing the hot loop at $F83B98-$F83BCA + $F83CF0-$F83D22 shows
+this is strap.lib's serial-receive polling, called recursively
+from the priv-vio handler at $F84020+ that fires when the boot
+task hits `MOVE A0, USP` at $F80796 in user mode.
 
-Neither is a sim bug; both are missing stimulus.  After the
-poll exits, Kickstart should reach the trackdisk path and
-finally write DSKLEN.
+The flow:
+1. Cold reset → vector init → exec init → MakeTask("boot")
+2. RTE to boot task at $F800F8 with `SR = $00F8` (user mode)
+3. Boot-task runs in user mode through $F800F8..$F80795
+4. At $F80796 `MOVE A0, USP` triggers a priv-vio trap
+5. Vector 8 handler chains into strap.lib at $F83BF6
+6. Strap.lib's polling enters $F83CF0 + nested calls to
+   $F83B66 / $F83B8E (SERDATR poll + 600K-iter delay)
+7. ...
+
+The polling at $F83CF0 reads SERDATR, checks D1 byte against
+$1B and $AF, and loops indefinitely if neither matches.  Tried:
+- SERDATR low byte = $1B: function exits → caller cold-reboots
+- SERDATR low byte = $AF: same outcome
+- Force-take BEQ at $F83CEC / BNE at $F83D0C: same outcome
+- Run for 2 billion cycles: no DSKLEN, just spinning in poll
+
+The polling appears to be checking for **serial-boot stimulus**
+(a remote-debugger protocol byte) rather than disk insertion.
+Without an actual serial peer feeding it, the loop is bounded
+only by D7 (an outer counter we haven't traced), which appears
+to be very large.
+
+Even when the poll is force-exited, Kickstart's task-switch RTE
+lands on `$0C34_00F8` which the 24-bit address mask resolves to
+chip-RAM `$0034_00F8`.  But that location is empty (we never
+populated it with task code), so execution walks through zeros
+forever.
+
+The real fix needs the *task code itself* to be at
+`$003400F8`.  Real Kickstart's MakeTask populates this region
+during AddTask, but our trace shows no writes to `$003400F8`.
+Either Kickstart's AddTask is being skipped or the address is
+computed differently.  Diagnosis needs:
+- Trace AddTask invocations and their `task_PC` argument
+- Identify which exec.library function builds the trackdisk
+  task struct
+- Verify the chain that feeds it the boot-task entry PC
+
+7 commits worth of CPU/bus fixes have removed every earlier
+crash; the remaining work is Kickstart-side data-flow analysis
+to find where the boot task's entry PC gets set.
 
 ### Open: AllocMem starts allocating from low-mem $20+
 Tracing shows AllocMem returning $20, $38, $50, $68, $80, $98,
