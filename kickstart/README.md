@@ -419,9 +419,23 @@ computed differently.  Diagnosis needs:
   task struct
 - Verify the chain that feeds it the boot-task entry PC
 
-7 commits worth of CPU/bus fixes have removed every earlier
-crash; the remaining work is Kickstart-side data-flow analysis
-to find where the boot task's entry PC gets set.
+**Confirmed AddTask never fires.**  Tracing the JT slot for AddTask
+(`A6 - $11A` = `$4292`) shows zero visits in 50M cycles of boot.
+Kickstart 1.3's first task is created via some other path -- a custom
+exec-init sequence that doesn't go through the standard AddTask LVO.
+The saved task context at `$5D62`-`$5D5E` is built by direct memory
+writes from the $F8146C `MOVE.L (A7)+, -(A5)` loop, populating the
+struct from values already on the supervisor stack.
+
+The value-chain question becomes: which earlier function pushed
+`$0C3400F8` onto the supervisor stack so $F8146C could pop it into
+the task's PC slot?  That's the next thread to pull, requiring
+trace-back through the strap.lib privilege-violation handler chain
+to find the exception-frame source.
+
+8 commits worth of CPU/bus fixes have removed every earlier crash;
+the remaining work is Kickstart-side data-flow analysis to find where
+that specific PC value gets onto the supervisor stack.
 
 ### Open: AllocMem starts allocating from low-mem $20+
 Tracing shows AllocMem returning $20, $38, $50, $68, $80, $98,
