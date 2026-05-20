@@ -866,15 +866,21 @@ module m68k_core #(
     // width and then zero-extended to 32 bits; using 32-bit negation on a
     // zero-extended operand would produce the 32-bit twos-complement value
     // (e.g. -0x0000FFFD = 0xFFFF0003), which corrupts the multiplication.
+    // For word-sized memory operands, the wanted word lives at
+    // dc_rdata[31:16] when dc_addr[1]==0 and dc_rdata[15:0] when
+    // dc_addr[1]==1.  Pre-pick the right half for the MULU/MULS/DIVU/DIVS
+    // mem-source paths (all 16-bit operands).
+    wire [15:0] mem_word_w = dc_addr[1] ? dc_rdata[15:0] : dc_rdata[31:16];
+    wire        mem_word_w_msb = mem_word_w[15];
     wire [15:0] muls_a_abs16  = ex_rb[15]       ? (16'd0 - ex_rb[15:0])       : ex_rb[15:0];
     wire [15:0] muls_b_abs16  = src_operand[15] ? (16'd0 - src_operand[15:0]) : src_operand[15:0];
-    wire [15:0] muls_bm_abs16 = dc_rdata[15]    ? (16'd0 - dc_rdata[15:0])    : dc_rdata[15:0];
+    wire [15:0] muls_bm_abs16 = mem_word_w_msb  ? (16'd0 - mem_word_w)         : mem_word_w;
     wire [31:0] muls_ua32 = {16'd0, muls_a_abs16} * {16'd0, muls_b_abs16};
     wire [31:0] muls_um32 = {16'd0, muls_a_abs16} * {16'd0, muls_bm_abs16};
     wire [31:0] muls_y_signed     =
         (ex_rb[15] ^ src_operand[15]) ? (32'd0 - muls_ua32) : muls_ua32;
     wire [31:0] muls_y_signed_mem =
-        (ex_rb[15] ^ dc_rdata[15])    ? (32'd0 - muls_um32) : muls_um32;
+        (ex_rb[15] ^ mem_word_w_msb)  ? (32'd0 - muls_um32) : muls_um32;
 
     // DIVS 32/16 -> {rem[15:0], quot[15:0]} signed division, computed
     // manually: take absolute values, do unsigned division, then apply sign
@@ -883,9 +889,9 @@ module m68k_core #(
     wire        divs_dividend_neg = ex_rb[31];
     wire [31:0] divs_a_abs = divs_dividend_neg ? (32'd0 - ex_rb) : ex_rb;
     wire        divs_divisor_neg     = src_operand[15];
-    wire        divs_divisor_neg_mem = dc_rdata[15];
+    wire        divs_divisor_neg_mem = mem_word_w_msb;
     wire [31:0] divs_b_abs     = divs_divisor_neg     ? {16'd0, (16'd0 - src_operand[15:0])} : {16'd0, src_operand[15:0]};
-    wire [31:0] divs_b_abs_mem = divs_divisor_neg_mem ? {16'd0, (16'd0 - dc_rdata[15:0])}    : {16'd0, dc_rdata[15:0]};
+    wire [31:0] divs_b_abs_mem = divs_divisor_neg_mem ? {16'd0, (16'd0 - mem_word_w)}        : {16'd0, mem_word_w};
     wire [31:0] divs_uq     = divs_a_abs / divs_b_abs;
     wire [31:0] divs_ur     = divs_a_abs % divs_b_abs;
     wire [31:0] divs_uq_mem = divs_a_abs / divs_b_abs_mem;
@@ -2186,10 +2192,14 @@ module m68k_core #(
                     end
                     K_MOVEA: begin
                         // MOVEA from memory: load source, sign-extend if .W, write to An.
+                        // For .W, the wanted word is at dc_rdata[31:16] when dc_addr[1]==0
+                        // and at dc_rdata[15:0] when dc_addr[1]==1 (big-endian lane).
                         wb_main_we_c   = 1'b1;
                         wb_main_idx_c  = {1'b1, ex_dst_reg};
                         wb_main_data_c = (ex_size == `SZ_W)
-                                         ? {{16{dc_rdata[15]}}, dc_rdata[15:0]}
+                                         ? (dc_addr[1]
+                                            ? {{16{dc_rdata[15]}}, dc_rdata[15:0]}
+                                            : {{16{dc_rdata[31]}}, dc_rdata[31:16]})
                                          : dc_rdata;
                         if (src_an_update) begin
                             wb_aux_we_c   = 1'b1;
@@ -2229,13 +2239,15 @@ module m68k_core #(
                         end
                     end
                     K_MULU, K_MULS: begin
+                        // Word operand from memory: use mem_word_w (the byte/word
+                        // lane at dc_addr[1:0]), not raw dc_rdata[15:0].
                         cc_we_c = 1'b1;
                         wb_main_we_c   = 1'b1;
                         wb_main_idx_c  = ex_reg_idx_full;
                         wb_main_size_c = `SZ_L;
                         if (ex_kind == K_MULU) begin
                             wb_main_data_c = {16'd0, ex_rb[15:0]} *
-                                             {16'd0, dc_rdata[15:0]};
+                                             {16'd0, mem_word_w};
                         end else begin
                             wb_main_data_c = muls_y_signed_mem;
                         end
@@ -2245,7 +2257,8 @@ module m68k_core #(
                         cc_c_c = 1'b0;
                     end
                     K_DIVU, K_DIVS: begin
-                        if (dc_rdata[15:0] == 16'd0) begin
+                        // Word divisor from memory: use mem_word_w.
+                        if (mem_word_w == 16'd0) begin
                             cc_we_c = 1'b1;
                             cc_v_c = 1'b1;
                         end else if (ex_kind == K_DIVU) begin
@@ -2253,8 +2266,8 @@ module m68k_core #(
                             wb_main_we_c   = 1'b1;
                             wb_main_idx_c  = ex_reg_idx_full;
                             wb_main_size_c = `SZ_L;
-                            wb_main_data_c = (((ex_rb % {16'd0, dc_rdata[15:0]}) & 32'h0000FFFF) << 16)
-                                           |  ((ex_rb / {16'd0, dc_rdata[15:0]}) & 32'h0000FFFF);
+                            wb_main_data_c = (((ex_rb % {16'd0, mem_word_w}) & 32'h0000FFFF) << 16)
+                                           |  ((ex_rb / {16'd0, mem_word_w}) & 32'h0000FFFF);
                             cc_n_c = wb_main_data_c[15];
                             cc_z_c = (wb_main_data_c[15:0] == 16'd0);
                             cc_v_c = 1'b0;
@@ -2271,6 +2284,11 @@ module m68k_core #(
                             cc_c_c = 1'b0;
                         end
                     end
+                    // K_CHK with memory source: known limitation -- exc_launch_c
+                    // is only sampled from S_RUN, so launching a CHK trap from
+                    // S_LOAD here would not actually fire the trap state
+                    // machine.  Tracked separately; for now mem-source CHK
+                    // still drops the load result and never traps.
                     default: ;
                 endcase
             end
