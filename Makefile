@@ -38,7 +38,7 @@ N_CORES   ?= 2
 MEM_WORDS ?= 65536
 BUILD     ?= build
 
-.PHONY: all build test test-ovl test-all test-boot-rom test-boot-rom-ext test-blockdev test-floppy test-boot-rom-bin test-fake-kickstart bench clean demo demo-fb demo-os demo-blt demo-cop demo-den demo-pau demo-poly demo-spr demo-morph demo-ham demo-coprainbow demo-showcase demo-hires demo-kickstart demo-fashion fetch-musashi musashi crosscheck fetch-fx68k fx68k crosscheck-fx68k crosscheck-all demos-c demos-c-build cc68k-image fetch-minimig minimig crosscheck-minimig
+.PHONY: all build test test-ovl test-all test-boot-rom test-boot-rom-ext test-blockdev test-floppy test-boot-rom-bin test-fake-kickstart test-kickstart-boot bench clean demo demo-fb demo-os demo-blt demo-cop demo-den demo-pau demo-poly demo-spr demo-morph demo-ham demo-coprainbow demo-showcase demo-hires demo-kickstart demo-fashion fetch-musashi musashi crosscheck fetch-fx68k fx68k crosscheck-fx68k crosscheck-all demos-c demos-c-build cc68k-image fetch-minimig minimig crosscheck-minimig
 
 all: test
 
@@ -438,6 +438,50 @@ test-boot-rom-bin:
 	$(PYTHON) $(TB_DIR)/asm68k.py tests/t63_boot_rom.s build_rom_bin/program.hex
 	@echo "Running $(ROMFILE) for up to $${ROMCYCLES:-100000000} cycles..."
 	@(cd build_rom_bin && ./Vm68k_top $${ROMCYCLES:-100000000}) | tail -40
+
+# ---------------------------------------------------------------------------
+# Kickstart end-to-end boot from a minimal MFM-encoded floppy.
+#
+# Builds a 1024-byte Amiga DOS bootblock (`tools/mkbootblock.py`), wraps
+# track 0 in MFM (`tools/adf2mfm.py`), loads the MFM hex into the bus's
+# disk[] image, and runs the real Kickstart ROM with the disk attached.
+# When strap.lib's trackdisk.device DMAs the boot block in, validates the
+# DOS\0 magic + checksum, and JSRs into the boot code at offset 12, the
+# code writes $CAFEBABE to $00050000 -- the bus catches that and emits
+# `[BOOTBLOCK] Kickstart called our boot code` via $display.
+#
+# Usage: make test-kickstart-boot ROMFILE=kickstart/kick.bin
+# ---------------------------------------------------------------------------
+test-kickstart-boot:
+	@if [ ! -f "$(ROMFILE)" ]; then \
+	    echo "ROMFILE=$(ROMFILE) does not exist."; \
+	    echo "Decrypt a Kickstart .rom and re-run: make test-kickstart-boot ROMFILE=kickstart/kick.bin"; \
+	    exit 1; \
+	fi
+	@mkdir -p build_kick_boot
+	$(PYTHON) tools/bin2rom.py --mem-words $(ROMSIZE_WORDS) $(ROMFILE) build_kick_boot/rom.hex
+	$(PYTHON) tools/mkbootblock.py build_kick_boot/boot.adf
+	$(PYTHON) tools/adf2mfm.py --mem-words 4096 --track 0 \
+	    build_kick_boot/boot.adf build_kick_boot/disk.hex
+	@$(MAKE) --no-print-directory build BUILD=build_kick_boot N_CORES=1 USE_CACHE=1 \
+	    MEM_WORDS=131072 ROM_WORDS=$(ROMSIZE_WORDS) ROM_HEXFILE=rom.hex OVL_RESET=1 \
+	    DISK_WORDS=4096 DISK_HEXFILE=disk.hex \
+	    VERI_DEFS='+define+KICKSTART_BOOT +define+KICKSTART_FAST_BOOT +define+KICKSTART_BOOT_TRACE $(EXTRA_VERI_DEFS)' \
+	    >build_kick_boot/_build.log 2>&1
+	$(PYTHON) $(TB_DIR)/asm68k.py tests/t63_boot_rom.s build_kick_boot/program.hex
+	@echo "Running Kickstart + bootblock disk for up to $${ROMCYCLES:-1500000000} cycles..."
+	@(cd build_kick_boot && ./Vm68k_top $${ROMCYCLES:-1500000000}) > build_kick_boot/run.log 2>&1; \
+	rc=$$?; \
+	if grep -q '\[BOOTBLOCK\]' build_kick_boot/run.log; then \
+	    echo "PASS test-kickstart-boot"; \
+	    grep -E '\[OVL\]|\[DSKLEN\]|\[BOOTBLOCK\]' build_kick_boot/run.log; \
+	    tail -3 build_kick_boot/run.log; \
+	else \
+	    echo "FAIL test-kickstart-boot rc=$$rc (no [BOOTBLOCK] message)"; \
+	    grep -E '\[OVL\]|\[DSKLEN\]' build_kick_boot/run.log | head -20; \
+	    tail -5 build_kick_boot/run.log; \
+	    exit 1; \
+	fi
 
 # ---------------------------------------------------------------------------
 # Block-device DMA test.  Builds with a tiny disk image (tests/disk_test.hex)

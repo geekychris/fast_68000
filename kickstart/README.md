@@ -435,9 +435,35 @@ a long time in our slow Verilator simulation.
 
 Reaching this routine without any BAD-PC, illegal-instruction trap,
 or stack corruption confirms the strap.lib → exec.library →
-display setup path is now sound end-to-end.  Further progress
-requires a real boot device (an MFM trackdisk image) so Kickstart
-exits the prompt loop into bootblock execution.
+display setup path is now sound end-to-end.
+
+### Boot-device infrastructure (in place but not yet exercised)
+`make test-kickstart-boot ROMFILE=kickstart/kick.bin` now wires up
+the full disk pipeline:
+- `tools/mkbootblock.py` builds a 1024-byte Amiga DOS bootblock
+  with valid `DOS\0` magic, additive checksum, and 14 bytes of code
+  that writes `$CAFEBABE` to `$00050000` then RTSes.
+- `tools/adf2mfm.py` MFM-encodes track 0 (~12 KB).
+- The Makefile loads the encoded track into `disk[]` via
+  `DISK_HEXFILE`, builds with `+define+KICKSTART_BOOT_TRACE`, and
+  greps the sim output for a `[BOOTBLOCK]` $display that fires when
+  the magic write lands.
+- `rtl/m68k_top.v` now drives CIA-A `pa_in` bit 2 (`/DSKCHANGE`) low
+  to signal "disk just changed" so trackdisk.device would treat the
+  drive as freshly loaded.
+
+The end-to-end test currently times out because Kickstart still
+spends every reachable cycle in the bitplane-scroll render
+described above; it never reaches the trackdisk-poll path that
+would write `DSKLEN` and trigger our DMA.  Tracing `INTENA` writes
+across 30M cycles shows VERTB IRQ never gets enabled (intena ends
+at `$4004` = master + SOFTINT only), so the prompt loop has no
+mechanism to advance and hand off to trackdisk.
+
+The bootblock and MFM pipeline are correct in isolation and will
+work as soon as Kickstart issues the disk DMA; the open problem is
+making Kickstart's render-init loop terminate (or be safely
+short-circuited) in feasible simulation time.
 
 ### Open: Task's saved PC computed as $0C3400F8 (pre-MOVE-FROM-SR fix)
 With all the above, Kickstart now runs to ~2.4M retired but

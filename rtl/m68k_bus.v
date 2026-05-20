@@ -1294,6 +1294,15 @@ module m68k_bus #(
                 // KICKSTART_BOOT only.
 `endif
             end else if (winner_valid && we[winner]) begin
+`ifdef KICKSTART_BOOT_TRACE
+                // The fake DOS bootblock writes $CAFEBABE to $00050000 to
+                // prove Kickstart's strap.lib actually JSR'd into our boot
+                // code.  Fire a one-shot $display when it lands.
+                if (addr[winner] == 32'h0005_0000 &&
+                    wdata[winner] == 32'hCAFE_BABE && be[winner] == 4'b1111)
+                    $display("[BOOTBLOCK] Kickstart called our boot code: wrote %h to %h",
+                        wdata[winner], addr[winner]);
+`endif
                 // Unaligned .L write (addr[1:0]==10, all four bytes enabled)
                 // straddles two mem[] entries on real 68000 silicon -- two
                 // consecutive word writes, low half to bytes 2..3 of the

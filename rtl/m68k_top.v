@@ -202,11 +202,16 @@ module m68k_top #(
     //   bit 5: /DSKRDY  (active low)     -- 0 (drive ready / spinning)
     //   bit 4: /DSKTRACK0 (active low)   -- 0 (at track 0 cylinder)
     //   bit 3: /DSKWRPRO  (active low)   -- 1 (NOT write-protected -> high)
-    //   bit 2: /DSKCHANGE (active low)   -- 1 (no recent change, disk
-    //                                      present and stable)
+    //   bit 2: /DSKCHANGE (active low)   -- 0 (active = "disk just
+    //                                       changed", which Kickstart
+    //                                       1.3 polls for at boot to
+    //                                       know it should read the
+    //                                       trackdisk; real hw clears
+    //                                       it after the drive steps).
     //   bit 1: /OVL                       -- driven by CIA, not input
     //   bit 0: /LED                       -- driven by CIA, not input
-    // So pa_in = bits 7|6|3|2 = 0xCC.  Bits 5/4 stay 0 to signal ready+T0.
+    // pa_in = bits 7|6|3 = 0xC8.  Bits 5/4 stay 0 (ready + at T0); bit
+    // 2 stays 0 (disk-just-changed) so trackdisk runs.
     cia u_cia_a (
         .clk      (clk),
         .rst_n    (rst_n),
@@ -218,7 +223,7 @@ module m68k_top #(
         .tick     (1'b1),
         .kbd_wr   (cia_a_kbd_wr),
         .kbd_byte (cia_a_kbd_byte),
-        .pa_in    (8'b1100_1100),
+        .pa_in    (8'b1100_1000),
         .pb_in    (8'd0),
         .pa_out   (cia_a_pa_out),
         .pa_oe    (cia_a_pa_oe),
