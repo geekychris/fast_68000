@@ -465,6 +465,47 @@ work as soon as Kickstart issues the disk DMA; the open problem is
 making Kickstart's render-init loop terminate (or be safely
 short-circuited) in feasible simulation time.
 
+### Why the render loop never terminates: AllocMem collision
+
+Tracing the `SUBQ.W #1, $8(A7)` outer counter at `$F86F92` shows
+the same write each iteration:
+```
+[CtrR] r=2414917 addr=00005d60 rdata=00000000
+[CtrW] r=2414917 addr=00005d60 wdata=ffff0000 be=c
+[CtrR] r=3331464 addr=00005d60 rdata=00000000    <- reset to 0!
+[CtrW] r=3331464 addr=00005d60 wdata=ffff0000 be=c
+```
+The decrement writes back `$FFFF` correctly, but the **next** read
+sees `$0000` again — the loop's own destination writes via
+`MOVE.L (A6), (A0)+ / (A1)+ / ... / (A4)+` clobber the counter
+each inner iteration.  A bus-level watch on `$5D60` shows multiple
+`wdata=00000000 be=f` between every `wdata=ffff0000 be=c`.
+
+The root cause is the open "AllocMem starts allocating from
+low-mem $20+" item: with the memory probe miscomputing free
+bounds, the buffers handed to this routine point INTO the
+supervisor stack frame instead of high free RAM.  On real Amiga
+A500 with a working probe, those buffers land in chip RAM well
+above `$5D60` and never touch the counter.
+
+`tests/t106_subqw_d16an.s` rules out a CPU `SUBQ.W d16(An)` bug —
+the operation itself works perfectly; the corruption is purely
+from the AllocMem mis-allocation upstream.
+
+### Next: fix the memory probe / AllocMem mh_Lower
+Kickstart's chip-RAM probe writes patterns at increasing addresses
+and reads them back to detect the upper bound.  Our bus's
+`KICKSTART_BOOT` guard drops writes past `MEM_WORDS<<2` and returns
+0 on reads, which the probe should treat as "RAM ends here".  But
+the resulting MemList apparently has `mh_Lower = $20` (rather than
+a high free address), so AllocMem hands out the bottom of memory.
+Fixing this likely unblocks the entire downstream path through
+trackdisk to the bootblock JSR.  Increasing `MEM_WORDS` from 512 KB
+(131072) to 2 MB (524288) doesn't change the symptom, so the
+probe isn't simply measuring memory size — there is a structural
+issue in how Kickstart builds the MemHeader from the probe results
+in our environment.
+
 ### Open: Task's saved PC computed as $0C3400F8 (pre-MOVE-FROM-SR fix)
 With all the above, Kickstart now runs to ~2.4M retired but
 the first task switch's RTE pops PC = $0C3400F8 — a slow-RAM
