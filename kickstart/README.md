@@ -505,20 +505,35 @@ on a fresh boot.
 The actual render-loop counter corruption at `$5D60` comes from
 `MOVE.L (A6), (A0)+ / (A1)+ / (A2)+ / (A3)+ / (A4)+` where one of
 `A0`..`A4` happens to point into the supervisor stack frame.
-Where do `A0`..`A4` come from?  The JT-dispatcher at `$F81168`
-calls `$F86EEE` with those registers pre-set — tracing back the
-caller's pointer-load sequence (likely from an exec.library
-struct populated during init) should find the field that should
-hold a high free-RAM address but instead holds something in the
-`$5DXX` range.
+
+A first-iteration trace of each dest's `dc_addr` reveals:
+```
+[F86Fdest] pc=00f86f1e addr=0000415c   ← A0 = $415C  (low chip RAM)
+[F86Fdest] pc=00f86f20 addr=00fbca8a   ← A1 = $FBCA8A (in ROM, writes dropped)
+[F86Fdest] pc=00f86f22 addr=00004154   ← A2 = $4154  (low chip RAM)
+[F86Fdest] pc=00f86f24 addr=00004154   ← A3 = $4154  (alias of A2!)
+[F86Fdest] pc=00f86f26 addr=00000005   ← A4 = $5     (vector 1 area!)
+```
+A0/A2/A3 all advance by 4 per iter and walk from `$4154`..`$415C`
+upward through chip RAM, hitting `$5D60` around iter 7180.  A4
+starts at `$5` (mid-vector-1) and writes unaligned bytes 4..7,
+8..11, 12..15... — straight into the exception vector table.
+
+So the root cause is concrete: one or more of these pointers
+should land in HIGH free chip RAM but instead point at low system
+structures.  The JT-dispatcher at `$F81168` calls into `$F86EEE`
+with `A0..A4` already loaded; tracing back the caller's
+pointer-load chain (likely `MOVE.L $xx(A6), Ax` from exec.library
+struct fields) should find which struct field is set to `$415C` /
+`$4154` / `$5` instead of high free-RAM addresses.  That field
+in turn is probably populated by some earlier init step that
+miscomputes a buffer base — possibly the same memory probe that
+the older README note flagged.
 
 Trying `MEM_WORDS` of 256 KB / 512 KB / 1 MB / 2 MB all leaves the
 boot stuck in the same render loop with the same `$5D60`
-collision — so the issue isn't RAM size or where the probe finds
-the upper bound, it's structurally one of those `A0..A4` pointers
-pointing at the stack.  This needs a Kickstart ROM disassembly +
-trace back from the `$F81168` JT to find which exec.library struct
-field is set to `$5DXX` instead of a high free-RAM address.
+collision — so this isn't RAM size; it's the structural
+pointer-source chain that needs Kickstart-side reverse engineering.
 
 ### Open: Task's saved PC computed as $0C3400F8 (pre-MOVE-FROM-SR fix)
 With all the above, Kickstart now runs to ~2.4M retired but
