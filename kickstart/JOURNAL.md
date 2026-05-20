@@ -169,3 +169,65 @@ Kickstart's intentional Alert hang at `$F807F4`.  All 91
 regression tests pass.  Next: identify what fails before the
 Alert -- likely a missing exec / graphics check, or a memory
 init step that doesn't satisfy Kickstart's expectations.
+
+### S5: Alert at $F807F4 -- it's the "no boot" tail, not a crash
+
+Goal: figure out what causes the yellow-Guru Alert hang.
+
+- Disassembled `$F80700..$F807F4` with `tools/disasm68k.py`.  The
+  routine is exec's task-bringup tail:
+  - `AllocEntry` to allocate the boot-task memory list.
+  - On AllocEntry failure: `Alert($80018001 = AT_DeadEnd |
+    AG_NoMemory | AO_ExecLib)`.  In our run AllocEntry succeeds
+    (BPL skips the alert), so this isn't where we hit.
+  - Build the boot task: `MOVE A0, USP` at $F80796 (this is the
+    same instruction that earlier tripped the priv-vio chain in
+    the old, broken render loop), task field setup, NewList for
+    the task's MemList, AddHead to attach it, RemTask /
+    state=`TS_READY`, RemHead, Permit, check CoolCapture, then
+    `InitCode(1, 0)` -- run all RTF_COLDSTART residents.
+  - After InitCode returns, set `COLOR00 = $0F0F` (yellow Guru
+    background) and `BRA $F807F4` -- the intentional "I'm done,
+    no boot found" hang.
+
+- LVO map confirmed via the `JSR $FFxx(A6)` displacements:
+  `$FFB8 = -72 = InitCode`, `$FF94 = -108 = Alert`, `$FF76 = -138
+  = Permit`, `$FEE6 = -282 = RemTask`, `$FF22 = -222 = AllocEntry`.
+  Earlier guesses elsewhere were wrong; LVO -72 is **InitCode**
+  (not WaitTOF/Alert).
+
+- The boot reaches the Alert tail because InitCode returns
+  without anyone JSR'ing into a bootblock.  No `[DSKLEN]` writes
+  fire across 100M cycles.  So whichever resident in the
+  RTF_COLDSTART chain is supposed to drive trackdisk either
+  isn't reached, or its init returns early without scheduling
+  a disk read.
+
+- INTENA across the whole run: master + SOFTINT only (`$4004`).
+  VERTB IRQ is **never** enabled by Kickstart in this path
+  (there's even one explicit `INTREQ CLR $7FFF` at boot that
+  clears a queued VERTB).  Hypothesis: the boot expects a
+  task-switch via VERTB to hand off to trackdisk, but the IRQ
+  isn't enabled until trackdisk.device itself initializes -- and
+  trackdisk's init isn't running.
+
+- Tested by gating an `+define+KICKSTART_FORCE_VERTB` hack into
+  the Paula INTENA write path (forces bit 5 set whenever INTENA
+  master is touched).  Result: with VERTB IRQs firing,
+  the vector dispatch immediately jumps to chip RAM addresses
+  ($1B, $23, ...), because the vector table at vector 25 / 27
+  (autovector for level 3 = VERTB) hasn't been populated by
+  Kickstart yet at the time we force-fire it.  Confirmed VERTB
+  isn't the right knob here -- the boot really does need
+  trackdisk's RT_INIT to run.
+
+- Reverted the FORCE_VERTB hack; only the journal notes remain.
+
+Status: 91/91 regression tests still pass.  Next concrete step:
+trace what InitCode iterates -- which residents it visits in
+order, and whether trackdisk's resident is in the list.  If it
+is, why does its init return without writing DSKLEN?  If it
+isn't, our InitResident scan missed it (probably a cache /
+unaligned-read issue in the scan).  The earlier README confirmed
+trackdisk WAS found by InitResident before; the question is
+whether that's still true in the post-Scc-fix execution path.
