@@ -1745,12 +1745,25 @@ module m68k_core #(
                         end
                     end
                     K_SCC: begin
-                        // Scc <ea>.B: write 0xFF if cond true, else 0x00. We support Dn dest.
+                        // Scc <ea>.B: write 0xFF if cond true, else 0x00.
+                        // Destination is any data-alterable EA — Dn or
+                        // memory.  Memory dst (e.g. ST $1F(A2)) was
+                        // previously a silent no-op which broke Kickstart
+                        // 1.3's library-create fail-flag pattern at
+                        // $F8086A (ST $1F(A2)).
                         if (ex_src_mode == `EA_DREG) begin
                             wb_main_we_c   = 1'b1;
                             wb_main_idx_c  = {1'b0, ex_src_reg};
                             wb_main_size_c = `SZ_B;
                             wb_main_data_c = {24'd0, {8{cond_true(ex_cc)}}};
+                        end else if (src_needs_mem) begin
+                            // .B store of the cond-result to memory.
+                            want_mem  = 1'b1;
+                            want_we   = 1'b1;
+                            want_addr = src_ea;
+                            want_be   = be_for_byte(src_ea[1:0]);
+                            want_wdata = byte_into_word(
+                                {8{cond_true(ex_cc)}}, src_ea[1:0]);
                         end
                     end
                     K_TRAP: begin
@@ -2242,6 +2255,15 @@ module m68k_core #(
                             wb_aux_we_c   = 1'b1;
                             wb_aux_idx_c  = {1'b1, ex_dst_reg};
                             wb_aux_data_c = dst_an_next;
+                        end
+                    end
+                    K_SCC: begin
+                        // Scc to memory: commit predec/postinc An on src
+                        // (the Scc EA is src_mode in our decoder).
+                        if (src_an_update) begin
+                            wb_aux_we_c   = 1'b1;
+                            wb_aux_idx_c  = {1'b1, ex_src_reg};
+                            wb_aux_data_c = src_an_next;
                         end
                     end
                     K_MOVE: begin
