@@ -110,7 +110,15 @@ module m68k_cache #(
     // Locked reads (TAS phase 0) always go to the bus so the arbiter sees
     // the lock and serialises against other cores.  I/O reads are also
     // forced to the bus so device-register changes are visible.
-    wire comb_read_hit = (state == S_IDLE) && cpu_req && !cpu_we && !cpu_lock && !is_io && hit;
+    // Unaligned .L reads (cpu_is_long && cpu_addr[1:0]==10) must also go
+    // to the bus -- a hit here would return the aligned longword at
+    // (cpu_addr & ~3) rather than the spliced {low half, next high half}
+    // the unaligned access needs.  Without this guard an RTE PC pop that
+    // landed at SP[1:0]==10 (every RTE after the .W SR pop) could pull a
+    // stale cached longword and redirect to garbage.
+    wire is_unaligned_long = cpu_is_long && (cpu_addr[1:0] == 2'b10);
+    wire comb_read_hit = (state == S_IDLE) && cpu_req && !cpu_we && !cpu_lock &&
+                         !is_io && !is_unaligned_long && hit;
 
     // Combinational response while we're holding the BUS_WAIT state and the
     // bus has just returned. The state machine transitions back to S_IDLE on
@@ -191,10 +199,15 @@ module m68k_cache #(
                         saved_idx <= idx;
                         saved_tag <= tag_in;
                         state <= S_BUS_WAIT;
-                    end else if (cpu_req && !cpu_we && (!hit || cpu_lock || is_io)) begin
-                        // Miss, locked read, or I/O read.  I/O reads always
-                        // go to the bus and never fill the cache so that the
-                        // CPU sees current device-register state.
+                    end else if (cpu_req && !cpu_we && (!hit || cpu_lock || is_io || is_unaligned_long)) begin
+                        // Miss, locked read, I/O read, or unaligned .L read.
+                        // I/O reads always go to the bus and never fill the
+                        // cache so the CPU sees current device-register state.
+                        // Unaligned .L reads need the bus's split-assembly
+                        // and the spliced result must NOT be cached -- it
+                        // doesn't correspond to any aligned mem[] longword,
+                        // so caching it would corrupt the next read at the
+                        // same aligned index.
                         bus_req_r <= 1'b1;
                         bus_we  <= 1'b0;
                         bus_lock <= cpu_lock;
@@ -204,9 +217,8 @@ module m68k_cache #(
                         saved_we <= 1'b0;
                         saved_idx <= idx;
                         saved_tag <= tag_in;
-                        // Suppress fill for I/O reads by remembering it was
-                        // an I/O access; bypass storing the result on resp.
-                        saved_io <= is_io;
+                        // Suppress fill for I/O reads and unaligned .L reads.
+                        saved_io <= is_io || is_unaligned_long;
                         state <= S_BUS_WAIT;
                     end
                 end

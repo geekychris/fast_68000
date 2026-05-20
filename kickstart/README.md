@@ -308,6 +308,57 @@ BAD-PC: RTS at $F80BE6 pops `$0B0C_00F8` from the supervisor
 stack at $FFE0 — i.e. the saved return address is still
 corrupt.  Next thing to chase.
 
+### 12. D-cache returned aligned longword for unaligned .L reads — FIXED
+The cache stores aligned 32-bit longwords indexed by
+`addr[9:2]`.  Its hit check ignored `addr[1:0]`, so an unaligned
+.L read (`addr[1:0]==10`) of a previously-cached line returned
+the aligned longword at `(addr & ~3)` — the wrong four bytes.
+The bus's read-side unaligned-.L assembly path
+(`{mem[idx][15:0], mem[idx+1][31:16]}`) was never invoked for
+cache hits.
+
+Kickstart 1.3 trips this on its first task switch.  The
+supervisor stack at $FFE8 gets cached during normal access.
+The task setup pushes PC.L unaligned at $FFEA and SR.W aligned
+at $FFE8, leaving `mem[$3FFA]` = `$00F8_00F8` (SR high half ||
+PC high half).  When `RTE` later pops PC.L from $FFEA, the
+cache hits and returns the *aligned* longword $00F800F8
+instead of the spliced PC.  RTE redirects to garbage.
+
+The same bug also bites the cached fill: if a miss brought in
+an unaligned .L's spliced result and stored it as the aligned
+line, the next read at the aligned index would see corrupted
+data.
+
+Fix in `rtl/m68k_cache.v`:
+- `comb_read_hit` now gates on `!is_unaligned_long` (where
+  `is_unaligned_long = cpu_is_long && cpu_addr[1:0]==10`), so
+  unaligned .L hits force a bus access.
+- The miss-issue path also sets `saved_io <= is_io ||
+  is_unaligned_long` so the spliced bus response is *not*
+  cached (it doesn't correspond to any aligned mem line).
+
+Regression: `tests/t103_cache_unaligned_l.s` primes the cache
+with an aligned read, writes an unaligned .L, and verifies
+both aligned and unaligned reads return the right bytes.
+
+### Open: Task's saved PC computed as $0C3400F8
+With all the above, Kickstart now runs to ~2.4M retired but
+the first task switch's RTE pops PC = $0C3400F8 — a slow-RAM
+address with no backing memory.  The task setup wrote this
+value to the task struct's saved-PC slot at $5D5E.  Some
+earlier read returned $0C3400F8 (after the cache fix it's the
+correctly-spliced unaligned value; before it returned the
+aligned half-corrupted $00F80C34), but in either case the PC
+is a slow-RAM pointer.
+
+Likely upstream cause: Kickstart's memory probe found "memory"
+at $0C00_0000+ via some path we haven't blocked yet (the new
+range check covers main-RAM reads and writes, but maybe the
+probe still concludes memory exists via chipset/ROM behavior).
+That's the next thing to chase — find where Kickstart decides
+$0C00_0000 is valid RAM.
+
 ### Open: AllocMem starts allocating from low-mem $20+
 Tracing shows AllocMem returning $20, $38, $50, $68, $80, $98,
 $B0, $C8 — each 24 bytes apart, starting from $20.  $20 is
