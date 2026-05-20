@@ -31,12 +31,16 @@ RTL_SRCS := $(RTL_DIR)/m68k_alu.v \
 
 # Tests in the default `make test` suite.  t61_ovl needs a special build
 # (OVL_RESET=1 + a tiny ROM); it has its own `test-ovl` target.
-TESTS  := $(filter-out $(TESTS_DIR)/t61_ovl.s $(TESTS_DIR)/t63_boot_rom.s $(TESTS_DIR)/t65_blockdev.s $(TESTS_DIR)/t66_boot_rom_ext.s $(TESTS_DIR)/t68_floppy_dsklen.s $(TESTS_DIR)/t69_fake_kickstart.s,$(wildcard $(TESTS_DIR)/*.s))
-BENCHES:= $(wildcard $(BENCH_DIR)/*.s)
-
-N_CORES   ?= 2
+N_CORES   ?= 1
 MEM_WORDS ?= 65536
 BUILD     ?= build
+
+TESTS  := $(filter-out $(TESTS_DIR)/t61_ovl.s $(TESTS_DIR)/t63_boot_rom.s $(TESTS_DIR)/t65_blockdev.s $(TESTS_DIR)/t66_boot_rom_ext.s $(TESTS_DIR)/t68_floppy_dsklen.s $(TESTS_DIR)/t69_fake_kickstart.s,$(wildcard $(TESTS_DIR)/*.s))
+# Multicore tests (t06_multicore, t07_coherence) need N_CORES >= 2.
+ifeq ($(N_CORES),1)
+TESTS := $(filter-out $(TESTS_DIR)/t06_multicore.s $(TESTS_DIR)/t07_coherence.s,$(TESTS))
+endif
+BENCHES:= $(wildcard $(BENCH_DIR)/*.s)
 
 .PHONY: all build test test-ovl test-all test-boot-rom test-boot-rom-ext test-blockdev test-floppy test-boot-rom-bin test-fake-kickstart test-kickstart-boot bench clean demo demo-fb demo-os demo-blt demo-cop demo-den demo-pau demo-poly demo-spr demo-morph demo-ham demo-coprainbow demo-showcase demo-hires demo-kickstart demo-fashion fetch-musashi musashi crosscheck fetch-fx68k fx68k crosscheck-fx68k crosscheck-all demos-c demos-c-build cc68k-image fetch-minimig minimig crosscheck-minimig
 
