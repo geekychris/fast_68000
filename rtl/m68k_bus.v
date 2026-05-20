@@ -240,6 +240,13 @@ module m68k_bus #(
     reg [31:0] blk_cur_off; // current disk word offset
     reg [31:0] blk_cur_dst; // current dest byte addr
     reg        blk_busy_last;
+    // When the DSKLEN-DMA path triggers it, blk_count_in_bytes is set to
+    // dsk_len_words << 1 and the byte-mode termination check below
+    // uses (blk_dst + blk_count_in_bytes) instead of (blk_dst + blk_cnt*512).
+    // Lets us serve trackdisk's per-word DMA length verbatim rather than
+    // re-quantizing to sectors.
+    reg        blk_byte_mode;
+    reg [31:0] blk_count_in_bytes;
     // One-cycle pulse on the busy 1->0 transition (DMA completion).
     assign dskblk_pulse_o = blk_busy_last && !blk_busy;
 
@@ -334,7 +341,11 @@ module m68k_bus #(
     localparam [31:0] POT1DAT_ADDR = 32'h00DF_F014;   // pot 1 sample
     localparam [31:0] JOY0DAT_ADDR = 32'h00DF_F00A;
     localparam [31:0] JOY1DAT_ADDR = 32'h00DF_F00C;
-    localparam [15:0] SERDATR_VAL  = 16'h6000;        // TSRE | TBE
+    // SERDATR: TSRE | TBE (idle TX) + low byte $7F to satisfy Kickstart
+    // 3.1's post-init self-test poll at $F84048 (reads SERDATR low byte
+    // and waits for $7F via DBEQ; on timeout it BRA-s to the cold-reboot
+    // path).  $7F looks like a "self-test PASS" magic value.
+    localparam [15:0] SERDATR_VAL  = 16'h607F;
     localparam [15:0] POTGOR_VAL   = 16'hFFFF;
     localparam [15:0] POT_DAT_VAL  = 16'h0000;
     localparam [15:0] JOY_DAT_VAL  = 16'h0000;
@@ -990,6 +1001,8 @@ module m68k_bus #(
             blk_busy_last <= 1'b0;
             blk_cur_off <= 32'd0;
             blk_cur_dst <= 32'd0;
+            blk_byte_mode <= 1'b0;
+            blk_count_in_bytes <= 32'd0;
             dsk_pt    <= 32'd0;
             dsk_len   <= 16'd0;
             autoconfig_shutup  <= 1'b0;
@@ -1107,8 +1120,10 @@ module m68k_bus #(
             // bypass the bus arbiter entirely (this is a "ghost" master that
             // writes mem[] directly, simulating an off-CPU controller).
             if (blk_busy) begin
-                if (blk_cur_dst >= blk_dst + (blk_cnt << 9)) begin
+                if ((blk_byte_mode && blk_cur_dst >= blk_dst + blk_count_in_bytes) ||
+                    (!blk_byte_mode && blk_cur_dst >= blk_dst + (blk_cnt << 9))) begin
                     blk_busy <= 1'b0;
+                    blk_byte_mode <= 1'b0;
                 end else begin
                     mem[blk_cur_dst[AIDX_BITS+1:2]] <= disk[blk_cur_off[DISK_IDX_BITS+1:2]];
                     blk_cur_off <= blk_cur_off + 32'd4;
@@ -1143,21 +1158,28 @@ module m68k_bus #(
                 end else if (addr[winner] == DSKPTL_ADDR) begin
                     dsk_pt[15:0]  <= wdata[winner][15:0];
                 end else if (addr[winner] == DSKLEN_ADDR) begin
+`ifdef KICKSTART_BOOT_TRACE
+                    $display("[DSKLEN] wdata=%h dsk_pt=%h", wdata[winner], dsk_pt);
+`endif
                     // Word write at $24 — value in high half of 32-bit
                     // word (since $24 is long-aligned, addr[1]=0).
                     dsk_len <= wdata[winner][31:16];
                     // DMAEN bit 15: start transfer.  Re-use block-DMA
-                    // engine: source = blk_src*512, dest = dsk_pt,
-                    // count = (dsk_len & $3FFF) words = dsk_len*2 bytes.
+                    // engine in byte-mode: source = current track*track_mfm,
+                    // dest = dsk_pt, count = (dsk_len & $3FFF) words << 1
+                    // bytes.
                     if (wdata[winner][31] && !blk_busy) begin
                         blk_busy    <= 1'b1;
-                        blk_cur_off <= blk_src << 9;          // sector*512
+                        blk_byte_mode <= 1'b1;
+                        // Source: a "current track" register that tracks
+                        // CIA-B PRB step pulses.  POC: just start at 0
+                        // (always read track 0) so the boot block lands.
+                        blk_cur_off <= 32'd0;
                         blk_cur_dst <= dsk_pt;
-                        // Use dsk_len (in words) as the transfer length
-                        // in bytes/4 longs.  Set blk_cnt such that
-                        // blk_dst + (blk_cnt << 9) = dsk_pt + dsk_len*2:
                         blk_dst     <= dsk_pt;
-                        blk_cnt     <= {16'd0, wdata[winner][29:16]} >> 8;
+                        // dsk_len[14:0] holds the word count; the upper
+                        // bit is DMAEN.  Shift by 1 to get bytes.
+                        blk_count_in_bytes <= {17'd0, wdata[winner][29:16]} << 1;
                     end
                 end
             end else if (winner_valid && we[winner] && is_blk_reg) begin
@@ -1436,14 +1458,19 @@ module m68k_bus #(
                            : (granted_blk_sel_q == 2'd1) ? blk_dst
                            : (granted_blk_sel_q == 2'd2) ? blk_cnt
                            : {31'd0, blk_busy};
-    wire [31:0] agnus_resp_w = (granted_agnus_sel_q == 2'd2)
-                                  // VHPOSR: {V[7:0], H[7:0]} in low 16
-                                  ? {16'd0, agnus_v[7:0], agnus_h[7:0]}
-                              : (granted_agnus_sel_q == 2'd1)
-                                  // VPOSR: bit 0 of high byte = V[8]
-                                  ? {16'd0, 7'd0, agnus_v[8], 8'd0}
-                                  // DMACONR
-                                  : {16'd0, dmacon};
+    // 16-bit chipset reads land in either the high or low half of the
+    // 32-bit bus word depending on the access address — long-aligned
+    // accesses with addr[1]=0 expect the value in [31:16]; odd-word
+    // accesses (addr[1]=1) expect it in [15:0].  The CPU's MOVE.W
+    // extraction takes the appropriate half based on dc_addr[1], so
+    // place the 16-bit value accordingly.
+    wire [15:0] agnus_val_w  = (granted_agnus_sel_q == 2'd2)
+                                   ? {agnus_v[7:0], agnus_h[7:0]}  // VHPOSR $DFF006 (addr[1]=1)
+                             : (granted_agnus_sel_q == 2'd1)
+                                   ? {7'd0, agnus_v[8], 8'd0}      // VPOSR  $DFF004 (addr[1]=0)
+                                   : dmacon;                       // DMACONR $DFF002 (addr[1]=1)
+    wire [31:0] agnus_resp_w = granted_addr_q[1] ? {16'd0, agnus_val_w}
+                                                 : {agnus_val_w, 16'd0};
 
     // Autoconfig read response.  Before shutup, byte $00 returns the
     // type byte in the high lane; everything else returns 0.  After
@@ -1477,7 +1504,9 @@ module m68k_bus #(
                        :                                     bpl_fetches )
                    : granted_is_shadow_q    ? {granted_shadow_hi_q, granted_shadow_lo_q}
                    : granted_is_agnus_q     ? agnus_resp_w
-                   : granted_is_paula_ro_q  ? {16'd0, granted_paula_ro_val_q}
+                   : granted_is_paula_ro_q  ?
+                       (granted_addr_q[1] ? {16'd0, granted_paula_ro_val_q}
+                                          : {granted_paula_ro_val_q, 16'd0})
                    : granted_is_disk_q      ? granted_disk_data_q
                    : granted_is_blk_q       ? blk_resp_w
                    : granted_is_blt_q       ? granted_blt_rdata_q

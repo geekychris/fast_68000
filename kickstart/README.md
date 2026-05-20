@@ -151,6 +151,38 @@ The bus already has the MFM DMA stub; the missing piece is a
 real Workbench-style MFM image generator (or fake DOS\0 short
 boot stub) loaded via `DISK_HEXFILE`.
 
+### 7. 16-bit chipset reads landed in the wrong half — FIXED
+Every chipset MOVE.W `<reg>`, Dn comes through the 32-bit bus as
+a long-aligned read.  The CPU's MOVE.W extraction picks
+`dc_rdata[31:16]` when the access addr[1] is 0 and `[15:0]` when
+it is 1 (the long-aligned bus access straddles two words and the
+.W lands in whichever half the address selects).  Earlier the bus
+put every 16-bit chipset value (SERDATR, POTGOR, ADKCONR, VPOSR,
+the JOY/POTxDAT pairs, DMACONR, VHPOSR) in the low half of the
+response unconditionally.  Registers at odd-word offsets
+(POTGOR/POTxDAT/JOY0DAT/VHPOSR/DMACONR) accidentally worked
+because addr[1] was 1; registers at even-word offsets (SERDATR
+$DFF018, ADKCONR $DFF010, JOY1DAT $DFF00C, VPOSR $DFF004) read as
+$0000 because the CPU took the high half.
+
+Fix in `rtl/m68k_bus.v`: condition both `agnus_resp_w` and the
+`granted_is_paula_ro_q` resp on `granted_addr_q[1]` so the value
+lands in `[31:16]` when addr[1]=0 and `[15:0]` when addr[1]=1.
+Regression: `tests/t100_chip_word_half.s` does MOVE.W $DFF018
+(addr[1]=0) and MOVE.W $DFF016 (addr[1]=1) and checks both halves.
+
+With this fix, Kickstart's SERDATR self-test at `$F84048`
+(`AND.B #$7F, D0 ; CMP.B #$7F, D0 ; DBLS / BEQ`) actually sees
+$7F (when SERDATR_VAL = $607F) and takes the BEQ to $F83BF6
+(strap.lib continuation) instead of falling through to the
+direct cold-reboot path at $F80452.  Strap.lib now runs through
+$F83C78 onward but eventually hits Alert($0100000F =
+AN_MemoryInsane) at $F81DB8 — Kickstart's `FreeMem` walked the
+MemList looking for the MemHeader that owns the freed pointer
+and reached the terminator without a match, i.e. wild pointer
+into the free-list.  That's the next sim-side bug to chase
+before disk boot becomes reachable.
+
 ### 4. Address-error too strict — FIXED
 The CPU was trapping `.L` accesses on any address with `bits[1:0] !=
 00`.  Real 68000 only traps when bit 0 is 1 (odd byte); even-but-not-

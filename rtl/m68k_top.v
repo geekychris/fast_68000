@@ -196,6 +196,17 @@ module m68k_top #(
 
     // CIA-A and CIA-B.  Tick every bus cycle for now (10x real Amiga rate)
     // -- when we split into chip-clock vs CPU-clock domains we'll gate this.
+    // CIA-A PRA inputs reflect floppy "disk present, ready, at track 0":
+    //   bit 7: /FIRE  (joy/mouse button) -- not pressed -> 1
+    //   bit 6: /SEL2  (extra select)     -- 1 (unused)
+    //   bit 5: /DSKRDY  (active low)     -- 0 (drive ready / spinning)
+    //   bit 4: /DSKTRACK0 (active low)   -- 0 (at track 0 cylinder)
+    //   bit 3: /DSKWRPRO  (active low)   -- 1 (NOT write-protected -> high)
+    //   bit 2: /DSKCHANGE (active low)   -- 1 (no recent change, disk
+    //                                      present and stable)
+    //   bit 1: /OVL                       -- driven by CIA, not input
+    //   bit 0: /LED                       -- driven by CIA, not input
+    // So pa_in = bits 7|6|3|2 = 0xCC.  Bits 5/4 stay 0 to signal ready+T0.
     cia u_cia_a (
         .clk      (clk),
         .rst_n    (rst_n),
@@ -207,7 +218,7 @@ module m68k_top #(
         .tick     (1'b1),
         .kbd_wr   (cia_a_kbd_wr),
         .kbd_byte (cia_a_kbd_byte),
-        .pa_in    (8'd0),
+        .pa_in    (8'b1100_1100),
         .pb_in    (8'd0),
         .pa_out   (cia_a_pa_out),
         .pa_oe    (cia_a_pa_oe),
