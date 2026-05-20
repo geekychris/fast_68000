@@ -222,6 +222,47 @@ gameport, keyboard at $F800B2/$F841DE/$F84CBE/$FA8C72/$FB9EFE/
 $FBC6E6/$FC2486/$FC9A96), AllocMem returns valid pointers, and
 the boot runs to ~1.4M retired instructions.
 
+### 9. MOVEM didn't set dc_is_long; unaligned .L reads broke — FIXED
+The MOVEM-step issue path in `rtl/m68k_core.v` set `dc_req_r`,
+`dc_we`, `dc_addr`, `dc_be` but forgot to drive `dc_is_long`.
+The bus's unaligned-.L read assembly (`{mem[idx][15:0],
+mem[idx+1][31:16]}` when `addr[1:0] == 2'b10`) only fires when
+`granted_is_long_q` is set, so MOVEM-loads from a stack whose
+top was word-aligned-but-not-mod-4 returned `mem[idx]` verbatim
+— the wrong half — and pulled garbage into the restored
+registers.
+
+In Kickstart 1.3's InitResident driver at `$F80E48`:
+
+```
+LINK A5, #-$0E          ; A5 = $3E4, SP = $3D6  (SP[1:0] = 10)
+...
+MOVEM.L D2/A5, -(SP)    ; saves A5 = $3E4 to mem[$3CA]
+... scan body ...
+MOVEM.L (SP)+, D2/A5    ; should restore A5 = $3E4
+```
+
+The save wrote `$3E4` to `mem[$3CA]` correctly via the bus's
+existing unaligned-.L *write* path.  The restore, lacking
+`dc_is_long`, read `mem[$F2]` directly (`mem[$F2] = mem[$3C8] |
+mem[$3C9] | mem[$3CA] | mem[$3CB]`) and pulled the *high* word
+of the longword starting four bytes earlier — i.e. the *D2*
+slot.  A5 ended up as garbage like `$FFFB0000` / `$FFFFFFFB`,
+and the eventual `UNLK A5` at `$F80E58` tried to read
+`mem[$FFFFFFFB]` (odd address) and triggered an address-error
+trap with PC garbage.
+
+Fix in `rtl/m68k_core.v`: assign `dc_is_long <= (ex_size ==
+SZ_L)` inside the MOVEM-step issue path.  Regression:
+`tests/t102_movem_unaligned_l.s` does the LINK A5,#-$0E + 4-reg
+MOVEM round-trip on an unaligned stack and verifies every
+register's value round-trips intact.
+
+With this fix Kickstart's InitResident scan completes cleanly,
+the driver's UNLK A5 lands on the proper saved A5, and boot
+runs to ~42M retired instructions before hitting a new failure
+(BAD-PC from JT slot `$00004024` to `$038F_0305`).
+
 ### Open: AllocMem starts allocating from low-mem $20+
 Tracing shows AllocMem returning $20, $38, $50, $68, $80, $98,
 $B0, $C8 — each 24 bytes apart, starting from $20.  $20 is

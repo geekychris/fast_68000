@@ -2687,6 +2687,16 @@ module m68k_core #(
                             dc_lock  <= 1'b0;
                             dc_addr  <= movem_step_addr;
                             dc_be    <= 4'b1111;
+                            // MOVEM.L is a long-aligned transfer in size but
+                            // the SP at entry can be word-aligned-not-mod-4
+                            // (e.g. after the InitResident driver's LINK A5,
+                            // #-$0E leaves SP at $3D6 and the inner -(SP)
+                            // pushes hit $3CA/$3C6).  We need dc_is_long set
+                            // so the bus's unaligned-.L assembly path fires
+                            // on the read response; otherwise MOVEM-load
+                            // reads return mem[idx] verbatim (= the wrong
+                            // half) and registers get restored to garbage.
+                            dc_is_long <= (ex_size == `SZ_L);
                             // For store, the wdata comes from regfile ra
                             // (overridden to movem_curr_reg_full).
                             if (movem_dir == 1'b0) dc_wdata <= rf_ra_data;
