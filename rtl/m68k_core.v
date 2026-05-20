@@ -493,7 +493,7 @@ module m68k_core #(
             K_MULU, K_MULS, K_DIVU, K_DIVS,
             K_BIT, K_SHIFT, K_EXG, K_CHK,
             K_ADDX, K_SUBX:                      id_rb_idx = id_reg_idx_full;
-            K_MOVE, K_MOVEA:                     id_rb_idx = id_dst_base_idx;
+            K_MOVE, K_MOVEA, K_MOVESR:           id_rb_idx = id_dst_base_idx;
             K_ALUI:                              id_rb_idx = {idec_dst_mode != `EA_DREG, idec_dst_reg};
             K_DBCC:                              id_rb_idx = {1'b0, idec_src_reg};
             default:                             id_rb_idx = 4'd0;
@@ -1781,12 +1781,24 @@ module m68k_core #(
                         // direction 0: read SR into Dn (or memory dst). 1: write SR.
                         if (ex_direction == 1'b0) begin
                             // MOVE from SR (non-priv in 68000; treat as such).
-                            // Support Dn destination only.
+                            // Dest is any data-alterable EA — Dn or memory.
                             if (ex_dst_mode == `EA_DREG) begin
                                 wb_main_we_c   = 1'b1;
                                 wb_main_idx_c  = {1'b0, ex_dst_reg};
                                 wb_main_size_c = `SZ_W;
                                 wb_main_data_c = {16'd0, sr_now};
+                            end else if (dst_is_mem) begin
+                                // .W store of SR to memory. Slot the 16-bit
+                                // value into the right half of the bus word
+                                // and pick the corresponding byte enables.
+                                // dst_an_update (for predec/postinc) is
+                                // committed in S_STORE, matching the K_MOVE
+                                // pattern.
+                                want_mem  = 1'b1;
+                                want_we   = 1'b1;
+                                want_addr = dst_ea;
+                                want_be   = be_for_word(dst_ea[1]);
+                                want_wdata = word_into_word(sr_now, dst_ea[1]);
                             end
                         end else begin
                             // MOVE to SR (privileged).
@@ -2195,6 +2207,14 @@ module m68k_core #(
             end
             S_STORE: begin
                 case (ex_kind)
+                    K_MOVESR: begin
+                        // MOVE-FROM-SR to memory: commit predec/postinc An.
+                        if (dst_an_update) begin
+                            wb_aux_we_c   = 1'b1;
+                            wb_aux_idx_c  = {1'b1, ex_dst_reg};
+                            wb_aux_data_c = dst_an_next;
+                        end
+                    end
                     K_MOVE: begin
                         cc_we_c = 1'b1;
                         cc_n_c = src_operand[31];
@@ -2377,6 +2397,11 @@ module m68k_core #(
 `ifdef KICKSTART_BOOT_PC_TRACE
             if (is_settled && ex_kind != K_STOP)
                 $display("[PC] r=%d pc=%h kind=%d", retired, ex_pc, ex_kind);
+`endif
+`ifdef KICKSTART_BOOT_TRACE
+            if (ex_kind == K_STOP && is_settled)
+                $display("[STOP] r=%d pc=%h imm=%h",
+                    retired, ex_pc, ex_src_imm32[15:0]);
 `endif
 
             if (is_settled && cc_we_c) begin

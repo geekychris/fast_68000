@@ -342,7 +342,64 @@ Regression: `tests/t103_cache_unaligned_l.s` primes the cache
 with an aligned read, writes an unaligned .L, and verifies
 both aligned and unaligned reads return the right bytes.
 
-### Open: Task's saved PC computed as $0C3400F8
+### 14. MOVE-FROM-SR to memory was a silent no-op — FIXED
+Our `K_MOVESR` direction=0 (MOVE-FROM-SR) handler only emitted a
+write-back when `dst_mode == EA_DREG`.  Memory destinations (-(An),
+(An)+, (An), d16(An), etc.) just dropped on the floor: no memory write,
+no An update.  On real 68000 these are valid data-alterable EAs.
+
+Two bugs, both in `rtl/m68k_core.v`:
+a) `id_rb_idx`'s case statement defaulted K_MOVESR's `id_rb_idx` to
+   `4'd0` (= D0).  For MOVE.W SR, -(An) the EX stage needs ex_rb = An
+   so the predec computes `An - 2`.  With the default, dst_ea was
+   computed from D0 and the write landed in random low memory.  Fix:
+   include K_MOVESR in the K_MOVE/K_MOVEA case so `id_rb_idx =
+   id_dst_base_idx`.
+b) The K_MOVESR `direction == 0` handler had no `else if (dst_is_mem)`
+   branch.  Added one that sets `want_mem/want_we/want_addr/want_be/
+   want_wdata` exactly like K_MOVE's .W store, with `dst_an_update`
+   committed in the S_STORE case (matching K_MOVE's pattern).
+
+Kickstart 1.3 hits this in strap.lib's transition-to-supervisor
+sequence:
+```
+ORI.W #$2000, SR     ; supervisor (or trap to vec 8 if user)
+PEA   <ret>           ; push synthetic PC
+MOVE  SR, -(A7)       ; push synthetic SR
+JMP   (A5)            ; dispatch
+```
+With `MOVE SR, -(A7)` a no-op, A7 didn't decrement past PEA's push,
+so subsequent supervisor code (Switch / scheduler) read the synthetic
+RTE frame from the wrong offset.  The first task switch's RTE popped
+PC = $0C3400F8 (high half of the PEA'd $00F80C34 spliced with the high
+half of the next pushed return $00F827C2) and crashed.
+
+Regression: `tests/t104_movefromsr_mem.s` snapshots SR into Dn then
+into memory via -(An) and (An)+, verifies both stores match and the
+An updates.
+
+### Open: Switch's MOVEM with unaligned SSP clobbers user-stack BSR
+With the MOVE-FROM-SR fix the boot reaches the next genuine layout
+issue.  Vector 8 (priv-vio) is `$F80BF4` -- the same routine the
+supervisor-mode native path runs, just reached via trap.  The trap
+entry pushes 6 bytes from SSP = $10000, leaving SSP = $FFFA (not
+long-aligned -- normal 68000 behavior for a 6-byte short frame from
+an aligned SSP).  Once the path joins Switch ($F813E6),
+`MOVEM.L D0/D1/A0/A1/A5/A6, -(A7)` with A7 = $FFFA pushes long words
+at $FFF6, $FFF2, $FFEE, ... -- unaligned splits that span memory the
+user-mode BSR at $F827BE earlier wrote ($FFF4 = $F827C2 return).
+MOVEM stomps bytes $FFF4..$FFF7, so the eventual RTS at $F80C34 pops
+$27C60000 and crashes.
+
+The root cause is that our boot configuration leaves the boot task's
+USP and the system SSP overlapping in the same high-chip-RAM region
+(both pointing near $10000), so user-stack data and supervisor-stack
+data fight over the same physical memory.  Real Kickstart allocates
+the boot task's user stack out of a different memory region from the
+system stack.  Next step: trace where the boot task's USP and SSP
+get initialized and confirm they should land at different addresses.
+
+### Open: Task's saved PC computed as $0C3400F8 (pre-MOVE-FROM-SR fix)
 With all the above, Kickstart now runs to ~2.4M retired but
 the first task switch's RTE pops PC = $0C3400F8 — a slow-RAM
 address with no backing memory.  The task setup wrote this
