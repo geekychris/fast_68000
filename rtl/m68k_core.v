@@ -1794,6 +1794,21 @@ module m68k_core #(
                         exc_vector_c   = 8'd`VEC_ILLEGAL;
                         exc_saved_pc_c = ex_pc;
                     end
+                    K_BAD: begin
+                        // Unknown opcode -- treat as a 68000 ILLEGAL.
+                        // A-line ($A___) and F-line ($F___) get their own
+                        // vectors (Kickstart uses these as CPU-feature
+                        // probes; without the trap the boot mis-detects
+                        // us as 68030+ and takes higher-CPU paths).
+                        exc_launch_c   = 1'b1;
+                        exc_saved_pc_c = ex_pc;
+                        if (ex_opcode[15:12] == 4'hA)
+                            exc_vector_c = 8'd`VEC_LINEA;
+                        else if (ex_opcode[15:12] == 4'hF)
+                            exc_vector_c = 8'd`VEC_LINEF;
+                        else
+                            exc_vector_c = 8'd`VEC_ILLEGAL;
+                    end
                     K_MOVEUSP: begin
                         // Privileged. ex_direction: 0 = An→USP, 1 = USP→An.
                         if (!sr_s) begin
@@ -2454,7 +2469,6 @@ module m68k_core #(
                 $display("[STOP] r=%d pc=%h imm=%h",
                     retired, ex_pc, ex_src_imm32[15:0]);
 `endif
-
             if (is_settled && cc_we_c) begin
                 cc_n <= cc_n_c; cc_z <= cc_z_c; cc_v <= cc_v_c; cc_c <= cc_c_c;
             end

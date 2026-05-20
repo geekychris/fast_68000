@@ -362,6 +362,12 @@ module m68k_decoder (
                 src_ext_words = ea_ext(m3, r0, `SZ_L);
             end
 
+            // ILLEGAL ($4AFC) lives inside the TAS encoding slot
+            // (mode 7 / reg 4 = #immediate, which is not a valid TAS
+            // destination on real 68000).  Match it BEFORE the TAS
+            // pattern below so $4AFC dispatches to K_ILLEGAL rather
+            // than K_TAS.
+            16'b0100_1010_1111_1100: kind = K_ILLEGAL;
             // TAS / TST  (0100_1010_xx_mm_rrr)
             16'b0100_1010_11_??_????: begin
                 kind = K_TAS;
@@ -478,8 +484,7 @@ module m68k_decoder (
                 alu_op = `ALU_PASSB;
             end
 
-            // ILLEGAL: 0100_1010_1111_1100
-            16'b0100_1010_1111_1100: kind = K_ILLEGAL;
+            // (ILLEGAL handled earlier, before TAS pattern.)
 
             // ----------------------------------------------------------
             // 0101_*: ADDQ / SUBQ / Scc / DBcc
