@@ -378,26 +378,44 @@ Regression: `tests/t104_movefromsr_mem.s` snapshots SR into Dn then
 into memory via -(An) and (An)+, verifies both stores match and the
 An updates.
 
-### Open: Switch's MOVEM with unaligned SSP clobbers user-stack BSR
-With the MOVE-FROM-SR fix the boot reaches the next genuine layout
-issue.  Vector 8 (priv-vio) is `$F80BF4` -- the same routine the
-supervisor-mode native path runs, just reached via trap.  The trap
-entry pushes 6 bytes from SSP = $10000, leaving SSP = $FFFA (not
-long-aligned -- normal 68000 behavior for a 6-byte short frame from
-an aligned SSP).  Once the path joins Switch ($F813E6),
-`MOVEM.L D0/D1/A0/A1/A5/A6, -(A7)` with A7 = $FFFA pushes long words
-at $FFF6, $FFF2, $FFEE, ... -- unaligned splits that span memory the
-user-mode BSR at $F827BE earlier wrote ($FFF4 = $F827C2 return).
-MOVEM stomps bytes $FFF4..$FFF7, so the eventual RTS at $F80C34 pops
-$27C60000 and crashes.
+### 15. SR-write transition to user mode didn't swap A7 — FIXED
+On real 68000, A7 is a dual-register pair: SSP when S=1, USP when
+S=0.  Whenever S toggles, A7's visible value must swap between
+SSP and the stashed USP (`usp_shadow` in our impl).
 
-The root cause is that our boot configuration leaves the boot task's
-USP and the system SSP overlapping in the same high-chip-RAM region
-(both pointing near $10000), so user-stack data and supervisor-stack
-data fight over the same physical memory.  Real Kickstart allocates
-the boot task's user stack out of a different memory region from the
-system stack.  Next step: trace where the boot task's USP and SSP
-get initialized and confirm they should land at different addresses.
+Our impl handled the swap on `RTE` cleanly (line 2884), but the
+"direct" supervisor→user transitions via SR writes
+(`ANDI/ORI/EORI #imm, SR`, `MOVE.W src, SR`) only saved the current
+A7 (=SSP) into `usp_shadow` and never loaded the prior USP back
+into A7 — A7 silently kept the supervisor pointer.  A comment at
+the swap site flagged this as deferred ("use RTE for clean U/S
+transitions").
+
+Kickstart 1.3 hits this directly at `$F807CE`: `ANDI.W #$0000, SR`
+drops the running supervisor code into user mode.  Without the
+swap, A7 stayed at SSP = $10000.  User code then pushed BSR
+returns and locals onto what was actually the supervisor stack,
+silently corrupting whatever the supervisor code stashed there.
+The first priv-vio trap from this "user" mode pushed its frame on
+top, and Switch's MOVEM-save then overlapped with the BSR push
+two frames up.  The eventual RTS popped garbage and crashed.
+
+Fix in `rtl/m68k_core.v`: in the combinational planning block for
+both `K_ALUI` to SR and `K_MOVESR` direction=1, when the new
+`sr_data_c[`SR_S]` is 0 and current `sr_s` is 1, drive
+`wb_aux_we_c=1 / wb_aux_idx_c=15 / wb_aux_data_c=usp_shadow` so the
+regfile commits A7 := old USP at the same settle.  The existing
+sequential block still saves the outgoing A7 (=SSP) into
+`usp_shadow`.
+
+Regression: `tests/t105_sr_user_swap.s` sets USP, clears S via ANDI
+to SR, verifies A7 swapped, pushes a sentinel onto the user stack,
+confirms the supervisor-stack sentinel is untouched, then takes a
+TRAP back to supervisor and re-verifies A7.
+
+With this fix Kickstart's boot reaches ~17M+ retired instructions
+in 100M cycles with no BAD-PC.  Likely now stuck in a SERDATR /
+disk-insert poll loop (as documented in section 13).
 
 ### Open: Task's saved PC computed as $0C3400F8 (pre-MOVE-FROM-SR fix)
 With all the above, Kickstart now runs to ~2.4M retired but

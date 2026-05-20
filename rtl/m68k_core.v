@@ -1366,6 +1366,15 @@ module m68k_core #(
                                         `ALU_EOR: sr_data_c = sr_now ^ ex_src_imm32[15:0];
                                         default:  sr_data_c = sr_now;
                                     endcase
+                                    // If S is being cleared (supervisor→user
+                                    // mode), swap A7 with usp_shadow.  Without
+                                    // this A7 keeps the supervisor stack
+                                    // pointer and user-mode pushes clobber it.
+                                    if (sr_data_c[`SR_S] == 1'b0 && sr_s) begin
+                                        wb_aux_we_c   = 1'b1;
+                                        wb_aux_idx_c  = 4'd15;
+                                        wb_aux_data_c = usp_shadow;
+                                    end
                                 end
                             end
                         end else if (alui_mem) begin
@@ -1813,6 +1822,13 @@ module m68k_core #(
                                 // is the EA contents; for memory sources we'd
                                 // need a load.
                                 sr_data_c = src_operand[15:0];
+                                // S being cleared: swap A7 with usp_shadow
+                                // (same fix as ANDI/ORI/EORI to SR).
+                                if (sr_data_c[`SR_S] == 1'b0 && sr_s) begin
+                                    wb_aux_we_c   = 1'b1;
+                                    wb_aux_idx_c  = 4'd15;
+                                    wb_aux_data_c = usp_shadow;
+                                end
                             end
                         end
                     end
