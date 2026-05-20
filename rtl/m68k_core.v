@@ -537,7 +537,18 @@ module m68k_core #(
     // current MOVEM register during store-MOVEM transfers.
     wire movem_active;
     wire [3:0] movem_curr_reg_full;
-    wire [3:0] rf_ra_idx_eff = movem_active ? movem_curr_reg_full : id_ra_idx;
+    // While MOVEM is mid-flight the ra port is borrowed to feed register
+    // values to the memory writes (predec / postinc / fixed (An) store
+    // mode).  But on the cycle MOVEM retires (is_settled_after_movem=1)
+    // the ID→EX boundary advances and ex_ra <= id_ra_fwd latches, so the
+    // mux must already be returning the *next* instruction's src reg on
+    // that cycle — otherwise ex_ra captures the last MOVEM reg's value
+    // and any immediately-following Dn-source instruction (MOVE.L D0,D3,
+    // ADD.L D0,D1, ...) silently reads the wrong operand.  Hand the port
+    // back as soon as the final MOVEM transfer is in.
+    wire [3:0] rf_ra_idx_eff = (movem_active && !is_settled_after_movem)
+                                   ? movem_curr_reg_full
+                                   : id_ra_idx;
 
     m68k_regfile u_rf (
         .clk      (clk),

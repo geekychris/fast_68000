@@ -175,13 +175,56 @@ With this fix, Kickstart's SERDATR self-test at `$F84048`
 (`AND.B #$7F, D0 ; CMP.B #$7F, D0 ; DBLS / BEQ`) actually sees
 $7F (when SERDATR_VAL = $607F) and takes the BEQ to $F83BF6
 (strap.lib continuation) instead of falling through to the
-direct cold-reboot path at $F80452.  Strap.lib now runs through
-$F83C78 onward but eventually hits Alert($0100000F =
-AN_MemoryInsane) at $F81DB8 — Kickstart's `FreeMem` walked the
-MemList looking for the MemHeader that owns the freed pointer
-and reached the terminator without a match, i.e. wild pointer
-into the free-list.  That's the next sim-side bug to chase
-before disk boot becomes reachable.
+direct cold-reboot path at $F80452.
+
+### 8. MOVEM ra-port poisoned the next instruction — FIXED
+The CPU has only three regfile read ports; the `ra` port is
+shared between the ID stage's source-register read and MOVEM's
+"current register being pushed" value (the data the bus needs
+when MOVEM is doing a register-to-memory write).  The mux
+`rf_ra_idx_eff = movem_active ? movem_curr_reg_full : id_ra_idx`
+left the MOVEM-current register selected on the cycle MOVEM
+retired — which is exactly when the ID→EX boundary advances and
+the next instruction's `ex_ra` latches.  So any instruction
+immediately after MOVEM whose source was a register *not in the
+MOVEM mask* silently captured one of the just-pushed MOVEM
+registers' value instead.
+
+The failure mode in Kickstart 1.3:
+
+```
+MOVEM.L D2/D3, -(SP)          ; inner MOVEM in AllocMem at $F81ECE
+MOVE.L  D0, D3                 ; should set D3 = AllocMem size arg
+```
+
+`ex_ra` for the MOVE captured the just-saved D3 value (= 0)
+rather than D0 (= 18).  AllocMem's inner function tested
+`MOVE.L D0,D3 ; BEQ` (treating D3 as the size argument), saw
+zero, took the zero-size early-return path, and returned with D0
+unchanged.  The caller then stored D0 (=18, the requested size)
+as the "allocated pointer".  Later `FreeMem(18, 18)` walked the
+MemList looking for a MemHeader owning address 18, fell off the
+end, and `Alert($0100000F = AN_MemoryInsane)`.
+
+Fix in `rtl/m68k_core.v`: change the mux to
+`movem_active && !is_settled_after_movem` so the ra port hands
+back to `id_ra_idx` on the retirement cycle.  Reads are
+combinational in the regfile, so the latch on the next clock
+edge captures the correct source register value.
+
+Regression: `tests/t101_movem_ra_hazard.s` reproduces the
+exact MOVEM+MOVE pattern from AllocMem and verifies the
+following MOVE reads its operand correctly.
+
+With this fix Kickstart's InitResident finds all 8 ROM-resident
+modules (exec, expansion, ramlib, audio, console, trackdisk,
+gameport, keyboard at $F800B2/$F841DE/$F84CBE/$FA8C72/$FB9EFE/
+$FBC6E6/$FC2486/$FC9A96), AllocMem returns valid pointers, and
+the boot runs to ~1.4M retired instructions before jumping into
+an apparent garbage region around `$038F_Axxx` (= Z2 FastRAM
+area).  That's the next thing to chase — probably an early
+resident's Init function reading bogus values from our autoconfig
+or FastRAM stub.
 
 ### 4. Address-error too strict — FIXED
 The CPU was trapping `.L` accesses on any address with `bits[1:0] !=
