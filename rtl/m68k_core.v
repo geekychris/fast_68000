@@ -2078,9 +2078,21 @@ module m68k_core #(
                         end
                     end
                     K_ALU: begin
+                        // dc_rdata is the 32-bit aligned read; the ALU operand
+                        // must be the size-appropriate field positioned at the
+                        // requested address.  For byte/word reads at odd byte
+                        // or odd word offsets, the wanted lane is not in
+                        // dc_rdata[7:0] / dc_rdata[15:0].  (Bug surfaced as
+                        // CMP.B (d16,An),Dn computing the wrong N flag for any
+                        // byte at offset 1 within a longword.)
                         alu_op_c = ex_alu_op;
                         alu_a = ex_rb;
-                        alu_b = dc_rdata;
+                        case (ex_size)
+                            `SZ_B: alu_b = {24'd0, byte_at(dc_rdata, dc_addr[1:0])};
+                            `SZ_W: alu_b = {16'd0, dc_addr[1] ? dc_rdata[15:0]
+                                                              : dc_rdata[31:16]};
+                            default: alu_b = dc_rdata;
+                        endcase
                         cc_we_c = 1'b1;
                         cc_n_c = alu_n; cc_z_c = alu_z; cc_v_c = alu_v; cc_c_c = alu_c;
                         if (ex_alu_op != `ALU_CMP) begin
@@ -2468,6 +2480,8 @@ module m68k_core #(
             if (ex_kind == K_STOP && is_settled)
                 $display("[STOP] r=%d pc=%h imm=%h",
                     retired, ex_pc, ex_src_imm32[15:0]);
+            if (is_settled && exc_launch_c)
+                $display("[EXC] r=%d pc=%h vec=%d kind=%d", retired, ex_pc, exc_vector_c, ex_kind);
 `endif
             if (is_settled && cc_we_c) begin
                 cc_n <= cc_n_c; cc_z <= cc_z_c; cc_v <= cc_v_c; cc_c <= cc_c_c;
