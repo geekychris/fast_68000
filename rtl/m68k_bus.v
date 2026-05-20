@@ -146,7 +146,18 @@ module m68k_bus #(
     // are invalidated when low memory switches to RAM.
     output wire                           ovl_clear_pulse_o
 );
-    localparam [31:0] IRQ_REG_ADDR  = 32'hFFFF_FFFC;
+`ifdef KICKSTART_BOOT
+    // Under Kickstart the address-bus mask in `unflat` drops bits 24..31,
+    // so $FFFF_FFFC (the test-bench IRQ register slot) folds to
+    // $00FF_FFFC which is inside the Kickstart ROM window.  Move it to
+    // the empty autoconfig slot at $00E9_FFFC which Kickstart never reads.
+    localparam [31:0] IRQ_REG_ADDR  = 32'h00E9_FFFC;
+`else
+    // Test-bench IRQ register.  $FFFC.W sign-extends to $FFFF_FFFC inside
+    // the CPU; the 24-bit mask folds that to $00FF_FFFC, so compare
+    // against the masked form.
+    localparam [31:0] IRQ_REG_ADDR  = 32'h00FF_FFFC;
+`endif
     localparam [31:0] BLT_BASE      = 32'h00FE_0000;
     localparam [31:0] BLT_END       = 32'h00FE_003F;
     localparam [31:0] COP_BASE      = 32'h00FE_0040;
@@ -504,7 +515,14 @@ module m68k_bus #(
     genvar g;
     generate
         for (g = 0; g < N_PORTS; g = g + 1) begin : unflat
-            assign addr[g]    = addr_flat[32*g +: 32];
+            // Real 68000 has a 24-bit external address bus -- bits 24..31
+            // of any 32-bit register are not driven at the pins.  Kickstart
+            // 1.3 stores pointers with non-zero top bytes (e.g. flag bits
+            // packed into the high byte of an APtr) and assumes
+            // $0C34_xxxx resolves to chip-RAM $0034_xxxx.  Mask here so
+            // the bus, every decoder, and the cache-fed bus_addr all see
+            // the same 24-bit-wrapped address.
+            assign addr[g]    = {8'd0, addr_flat[32*g +: 24]};
             assign wdata[g]   = wdata_flat[32*g +: 32];
             assign be[g]      = be_flat[4*g +: 4];
             assign is_long[g] = is_long_flat[g];

@@ -346,18 +346,45 @@ both aligned and unaligned reads return the right bytes.
 With all the above, Kickstart now runs to ~2.4M retired but
 the first task switch's RTE pops PC = $0C3400F8 — a slow-RAM
 address with no backing memory.  The task setup wrote this
-value to the task struct's saved-PC slot at $5D5E.  Some
-earlier read returned $0C3400F8 (after the cache fix it's the
-correctly-spliced unaligned value; before it returned the
-aligned half-corrupted $00F80C34), but in either case the PC
-is a slow-RAM pointer.
+value to the task struct's saved-PC slot at $5D5E.
 
-Likely upstream cause: Kickstart's memory probe found "memory"
-at $0C00_0000+ via some path we haven't blocked yet (the new
-range check covers main-RAM reads and writes, but maybe the
-probe still concludes memory exists via chipset/ROM behavior).
-That's the next thing to chase — find where Kickstart decides
-$0C00_0000 is valid RAM.
+### 13. Real 68000 has a 24-bit external address bus — FIXED
+Kickstart 1.3 stores APtrs with non-zero top bytes (flag bits
+packed into bits 24..31) and assumes the bus ignores them, so
+$0C34_xxxx and $0034_xxxx resolve to the same physical chip-RAM
+longword.  Our bus passed the full 32-bit address through to
+every decoder, which (combined with the read-side range check)
+turned every "flagged" APtr into a garbage read of 0.
+
+Fix in `rtl/m68k_bus.v`: at the unflatten step, mask each port's
+incoming address to 24 bits (`addr[g] = {8'd0, addr_flat[32*g
++: 24]}`) before the bus's chipset / ROM / CIA / memory decoders
+see it.  Required moving `IRQ_REG_ADDR` from $FFFF_FFFC (which
+folds onto the last ROM longword and broke the ROM checksum) to
+$00E9_FFFC (an empty autoconfig slot under KICKSTART_BOOT) and
+to $00FF_FFFC (the masked form of $FFFF_FFFC) for tests, so
+`t15_irq` still works with `$FFFC.W` (sign-extends to
+$FFFFFFFC, masked to $00FFFFFC).
+
+With the mask, the RTE that earlier landed in `$0C34_00F8`
+garbage now lands in chip-RAM `$0034_00F8` where the first task's
+code actually lives.  Boot runs through strap.lib and into a
+long polling loop at $F83B8E-$F83D0C reading SERDATR and
+checking CIA-A bits — looks like the "insert disk" prompt or a
+keyboard wait.  146M retired in 500M cycles without crashing,
+no DSKLEN write yet.
+
+### Next: simulate disk insertion / keypress
+The polling loop checks D1 against $1B and $AF — looks like
+keyboard scancode tests.  To unstick the boot we need either:
+- A pulse on CIA-A `/DSKCHANGE` (currently held high by the
+  port-input wiring) to signal "new disk inserted", or
+- A simulated keyboard scancode delivered via the CIA-A SP/CNT
+  handshake.
+
+Neither is a sim bug; both are missing stimulus.  After the
+poll exits, Kickstart should reach the trackdisk path and
+finally write DSKLEN.
 
 ### Open: AllocMem starts allocating from low-mem $20+
 Tracing shows AllocMem returning $20, $38, $50, $68, $80, $98,
