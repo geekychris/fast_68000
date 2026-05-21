@@ -651,3 +651,85 @@ Status: 93/93 tests pass (added t112_alu_mem_dst).  Boot
 progresses past the prior wall but doesn't reach [BOOTBLOCK]
 yet; need a fresh trace to see the new state at the reset
 boundary.
+
+### S11: post-K_ALU boot wall is K_BAD at chip-RAM $6382 / opcode $4D14
+
+Goal: find where the boot is looping at retired=88M post K_ALU
+mem-dst fix.
+
+- Periodic PC sampler (every 4M instr): all samples land in
+  `$F83Bxx` / `$F83Dxx`, SP oscillating between `$FF7A` and
+  `$FF76`.  Two-byte stack delta = tight inner loop.
+
+- Disassembled the cluster.  `$F83CF0..$F83D00` is the Alert()
+  serial poll: send `D7` (alert code) out via SERDATR, read
+  reply, retry 9x.  `$F83BCC` / `$F83B8E` are the serial
+  send/receive helpers.  Kickstart 1.3 has a "ROMWACK" debug
+  monitor that polls the modem serial port during Alert -- this
+  is it.
+
+- Hooked PC=`$F83CEA` (alert inner entry): `D7 = $53414421`
+  ("SAD!").  That's not the original alert code; it's the magic
+  the Alert handler stuffs in D7 for its serial protocol.
+
+- Found a debug bug: the existing `[EXC] r=` trace was gated
+  `is_settled && exc_launch_c`, but `exc_launch_c` *gates*
+  `run_launches_exc` which disables `is_settled_in_run`.  The
+  two signals are mutually exclusive, so [EXC] never fired
+  during the entire S7-S10 investigation.  Fixed in `a3cf0e5`
+  to use `ex_state == S_RUN && ex_valid && !halted &&
+  exc_launch_c`; also dump `ex_opcode`.
+
+- With the corrected trace, the boot fires **4 exceptions**:
+    ```
+    [EXC] r=    435874 pc=00f80c5e opcode=4e7b kind=K_BAD  vec= 4 (ILLEGAL)
+    [EXC] r=   1537276 pc=00f80be8 opcode=007c kind=K_ALUI vec= 8 (PRIV_VIO)
+    [EXC] r=   1546964 pc=00f81742 opcode=241f kind=K_MOVE vec=27 (auto-IRQ 3)
+    [EXC] r=   1546982 pc=00006382 opcode=4d14 kind=K_BAD  vec= 4 (ILLEGAL)
+    ```
+  1. `$4E7B` MOVEC -- expected, the CPU-feature probe.
+  2. `$007C` (ORI #imm,SR) from user mode -- expected.
+  3. Auto-IRQ level 3 -- a fired IRQ from chipset.
+  4. **`$4D14` at chip-RAM `$00006382`** -- the wall.  Our K_BAD
+     trap fires correctly, ILLEGAL vector handler runs, Alert()
+     is called with `$80000008` ("AN_BogusExcpt") in D7.
+
+- `$4D14` decoded:
+    ```
+    0100_1101_0001_0100
+    bits[15:12] = 0100 (MISC/IMM group)
+    bits[11:9]  = 110 (Dn=6 / dst An=A6 / ...)
+    bits[8:6]   = 100 (NOT a 68000 valid size for $4xxx series)
+    bits[5:3]   = 010 (mode 2 = (An))
+    bits[2:0]   = 100 (A4)
+    ```
+  On 68000, `$4xxx` with bits[8:6]=110 is CHK.W, with bits[8:6]=
+  111 is LEA.  bits[8:6]=100 is **invalid on 68000**; on 68020+
+  it's CHK.L.  So either:
+    a. The code at `$6382` is genuinely garbage / data being
+       executed as code (wrong jump).
+    b. There's a real 68000 instruction at `$4D14` we should
+       support but don't decode.
+  (b) is unlikely -- the official Motorola docs list `$4D14` as
+  not valid on 68000.  (a) means the boot took a bad jump to
+  `$6378`, then ran into garbage at `$6382`.
+
+- Lead-up redirect trace:
+    ```
+    r=1546923: $F8C1AA  -> $00005074 (K_JSR)     -- JSR via JT
+    r=1546924: $00005074 -> $F81708 (K_JMP)      -- JT slot's JMP
+    ...
+    r=1546979: $F81282  -> $00006378 (K_JMP)     -- JMP (A5) into chip RAM
+    r=1546982: $00006382 -> $F80AFC (K_BAD trap) -- crash
+    ```
+  At `$F81282: JMP (A5)`.  A5 was loaded at `$F81276` from
+  `$0090(A6)` (ExecBase + $90).  Whatever that slot points to
+  is wrong -- it ended up at `$00006378` which has 5 valid
+  instructions then garbage at byte 10.
+
+Status: 93/93 tests pass.  Boot wall is now `K_BAD` at chip-RAM
+`$6382` with opcode `$4D14`.  The boot took an indirect JMP via
+`A5 = $0090(A6)` into chip-RAM code that becomes invalid after
+~10 bytes.  Next: figure out what `$0090(A6)` was supposed to
+hold -- it's some exec-private function table.  Probably a
+library JT slot that wasn't set up correctly.
