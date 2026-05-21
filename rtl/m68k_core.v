@@ -526,7 +526,10 @@ module m68k_core #(
         ((idec_dst_mode == `EA_IDX) && (idec_dst_ext_words != 2'd0)) ||
         ((idec_dst_mode == `EA_EXT) && (idec_dst_reg == `EA7_PCIDX) &&
          (idec_dst_ext_words != 2'd0));
-    wire [15:0] id_src_ext0 = id_ext[0];
+    // For MOVEM with EA_IDX, the first extension word is the register mask
+    // and the brief extension lives at id_ext[1].  All other instructions
+    // place the brief extension as the first (or only) ext word.
+    wire [15:0] id_src_ext0 = (idec_kind == K_MOVEM) ? id_ext[1] : id_ext[0];
     wire [15:0] id_dst_ext0 = id_ext[idec_src_ext_words];
     wire [3:0]  id_src_xreg = {id_src_ext0[15], id_src_ext0[14:12]};
     wire [3:0]  id_dst_xreg = {id_dst_ext0[15], id_dst_ext0[14:12]};
@@ -2667,15 +2670,28 @@ module m68k_core #(
                         // decrements).  For d16(An), add the sign-extended
                         // displacement (which lives at ex_src_imm32[15:0]
                         // because the mask sits in the high half).  For
-                        // (An)/(An)+, just An.  Other modes (IDX/abs/PC-rel)
-                        // fall through to ex_ra; they're rare for MOVEM and
-                        // not exercised by Kickstart 1.3 boot.
+                        // (An)/(An)+, just An.  For d8(An,Xn), add the brief
+                        // extension's index (ex_sp routed via the IDX mux)
+                        // and 8-bit displacement -- Kickstart 1.3's exec
+                        // init uses MOVEM.L D1/A1, $54(A6, D3.W) at $F817C0
+                        // to initialise IntVects[3,5,4,13,15], and without
+                        // this case the EA collapses to A6 + 0 so
+                        // IntVects[3] never gets its chain head pointer,
+                        // and cia.resource's AddIntServer later crashes the
+                        // boot at chip-RAM $4190.  Abs.W/Abs.L and PC-rel
+                        // MOVEM aren't exercised by Kickstart and are left
+                        // falling through to ex_ra (a known limitation).
                         case (ex_src_mode)
                             `EA_ADEC:
                                 movem_addr <= ex_ra;
                             `EA_DISP:
                                 movem_addr <= ex_ra +
                                     {{16{ex_src_imm32[15]}}, ex_src_imm32[15:0]};
+                            `EA_IDX:
+                                movem_addr <= ex_ra
+                                    + (ex_src_imm32[11] ? ex_sp
+                                        : {{16{ex_sp[15]}}, ex_sp[15:0]})
+                                    + {{24{ex_src_imm32[7]}}, ex_src_imm32[7:0]};
                             default:
                                 movem_addr <= ex_ra;
                         endcase
