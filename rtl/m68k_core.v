@@ -2636,25 +2636,49 @@ module m68k_core #(
                         dc_be    <= 4'b1111;
                         ex_state <= S_EXC_PUSH_PC;
                     end else if (ex_valid && !halted && (ex_kind == K_MOVEM)) begin
-                        // MOVEM: capture mask + initial address. We only
-                        // support .L MOVEM with predec/(An)/postinc EA modes.
+                        // MOVEM: capture mask + initial address.
+                        //
+                        // Layout of ex_src_imm32 depends on src_ext_words:
+                        //   ext_words=1 (predec/AIND/postinc):
+                        //     ex_src_imm32 = sign_ext(mask) -- mask at [15:0]
+                        //   ext_words>=2 (d16(An)/d8(An,Xn)/abs/pcrel):
+                        //     ex_src_imm32 = {mask, disp} -- mask at [31:16],
+                        //     disp at [15:0]
+                        // Detect by ex_src_mode (since the predec/AIND/AINC
+                        // modes are exactly the ones with ext_words=1 for
+                        // MOVEM).
+                        //
                         // Mask bits map to registers differently for predec:
                         //   predec:    mask[0]=A7, ..., mask[15]=D0
                         //   other:     mask[0]=D0, ..., mask[15]=A7
-                        // The iterator walks bit 0..15 in order and uses the
-                        // appropriate mapping to pick the register.
-                        movem_mask    <= ex_src_imm32[15:0];
+                        movem_mask    <= ((ex_src_mode == `EA_AIND) ||
+                                          (ex_src_mode == `EA_AINC) ||
+                                          (ex_src_mode == `EA_ADEC))
+                                         ? ex_src_imm32[15:0]
+                                         : ex_src_imm32[31:16];
                         movem_idx     <= 5'd0;
                         movem_dir     <= ex_direction;
                         movem_predec  <= (ex_src_mode == `EA_ADEC);
                         movem_an_idx  <= ex_src_reg;
                         movem_an_update <= (ex_src_mode == `EA_ADEC) ||
                                            (ex_src_mode == `EA_AINC);
-                        // Initial An: for predec the tracked An starts at the
-                        // original An (each step uses An-4 then decrements).
-                        // For postinc and fixed (An), the tracked address is
-                        // the current write/read address.
-                        movem_addr    <= ex_ra;
+                        // Initial address: for predec the tracked An starts
+                        // at the original An (each step uses An-4 then
+                        // decrements).  For d16(An), add the sign-extended
+                        // displacement (which lives at ex_src_imm32[15:0]
+                        // because the mask sits in the high half).  For
+                        // (An)/(An)+, just An.  Other modes (IDX/abs/PC-rel)
+                        // fall through to ex_ra; they're rare for MOVEM and
+                        // not exercised by Kickstart 1.3 boot.
+                        case (ex_src_mode)
+                            `EA_ADEC:
+                                movem_addr <= ex_ra;
+                            `EA_DISP:
+                                movem_addr <= ex_ra +
+                                    {{16{ex_src_imm32[15]}}, ex_src_imm32[15:0]};
+                            default:
+                                movem_addr <= ex_ra;
+                        endcase
                         movem_busy    <= 1'b0;
                         ex_state      <= S_MOVEM;
                     end else if (ex_valid && !halted &&
