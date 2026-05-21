@@ -941,3 +941,89 @@ diagnosed: JMP into chip-RAM `$4190` mid-library-JT-slot,
 F-line opcode there triggers LINEF, unhandled vector cascade
 kills the stack.  Next: find which JSR/JMP computes `$4190`
 as its target and why.
+
+### S15: $4190 wall is cia.resource calling AddIntServer with un-NewList'd IntVects[3]
+
+Goal: trace the bad JSR/JMP to chip-RAM $4190 (S14 wall) and
+find a fix.
+
+- The bad JSR is `$FC2858: JSR $FE0E(A6)` (LVO -498 =
+  OpenResource), but A6 was **$4382** (garbage), not the
+  proper ExecBase $511C.  Target = A6 + $FE0E = $4190 (mid-JT-
+  slot).  A6 = $4382 because `MOVEA.L $0004.W, A6` at
+  `$FC2850` read garbage from $0004 -- the canonical ExecBase
+  pointer slot was clobbered.
+
+- Traced writes to $0004: legitimately set to $43AC (temp
+  ExecBase) then $511C (real ExecBase) by exec.rt_Init.  Then
+  PC=`$F81A20` writes garbage ($42E2, later $4382).
+  `$F81A20: MOVE.L A1, $0004(A0)` -- writes to A0+4.  When
+  A0=0, the target is absolute $0004 (ExecBase ptr).
+
+- `$F81A0A` is exec.Enqueue's loop body.  Walks A0's list
+  following ln_Succ pointers, inserts A1 at priority position.
+  When the list head is missing (lh_Head=0), the walk
+  immediately dereferences NULL: `MOVEA.L (A0),A0` after
+  reading the empty lh_Head sets A0=0, then the insertion
+  branch writes A1 to absolute $0004.
+
+- Caller chain: AddIntServer ($F81708) JSR'd via JT slot
+  $5074 with D0=3 (PORTS).  The body:
+    ```
+    $F81708: MOVE.L D2, -(A7)
+    $F8170A: MOVE.L D0, D2          ; D2 = level
+    $F8170E: MULU.W #12, D0
+    $F81712: LEA $54(A6, D0.W), A0  ; A0 = &IntVects[level]
+    $F81716: MOVEA.L (A0), A0       ; A0 = iv_Data (chain head)
+    $F81718: MOVE.W #$4000, INTENA
+    $F81720: ADDQ.B #1, $0126(A6)
+    $F81724: BSR $F81A0A             ; Enqueue
+    ```
+  No iv_Data check.  Assumes IntVects[level].iv_Data is a
+  valid List pointer (Kickstart 1.3 overloads the 12-byte
+  IntVector with the first 12 bytes of a List).
+
+- Caller of AddIntServer is **cia.resource's RT_INIT** at
+  `$FC204C..$FC2090`:
+    ```
+    $FC2058: JSR AllocMem(32, MEMF_PUBLIC|CLEAR)
+    $FC205C: A3 = result
+    $FC205E: BSR MakeFunctions wrapper
+    ...
+    $FC208E: MOVEQ #3, D0
+    $FC2090: JSR $FF58(A6)  ; AddIntServer for PORTS (= level 3)
+    ```
+  cia.resource expects IntVects[3] to already be NewList'd
+  before this call.
+
+- **Real exec init NEVER NewLists the IntVects table.**
+  Confirmed by bus-write tracing of $5170..$5230 region
+  (ExecBase + $54..$114 = IntVects[0..15]).  All writes are
+  zeros from the AllocMem-CLEAR pass at $F81F1C/1E/20.  Only
+  ONE non-zero write: $518C ← $F81872 (= IntVects[2].iv_Code,
+  SOFTINT handler).  No NewList'd lh_Head/Tail/TailPred
+  writes anywhere in IntVects.
+
+- That means real Kickstart 1.3 must do this init some other
+  way that we're skipping.  Likely culprits:
+    (a) An exec init step gated on a condition we don't
+        satisfy (KickMemPtr / kicktag flag / DiagROM mode).
+    (b) A NewList loop hidden in code our boot doesn't reach
+        (e.g., InitStruct template that builds IntVects in
+        bulk).
+    (c) cia.resource's expectation is wrong on our boot's
+        config and real Amiga has it pre-NewList'd by an
+        earlier resident.
+
+- Sanity check: wrote `tests/t114_move_an_predec_same.s` to
+  verify our `MOVE.L An, -(An)` uses the **68000 PRE-decrement
+  semantics** (stores the value of An BEFORE the decrement).
+  Passes -- so NewList itself (`MOVE.L A0,-(A0)` at end) would
+  build a correct empty list on our CPU.  The NewList sub is
+  fine; the problem is *no caller invokes it on IntVects*.
+
+Status: 95/95 tests pass (added t114_move_an_predec_same).
+Boot crash root cause identified: missing IntVects init.
+Not fixed yet -- needs a deeper look at Kickstart 1.3's exec
+init to find where IntVects-NewList lives in real Amiga, or
+spot the gated code path we're missing.
