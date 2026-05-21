@@ -1237,3 +1237,55 @@ TSRE idle, RBF=0, low byte $7F preserved for K3.1 self-test).
 
 Boot now reaches r=60.9M before stalling in the address-
 error / Guru loop (SERDATR poll harmless after the fix).
+
+### S19: heap "double-alloc" was an EX->ID forwarding bug in byte writes to Dn
+
+S18's hypothesis was wrong about WHERE.  The InitStruct overrun
+*was* the trigger, but the cause was a CPU forwarding bug, not
+a wrong neg_size or wrong InitStruct dispatch.
+
+- Traced MakeLibrary entry: pos_size=$32, data_table=$FC2434
+  (cia.resource's init).  The InitStruct word-copy loop at
+  $F8118C ran 26 word writes (52 bytes) into the 64-byte buffer
+  starting at A0=$44C6 and overran the chunk header at $44F0.
+
+- Looked at the word-copy entry sequence at $F81182-$F8118A:
+    ```
+    MOVE.L  A1, D1       ; D1 = $00FC243A  (correct)
+    ADDQ.L  #1, D1       ; D1 = $00FC243B  (correct)
+    AND.B   #$FE, D1     ; D1 should = $00FC243A
+    MOVEA.L D1, A1       ; A1 should = $00FC243A
+    ```
+
+- Traced ra/rb across these four PCs and saw D1 at the
+  MOVEA.L was $0000003A, not $00FC243A.  Upper 24 bits gone.
+
+- t116 verified that AND.B #$FE, D1 *standalone* (with a CMPI
+  separator that lets the writeback retire to the regfile)
+  preserves the upper bits correctly.  So the bug was in the
+  EX->ID forward hazard, not the AND.B itself.
+
+- Root cause: `fwd()` at rtl/m68k_core.v:589 returned
+  `wb_wdata` verbatim when wb_we && wb_widx == idx.  For
+  byte/word writes to Dn the regfile's sized_write() merges
+  only the low bits and preserves the upper, but the forwarder
+  did NOT mirror that merge.  Any instruction reading Dn the
+  same cycle as a byte-Dn writeback got the masked low bits
+  with zero upper.
+
+- Fix: forwarder now matches sized_write() -- for Dn
+  destinations with SZ_B/SZ_W, merge low bits of wb_wdata with
+  upper bits of the base regfile read.  An destinations
+  unchanged (always 32-bit writes).
+
+- t117_fwd_byte_dn is the regression test: forces the EX->ID
+  forward hazard with a same-cycle reader of the byte-written
+  Dn (no separator like CMPI between AND.B and the reader).
+
+Boot impact: passes the $F81A46 FindName wall, reaches r=1.79M
+with a new wall at $F8EA24 (JSR $FFFA(A6) with A6=0 -- a
+library-call stub firing with a bad base).  Filed as task #43.
+
+Status: 98/98 tests pass (added t116_andb_imm_dn,
+t117_fwd_byte_dn).  Forwarding fix removes an entire class of
+subtle byte/word-Dn corruption.
