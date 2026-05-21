@@ -2536,8 +2536,13 @@ module m68k_core #(
             if (ex_kind == K_STOP && is_settled)
                 $display("[STOP] r=%d pc=%h imm=%h",
                     retired, ex_pc, ex_src_imm32[15:0]);
-            if (is_settled && exc_launch_c)
-                $display("[EXC] r=%d pc=%h vec=%d kind=%d", retired, ex_pc, exc_vector_c, ex_kind);
+            // Exception launches happen in S_RUN with exc_launch_c set --
+            // that gates run_launches_exc and disables is_settled_in_run,
+            // so is_settled and exc_launch_c are mutually exclusive.  Use
+            // the raw S_RUN gate to trace launches.
+            if (ex_state == S_RUN && ex_valid && !halted && exc_launch_c)
+                $display("[EXC] r=%d pc=%h opcode=%h kind=%d vec=%d",
+                    retired, ex_pc, ex_opcode, ex_kind, exc_vector_c);
 `endif
             if (is_settled && cc_we_c) begin
                 cc_n <= cc_n_c; cc_z <= cc_z_c; cc_v <= cc_v_c; cc_c <= cc_c_c;
