@@ -9,7 +9,7 @@
 ; regression by reading SERDATR (addr[1]=0) and POTGOR (addr[1]=1) and
 ; verifying both return their canned values.
 ;
-; SERDATR = $607F (TSRE | TBE | self-test PASS low byte).
+; SERDATR = $307F (TBE | TSRE, RBF=0 idle, self-test PASS low byte).
 ; POTGOR  = $FFFF (no buttons pressed, pull-ups high).
 ;
 ; Pass = halt 0.  Failures: $BAD1 SERDATR mismatch, $BAD2 POTGOR mismatch.
@@ -27,7 +27,7 @@ core0:
         ;    response which used to be 0.
         move.w  $00DFF018, D0
         andi.l  #$FFFF, D0
-        cmpi.l  #$607F, D0
+        cmpi.l  #$307F, D0
         bne     fail_serdatr
 
         ; 2. MOVE.W from $DFF016 (POTGOR, addr[1]=1).  Always worked

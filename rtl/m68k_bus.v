@@ -339,12 +339,12 @@ module m68k_bus #(
     reg [15:0] dsk_len;
 
     // ----- Paula peripheral input stubs (read-only) -----------------
-    // Real Kickstart pokes SERDATR (bit 13 TBE = "transmit empty";
-    // bit 14 TSRE = "transmit shift register empty") and POTGOR
-    // (joystick / mouse / paddle button bits, active-low) during
-    // early init.  We pin SERDATR to "idle, no data" and POTGOR to
-    // "all buttons up, all pots floating high" so Kickstart's loops
-    // don't trip on garbage.
+    // Real Kickstart pokes SERDATR (bit 14 RBF = "receive buffer full",
+    // bit 13 TBE = "transmit buffer empty", bit 12 TSRE = "transmit
+    // shift register empty") and POTGOR (joystick / mouse / paddle
+    // button bits, active-low) during early init.  We pin SERDATR to
+    // "idle, no RX data" and POTGOR to "all buttons up, all pots
+    // floating high" so Kickstart's loops don't trip on garbage.
     localparam [31:0] SERDATR_ADDR = 32'h00DF_F018;   // serial data + status
     localparam [31:0] POTGOR_ADDR  = 32'h00DF_F016;   // pot/joy buttons + pull-ups
     localparam [31:0] ADKCONR_ADDR = 32'h00DF_F010;   // audio/disk control read
@@ -352,11 +352,14 @@ module m68k_bus #(
     localparam [31:0] POT1DAT_ADDR = 32'h00DF_F014;   // pot 1 sample
     localparam [31:0] JOY0DAT_ADDR = 32'h00DF_F00A;
     localparam [31:0] JOY1DAT_ADDR = 32'h00DF_F00C;
-    // SERDATR: TSRE | TBE (idle TX) + low byte $7F to satisfy Kickstart
-    // 3.1's post-init self-test poll at $F84048 (reads SERDATR low byte
-    // and waits for $7F via DBEQ; on timeout it BRA-s to the cold-reboot
-    // path).  $7F looks like a "self-test PASS" magic value.
-    localparam [15:0] SERDATR_VAL  = 16'h607F;
+    // SERDATR idle: TBE (bit 13) | TSRE (bit 12), RBF (bit 14) = 0 so
+    // no spurious "received byte" wakes up the Kickstart 1.3 Romwack
+    // serial poll at $F83B98 (BTST #14, D0; BNE got-byte).  Low byte
+    // $7F satisfies Kickstart 3.1's post-init self-test poll at
+    // $F84048 (reads low byte and DBEQs until it sees $7F).  Earlier
+    // $607F mistakenly set bit 14 thinking it was "TSRE" -- that
+    // confusion came from the comment, the bit layout was wrong.
+    localparam [15:0] SERDATR_VAL  = 16'h307F;
     localparam [15:0] POTGOR_VAL   = 16'hFFFF;
     localparam [15:0] POT_DAT_VAL  = 16'h0000;
     localparam [15:0] JOY_DAT_VAL  = 16'h0000;
