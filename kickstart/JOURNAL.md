@@ -797,3 +797,79 @@ calls trackdisk and writes DSKLEN -- a major milestone -- but
 DSKPT is wrong so the bootblock lands at $18 instead of a real
 buffer.  Next: trace DSKPTH/DSKPTL writes and figure out why
 the high half is missing.
+
+### S13: bus's DSKPT/DSKLEN dispatch ignored byte-enable (be)
+
+Goal: figure out why DSKPT ends up at $00000018 after trackdisk
+sets it up.
+
+- Traced ALL writes to $DFF020..$DFF02F at the CPU's dc port
+  and at the bus arbiter side.  The CPU emits patterns like:
+    ```
+    addr=$DFF020 be=0011 is_long=1 wdata=$00002708
+    addr=$DFF022 be=1111 is_long=1 wdata=$00000018
+    addr=$DFF024 be=1111 is_long=1 wdata=$011829A8
+    ```
+  None are simple aligned MOVE.L at $DFF020.  Looking carefully:
+    1. The first is `MOVE.W #$2708, $DFF022` -- our CPU
+       long-aligns to $DFF020 with `be=0011` (low lane =
+       $DFF022,$DFF023).  wdata[15:0] = $2708.
+    2. The second is an unaligned `MOVE.L Dn, $DFF022` spanning
+       DSKPTL+DSKLEN.  Bytes: 022 <- wdata[31:24]=$00,
+       023 <- wdata[23:16]=$00, 024 <- wdata[15:8]=$00,
+       025 <- wdata[7:0]=$18.  So DSKPTL=$0000, DSKLEN=$0018.
+    3. The third is aligned MOVE.L at DSKLEN.
+
+- The previous bus dispatch was:
+    ```
+    if (addr == DSKPTH_ADDR) dsk_pt[31:16] <= wdata[31:16];
+    else if (addr == DSKPTL_ADDR) dsk_pt[15:0] <= wdata[15:0];
+    ```
+  Matched by ADDR ONLY and always pulled wdata from the same
+  half.  For pattern (1) (addr=$DFF020 be=0011), it took
+  wdata[31:16] = $0000 as DSKPTH instead of recognising that
+  be=0011 means "low lane = DSKPTL write" and pulling
+  wdata[15:0]=$2708 into DSKPTL.
+
+- **Side rabbit-hole**: trace `[cacheLatch]` shows the CPU
+  emits these writes with `cpu_addr` having the high byte set
+  ($FFDFF02x).  This is the 68000 "24-bit external bus" idiom
+  (commit 56238c5 added bus-side mask).  The bus truncates to
+  24 bits before matching, so the matching is correct -- it's
+  just confusing to read the cacheLatch output.
+
+- **Fix (commit `f3c2448`):** dispatch by `(addr, be, is_long)`:
+    - addr=$DFF020 + is_long+be=1111: aligned MOVE.L Dn,$DFF020
+      -> full DSKPT <- wdata.
+    - addr=$DFF020 + be=1100: MOVE.W high-lane -> DSKPTH.
+    - addr=$DFF020 + be=0011: MOVE.W low-lane (= $DFF022) ->
+      DSKPTL.
+    - addr=$DFF022 + is_long+be=1111: unaligned long ->
+      DSKPTL <- wdata[31:16], DSKLEN <- wdata[15:0].
+    - addr=$DFF022 + be=0011 or 1111: word write -> DSKPTL.
+    - addr=$DFF024 with various (be, is_long): DSKLEN with DMA
+      trigger on bit 31/15 (depending on lane).
+
+- **Result:** Kickstart 1.3 boot post-fix sets `dsk_pt` to
+  `$00002708` (chip-RAM buffer) -- the disk pointer chain is
+  finally healed.  But the boot still TIMEOUTs at the same
+  retired=74M with the same BAD-PC at $08000888.  Why?
+  Because trackdisk hasn't actually fired DMA yet -- both
+  DSKLEN writes we see have bit 15 = 0 (no DMAEN).  The
+  bootblock load never starts.  Possibly trackdisk is
+  programming a setup sequence (DSKLEN twice + index pulse +
+  something else triggers DMA) that we're not faithful to.
+
+- **Debugging dead-end**: tried hooking the CPU's `dc_ack &&
+  dc_we && dc_addr in $DFF02x` -- never fired.  Was a chase
+  for "where is the CPU emitting these?" but turned out the
+  CPU emits them with the high byte set ($FFDFF02x) and my
+  filter required the high byte to be 0.  Lesson: when chasing
+  bus events, always include the 24-bit mask explicitly when
+  comparing CPU-side addresses.
+
+Status: 94/94 tests pass.  Bus byte-enable dispatch fixed.
+DSKPT is now correct (chip-RAM buffer at $00002708).  Boot
+still hits the same downstream wall -- needs more digging into
+strap's actual flow vs what trackdisk usually does to start
+DMA.
