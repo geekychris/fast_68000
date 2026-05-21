@@ -1105,3 +1105,70 @@ like FindResident/FindName).  Filed as task #40.
 Status: 96/96 tests pass (added t115_movem_idx).
 S15's IntVects-NewList theory was wrong: the init *does*
 exist, MOVEM EA_IDX was broken on our CPU.
+
+### S17: address-error wall at $F81A46 -- ResourceList node $46CC overlaid by MakeFunctions JT
+
+Goal: diagnose the address-error trap at $F81A46 that fires
+just after the MOVEM-IDX fix lets cia.resource init complete.
+
+- `$F81A46: MOVE.L (A2), D0` traps with vec=3 (address error)
+  when A2 = `$4EF900F9` (odd).  $F81A30/$F81A3A is the standard
+  exec **FindName(list:A0, name:A1)** under a Forbid wrapper.
+
+- At fire time A0=`$5296`, A1=`$4924`.  $5296 = NEW ExecBase
+  ($511C) + $17A = **NEW ResourceList head**.  The walked chain
+  is `lh_Head ($41B0) -> ln_Succ ($46CC) -> ln_Succ ($4EF9_00F9)`.
+  The last hop is the misaligned dereference.
+
+- The node at $46CC was a legit Resource added during the
+  early-boot list-copy at `$F8058A`-`$F8059C` (re-parents OLD
+  ExecBase's MemList + ResourceList onto NEW ExecBase, then
+  ADDQ.L #4 re-anchors the last node's `ln_Succ` to the NEW
+  list's `&lh_Tail`).
+
+- Bus-write trace on `$46CC` shows:
+    * r=981,867    : AllocMem CLEAR (first use of $46CC)
+    * r=982,355    : Enqueue link `(A1)=A0` ($46CC <- $452A)
+    * r=1,529,815+ : list-copy re-parenting (Resource still alive)
+    * r=1,534,156  : Enqueue link `(A0)=A1` ($46CC <- $511C)
+    * r=1,542,152  : **AllocMem CLEAR again** ($46CC <- 0)
+    * r=1,543,290+ : MakeFunctions writes JMP.L JT entries
+                     ($46CC <- $4EF9_0000, etc.)
+
+  So $46CC was AllocMem'd TWICE -- first as a Resource node
+  (~26 bytes), then again as the JT base of a new library
+  built by MakeLibrary at $F81BF4 / MakeFunctions at $F81C50.
+  The two allocations overlap; MakeFunctions' JMP.L writes
+  clobber the Resource's `ln_Succ`/`ln_Pred` fields, so
+  FindName's later walk hits the JT bytes interpreted as a
+  pointer and traps on the odd byte.
+
+- Where the double-alloc comes from is the open question.
+  AllocMem's free-chain walk lives at $F81ECE/$F81DCA (free
+  chunks at MemHeader+$10, each `{next:4, size:4}`).  Either:
+    (a) the heap free-chain initialisation includes the
+        Resource-node range as "free" (the Resources weren't
+        AllocMem'd from the same pool, or the pool boundaries
+        cover them);
+    (b) a FreeMem call between r=1,534,156 and r=1,542,152
+        returns $46CC to the chain (use-after-free in some
+        cleanup path).
+
+- Boot impact: the address error fires once at r=1,544,424
+  and is handled by the vec-3 handler at `$F83C90`+, which
+  prints a "Software Error" alert and falls into a Romwack-
+  style serial-poll loop at `$F83CEA`-`$F83D0C`.  Polls
+  `SERDATR` ($DFF018) bit 14 (RBF) for incoming bytes; on our
+  bus SERDATR returns `$607F` with bit 14 set (a separate
+  bug: `m68k_bus.v` comment confuses TSRE position -- bit 14
+  on real hw is RBF, bit 12 is TSRE, so we falsely report
+  data-available to Kickstart).  Even with that fixed Kickstart
+  would still be stuck in Guru because the address error has
+  already fired.
+
+Boot now reaches r=60.9M (vs r=3M pre-MOVEM-IDX fix) before
+stalling in the alert loop.
+
+Status: 96/96 tests pass.  Address-error root cause traced to
+double-AllocMem of $46CC; the underlying heap bug is task #41.
+The SERDATR RBF bit 14 issue is filed separately.
