@@ -1172,3 +1172,68 @@ stalling in the alert loop.
 Status: 96/96 tests pass.  Address-error root cause traced to
 double-AllocMem of $46CC; the underlying heap bug is task #41.
 The SERDATR RBF bit 14 issue is filed separately.
+
+### S18: SERDATR RBF=0 fixed; heap double-alloc root cause = InitStruct buffer overrun
+
+Two follow-ups from S17:
+
+**SERDATR fix (task #42):** `m68k_bus.v` had `SERDATR_VAL =
+$607F` with bit 14 set, but the comment claimed bit 14 was
+TSRE.  On real Paula bit 14 is **RBF** (Receive Buffer Full)
+and bit 12 is TSRE.  Changed to `$307F` (bits 13+12 = TBE+
+TSRE idle, RBF=0, low byte $7F preserved for K3.1 self-test).
+`t100_chip_word_half` updated to the new constant.
+
+**Heap double-alloc traced (task #41):**
+
+- AllocMem returned `$46CC` for a new library buffer at
+  r=1,541,945 because the chunk at `$44F0` in the free chain
+  claimed it had `$120000F8` bytes of space.  The chunk's
+  *real* size was `$138` bytes (= `$608` - allocated portion),
+  spanning `$44F0..$4628`.
+
+- The chunk header was clobbered ~600 cycles earlier
+  (r=1,541,335..1,541,346) by an `InitStruct` (LVO -78) word-
+  copy loop at `$F8118C`.  Destination started at `$44E0`
+  (offset $30 into the alloc'd `$44B0..$44F0` buffer, lib_base
+  = $44C2 after the neg-size offset).  The loop ran 13 word
+  iterations, writing 26 bytes from `$44E0` to `$44F9` -- 8
+  bytes past the buffer end at `$44F0`, smashing the next-link
+  + size fields of the chunk header.
+
+- After corruption: `$44F0.next = $11A800F8` (was 0),
+  `$44F4.size = $120000F8` (was $138).  Next AllocMem walks
+  the chain, sees a "huge" chunk at `$44F0`, satisfies a 1624-
+  byte request from it, and returns `$44F0` -- with the
+  allocator's split moving `mh_First` to `$44F0 + $658 = $4B48`.
+  The "allocated" range `$44F0..$4B48` includes the live
+  Resource node at `$46CC`.  MakeFunctions then writes JMP.L
+  entries over the Resource's `ln_Succ` / `ln_Pred` fields.
+
+- Open: **why is InitStruct overrunning by 8 bytes?**  The
+  buffer was allocated by MakeLibrary as 64 bytes (neg_size +
+  pos_size), but the InitStruct table for whichever library
+  was being built describes a struct that extends 8 bytes
+  past the alloc end.  Possible causes:
+    a. CPU bug in MakeLibrary's size computation -- one of
+       `NOT.W D3 / MULU.W #6, D3 / ANDI.W #$FFFC, D3` at
+       $F81C20-$F81C2A produces a wrong neg_size, or the
+       `SUBA.W #$FC74, A5` at $F80514 mis-adjusts the
+       AllocMem result.
+    b. CPU bug in InitStruct's command-byte dispatch at
+       $F81138-$F81168 -- a wrong `MOVE.B (A1)+, D0`,
+       `LSR.W #3, D1`, or `AND.W #$0E, D1` would pick the
+       wrong handler / loop count.
+    c. A pre-existing Kickstart quirk that worked on real
+       hardware because the heap had natural padding, and
+       we hit it because something else (e.g., our different
+       memory layout / Zorro autoconfig timing) changed the
+       free-chain layout enough to expose the overrun.
+
+  Worth checking by tracing the size argument MakeLibrary
+  passes to AllocMem against the InitStruct table size for
+  the offending library.  Need to know *which* library is
+  being built to compare against documented sizes.
+
+Boot now reaches r=60.9M before stalling in the address-
+error / Guru loop (SERDATR poll harmless after the fix).
