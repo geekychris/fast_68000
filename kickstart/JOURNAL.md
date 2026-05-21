@@ -1027,3 +1027,81 @@ Boot crash root cause identified: missing IntVects init.
 Not fixed yet -- needs a deeper look at Kickstart 1.3's exec
 init to find where IntVects-NewList lives in real Amiga, or
 spot the gated code path we're missing.
+
+### S16: IntVects init *does* exist -- MOVEM.L D1/A1, $54(A6,D3.W) at $F817C0 had two CPU bugs
+
+Goal: find where Kickstart 1.3 NewLists IntVects.  S15 wrongly
+concluded it didn't, because the trace was looking for List
+writes inside the IntVects table itself; the routine actually
+allocates an external 80-byte block and NewLists *that*, then
+stores pointers into `IntVects[i].iv_Data`/`iv_Code`.
+
+- Located the init at `$F8178A`, called from cold-boot exec
+  init at `$F8072C`.  Routine layout:
+    ```
+    $F8178A: save D2/D3/A2/A3
+    $F8178E: D0 = 80           ; AllocMem byteSize
+    $F81790: D1 = $00010001    ; MEMF_PUBLIC|CLEAR
+    $F81796: BSR AllocMem      ; -> D0 = block ptr
+    $F8179A: D2 = 4            ; DBRA count (= 5 iterations)
+    $F8179C: A2 = block ptr
+    $F8179E: A3 = $F817E0      ; PC-rel table of (level, ...)
+    loop:
+      $F817A2: D1 = A2          ; save block ptr for MOVEM
+      $F817A4: A2[8] = A2       ; lh_TailPred
+      $F817A8: A2 += 4
+      $F817AA: A2[0] = 0        ; lh_Tail
+      $F817AC: A2[-4] = A2      ; lh_Head -- correct 68000 NewList
+      $F817AE: D3 = (A3)+       ; D3 = level (3, 5, 4, 13, 15)
+      $F817B0: A2[14] = (A3)+   ; ln_Pri-ish second word
+      $F817B4: A2 += 16
+      $F817B8: A1 = $F817F4     ; PC-rel handler ptr
+      $F817BC: D3 *= 12         ; D3 = IntVect offset
+      $F817C0: MOVEM.L D1/A1, $54(A6, D3.W)
+                                ; IntVects[D3/12].iv_Data = block
+                                ; IntVects[D3/12].iv_Code = handler
+      $F817C6: DBRA D2, loop
+    ```
+  So `$F817C0`'s `MOVEM.L D1/A1, $54(A6, D3.W)` is the
+  IntVects[3,5,4,13,15] setup -- including the IntVects[3]
+  that cia.resource needs.
+
+- Two CPU bugs collapsed that EA to plain A6:
+
+  1. **MOVEM init didn't handle EA_IDX.**  `rtl/m68k_core.v`
+     line 2681 only branched on EA_ADEC and EA_DISP; every
+     other source mode fell through to `movem_addr <= ex_ra`,
+     i.e. An with no offset/index applied.
+
+  2. **MOVEM's IDX-mux read the wrong ext word.**  The
+     third regfile read port (rc) is repurposed during ID to
+     read the Xn register named in an EA_IDX brief extension.
+     The routing logic indexed `id_ext[0]` to find the brief
+     extension's top nibble.  For all non-MOVEM instructions
+     that's correct -- the brief ext is the first ext word.
+     But MOVEM's first ext word is the *register mask*; the
+     brief lives at `id_ext[1]`.  So `ex_sp` held whichever
+     register the mask word's high nibble happened to name,
+     not the intended Xn.  In Kickstart's case mask=$0202 had
+     high nibble 0 -> D0, so EA became `A6 + D0 + $54` =
+     `$511C + $4020 + $54` = $9190 instead of $5194.
+
+- Both fixed in one commit; t115_movem_idx exercises
+  `MOVEM.L D1/A1, $40(A0, D3.W)` and the reverse direction.
+  Pre-fix: writes silently hit `A0 + D0 + $40` and the test
+  hits $BAD1.
+
+- Boot impact: with the MOVEM-IDX fix, IntVects[3].iv_Data
+  now points at the NewList'd block, cia.resource's
+  AddIntServer enqueues correctly onto a valid list head,
+  and the $4190 LINEF cascade no longer fires.  Boot
+  progresses from `retired=3M` to `retired=60.9M` instructions
+  (200M cycle budget) before hitting the next wall.
+
+Next wall: **address error at $F81A46** -- `MOVE.L (A2), D0`
+with misaligned A2.  $F81A30 is a list-walk routine (looks
+like FindResident/FindName).  Filed as task #40.
+
+Status: 96/96 tests pass (added t115_movem_idx).
+S15's IntVects-NewList theory was wrong: the init *does*
+exist, MOVEM EA_IDX was broken on our CPU.
