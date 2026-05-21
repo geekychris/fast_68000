@@ -596,3 +596,58 @@ unchanged: AllocMem fails because the free-list chain is
 truncated at chunk `$4D08`.  Next session: bus-trace 4-byte
 writes at `$4D08` (and the other free-chunk header addresses)
 to pinpoint what severs the chain.
+
+### S10: K_ALU direction=1 was a silent no-op -- mh_Free never decremented
+
+Goal: chase the `mh_Free` vs reachable-free-list discrepancy.
+
+- Bus-trace writes to `$401C` (= `mh_Free`).  Result: **one
+  write only**, at `r=436,272` with value `$0007BFE0` (initial
+  heap size).  AllocMem inner does `SUB.L D0, $001C(A0)` at
+  `$F81E04` to decrement the counter -- never fires.
+
+- Decoded `$91A8 $001C`:
+    - bits[15:12]=1001 (SUB)
+    - bits[11:9]=000 (D0)
+    - bits[8:6]=110 (.L, **direction=1** = Dn -> ea)
+    - bits[5:3]=101 (mode 5 = d16(An))
+    - bits[2:0]=000 (A0)
+  That's "SUB.L D0, $001C(A0)" with mem destination.  The
+  decoder propagates `direction = opcode[8]`, but the K_ALU
+  executor at line 1197 only ever handled the direction=0
+  case (mem source, Dn destination).  Direction=1 was a silent
+  no-op: load scheduled but no writeback, no CCR.  Same
+  pattern as the old MOVE-FROM-SR mem-dest and K_ALUI
+  mem-dest bugs, just for the K_ALU family.
+
+- Mirrored the K_ALUI mem-dest plumbing:
+    - New `alu_mem_dst` / `alu_mem_dst_writes` wires gated on
+      `K_ALU && direction==1 && src_mode != EA_DREG/AREG`.
+    - K_ALU S_RUN executor schedules the RMW load when
+      `alu_mem_dst`.
+    - K_ALU S_LOAD ack does the lane-extract (byte_at /
+      word-half / long) and swaps operand roles:
+      `alu_a = mem`, `alu_b = ex_rb (Dn)` -- so SUB.L D0,mem
+      computes `mem - D0` (not `D0 - mem`).
+    - Sequential block captures `alu_y` + CCR snapshot
+      (`ex_tas_word`, `ex_alui_*_q`) and transitions to
+      `S_RMW_W`.
+    - S_RMW_W K_ALUI/K_ALUQ commit branch now also includes
+      `K_ALU`, with src-An-update routing for predec/postinc
+      on the EA.
+  Regression `tests/t112_alu_mem_dst.s`: encodes SUB.L /
+  ADD.L / AND.W / OR.B Dn,d16(A0) via .word (since asm68k has
+  no Dn,<ea> form), verifies memory writeback at each lane
+  + neighbour invariants.
+
+- Kickstart 1.3 cold-boot post-fix: **88M retired** in 300M
+  cycles (up from 75M), no `[BAD-PC]` chain, crosses a reset
+  boundary (two `[OVL] cleared`).  The AllocMem-fail-and-
+  clobber loop from S8 is gone.  `mh_Free` trace shows 191
+  decrement events now -- the allocator is tracking
+  properly.
+
+Status: 93/93 tests pass (added t112_alu_mem_dst).  Boot
+progresses past the prior wall but doesn't reach [BOOTBLOCK]
+yet; need a fresh trace to see the new state at the reset
+boundary.
