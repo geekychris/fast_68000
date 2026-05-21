@@ -733,3 +733,67 @@ Status: 93/93 tests pass.  Boot wall is now `K_BAD` at chip-RAM
 ~10 bytes.  Next: figure out what `$0090(A6)` was supposed to
 hold -- it's some exec-private function table.  Probably a
 library JT slot that wasn't set up correctly.
+
+### S12: MOVEM mem-to-reg with d16(An) was ignoring the displacement
+
+Goal: figure out what $90(A6) is and why A5 ends up = $6378.
+
+- Traced writes to `$51AC..$51B7` (the $90(A6) / $94(A6) slots,
+  with ExecBase = $511C).  Result: **only zero writes** at
+  `r=1,528,335..1,528,339` from the AllocMem clear-zone code.
+  Yet at r=1,546,977 the MOVEM at `$F81276` returned A5=$6378.
+  Impossible -- something has to have written non-zero there.
+
+- Traced ALL bus accesses during the MOVEM (`dc_ack` on, not
+  `is_settled` -- MOVEM intermediate cycles aren't settled).
+  The smoking gun:
+    ```
+    r=1546976 pc=00f81276 state=a RD addr=0000511c data=00000000
+    r=1546976 pc=00f81276 state=a RD addr=00005120 data=00004924
+    ```
+  The MOVEM read at `$511C` (= A6 + 0) and `$5120` (= A6 + 4)
+  **instead of** `$51AC` (= A6 + $90) and `$51B0` (= A6 + $94).
+  **The d16 displacement was being ignored.**
+
+- Two bugs at `K_MOVEM` init in `m68k_core.v` line 2666:
+  1. `movem_addr <= ex_ra` (= An), without adding the
+     displacement.  For d16(An) we want `An + d16`.
+  2. The mask read `ex_src_imm32[15:0]` works only for
+     ext_words=1 modes (predec / (An) / postinc).  For
+     ext_words=2 modes (d16(An), d8(An,Xn), abs, PC-rel), the
+     ID stage packs `ex_src_imm32 = {mask, d16}` so mask is in
+     `[31:16]` and d16 in `[15:0]`.  The code was reading the
+     d16 as the mask.
+
+- Fix (commit `1fa5595`): case-split on `ex_src_mode` in the
+  MOVEM init.  For `EA_DISP`: `movem_addr = ex_ra +
+  sign_ext(ex_src_imm32[15:0])`, mask = `ex_src_imm32[31:16]`.
+  For `EA_ADEC` / `EA_AIND` / `EA_AINC`: keep old behaviour.
+  Regression `tests/t113_movem_d16an.s` exercises the
+  `MOVEM.L $80(A0), D1/D3/A2/A5` shape used by Kickstart.
+
+- **Kickstart 1.3 boot post-fix retires 74M instr AND writes
+  `DSKLEN` for the first time** -- trackdisk is loading the
+  bootblock.  Trace:
+    ```
+    [DSKLEN] wdata=00002708 dsk_pt=00000018
+    [DSKLEN] wdata=011829a8 dsk_pt=00000018
+    [EXC] r=74019261 pc=08000888 opcode=ffff kind=K_BAD vec=11
+    [BAD-PC] from=08000888 to=08000818
+    ```
+  Fresh wall: DSKPT (disk DMA destination pointer) is `$18` --
+  way too low (should be a real RAM buffer).  The disk DMA
+  writes bootblock data over the vector table at `$18+`, then
+  PC eventually lands at `$08000888` (chip-RAM noise) with an
+  F-line opcode (`$FFFF`), our K_BAD trap fires LINEF, vector
+  loop hits another bad PC, etc.
+
+  Probably DSKPT isn't being set properly -- the high half
+  might be dropped, or our DSKPT register has a similar
+  byte/word lane bug.
+
+Status: 94/94 tests pass (added t113_movem_d16an).  Boot now
+calls trackdisk and writes DSKLEN -- a major milestone -- but
+DSKPT is wrong so the bootblock lands at $18 instead of a real
+buffer.  Next: trace DSKPTH/DSKPTL writes and figure out why
+the high half is missing.
