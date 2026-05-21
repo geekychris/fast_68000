@@ -873,3 +873,71 @@ DSKPT is now correct (chip-RAM buffer at $00002708).  Boot
 still hits the same downstream wall -- needs more digging into
 strap's actual flow vs what trackdisk usually does to start
 DMA.
+
+### S14: post-bus-fix wall is an unhandled LINEF emulator trap
+
+Goal: understand why no DSKLEN write turns on DMAEN -- and
+where the boot is actually going.
+
+- Periodic PC sample every 4M instr (`[SAMP]`):
+    ```
+    r=  4M pc=0000000c kind=13 sp=fff4407c
+    r=  8M pc=00000014 kind=13 sp=ffbd6510
+    r= 12M pc=00000000 kind=13 sp=ff86899e
+    r= 16M pc=00000008 kind=13 sp=ff4fae32
+    r= 20M pc=00000010 kind=13 sp=ff18d2c6
+    r= 25M pc=00000018 kind= 0 sp=fee1f75a
+    r= 29M pc=0800087c kind=13 sp=fed710fe
+    r= 33M pc=0800081c kind=13 sp=fec9d32e
+    ...
+    ```
+  PC cycles through low chip-RAM vector slots ($0, $8, $10,
+  $18, ...) and a `$08000xxx` range.  SP marches down 36k per
+  4M-instr -- recursive exception frames consuming the stack.
+  The boot is in an unrecoverable exception storm by 74M.
+
+- Exception list (`[EXC]`):
+    ```
+    r=    435874 pc=$F80C5E op=$4E7B vec=4    -- MOVEC probe (expected)
+    r=   1537279 pc=$F80BE8 op=$007C vec=8    -- priv-vio (expected)
+    r=   1541447 pc=$00004190 op=$FB0A vec=11 -- LINEF on a chip-RAM JMP
+    r=   2393365 pc=$0B400000 op=$AAAA vec=10 -- LINEA on a wild PC
+    r=   3245283 pc=$0B400000 op=$AAAA vec=10
+    r=   3245356 pc=$F80E16  op=$4E70 vec=4   -- RESET in user mode
+    ... (cascade) ...
+    ```
+  The first "real" failure is at `r=1,541,447`: PC lands at
+  chip-RAM `$00004190` where the bytes are `$FB0A`.  Since
+  $4190 isn't a sensible 68k opcode (F-line), our K_BAD trap
+  correctly raises LINEF (vector 11).  But vec 11 ($002C)
+  hasn't been wired to a working LINEF emulator handler at
+  this point in boot, so the trap goes to wild memory
+  ($0B400000) and the cascade begins.
+
+- The chip-RAM PC `$00004190` looks like the MIDDLE of a
+  library jump-table slot.  Standard JT slots are 6 bytes
+  (`JMP $abs.L` = `$4EF9 $XXXX_XXXX`).  At offset 8 within a
+  6-byte-slot table, we're reading data from the address
+  half of the next slot.  So someone JSR'd to `$4190` (or
+  thereabouts) computed from a stale or wrong library
+  jump-table base.
+
+- Same shape as S11's wall at `$6382` (different chip-RAM
+  address, different bogus opcode).  Each CPU fix moves the
+  boot to a different chip-RAM address that's similarly
+  mid-JT-slot.  Suggests a systemic issue: either (a) we
+  still have a CPU bug that miscomputes library JT base
+  pointers, or (b) Kickstart's `MakeFunctions` is being fed
+  wrong inputs and lays down a broken JT.
+
+- Side note: the DSKLEN writes we *do* see (post bus fix)
+  carry `bit 15 = 0` (no DMAEN), so floppy DMA never fires.
+  That's a downstream symptom -- trackdisk never reaches the
+  "start the read" code because boot crashes in the LINEF
+  cascade first.
+
+Status: 94/94 tests pass.  Boot's exception-storm wall is
+diagnosed: JMP into chip-RAM `$4190` mid-library-JT-slot,
+F-line opcode there triggers LINEF, unhandled vector cascade
+kills the stack.  Next: find which JSR/JMP computes `$4190`
+as its target and why.
