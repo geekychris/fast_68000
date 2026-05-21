@@ -585,14 +585,40 @@ module m68k_core #(
         .aux_data (wb_aux_data)
     );
 
-    // Forwarding network (EX → ID).
+    // Forwarding network (EX → ID).  When the main writeback is going to
+    // a D-register with a byte- or word-sized op, the regfile's own
+    // sized_write() merges only the low bits of wb_wdata with the
+    // preserved upper bits of the existing register value.  The forwarder
+    // must mirror that merge here -- otherwise an instruction that reads
+    // Dn the same cycle Dn is being byte-written sees wb_wdata directly
+    // (low byte in place, upper 24 zero) and loses the upper bits.
+    //
+    // Surfaced in Kickstart 1.3 InitStruct's word-copy entry sequence:
+    //   MOVE.L A1, D1 ; ADDQ.L #1, D1 ; AND.B #$FE, D1 ; MOVEA.L D1, A1
+    // The MOVEA.L immediately following AND.B forwarded the unmerged
+    // byte-write, so A1 ended up at $0000003A instead of $00FC243A and
+    // InitStruct copied source bytes from the chip-RAM vector table over
+    // its destination, smashing the heap free chain and triggering a
+    // downstream double-AllocMem of a live Resource node.
+    //
+    // For An destinations the regfile always writes 32 bits, so no merge
+    // is needed there.
     function [31:0] fwd;
         input [3:0]  idx;
         input [31:0] base;
         begin
-            if (wb_we     && wb_widx    == idx) fwd = wb_wdata;
-            else if (wb_aux_we && wb_aux_idx == idx) fwd = wb_aux_data;
-            else fwd = base;
+            if (wb_we && wb_widx == idx) begin
+                if (idx[3])
+                    fwd = wb_wdata;
+                else case (wb_size)
+                    `SZ_B: fwd = {base[31:8],  wb_wdata[7:0]};
+                    `SZ_W: fwd = {base[31:16], wb_wdata[15:0]};
+                    default: fwd = wb_wdata;
+                endcase
+            end else if (wb_aux_we && wb_aux_idx == idx)
+                fwd = wb_aux_data;
+            else
+                fwd = base;
         end
     endfunction
 
