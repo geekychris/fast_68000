@@ -1174,39 +1174,107 @@ module m68k_bus #(
             end else if (winner_valid && we[winner] && is_irq_reg) begin
                 if (be[winner][0]) irq_level <= wdata[winner][2:0];
             end else if (winner_valid && we[winner] && is_dsk_reg) begin
-                // Floppy DSKPT/DSKLEN writes.  Most accesses are 16-bit,
-                // landing in either high or low half of the 32-bit word.
-                // DSKPTH at $20 (word-aligned long): top 16 bits of DSKPT.
-                // DSKPTL at $22: bottom 16 bits.  DSKLEN at $24 (high half
-                // of long $24): length + DMAEN bit.
+                // Floppy DSKPT/DSKLEN writes.  The CPU presents (addr, be,
+                // is_long, wdata) where:
+                //   - aligned long at $DFF020: addr=$DFF020 be=1111 is_long=1,
+                //     wdata = full 32-bit ptr -> set DSKPT to wdata.
+                //   - word at $DFF020 (high half): addr=$DFF020 be=1100,
+                //     wdata[31:16] = the 16-bit value -> DSKPTH.
+                //   - word at $DFF022 (low half of $DFF020 long): addr=$DFF020
+                //     be=0011 wdata[15:0] = value -> DSKPTL.
+                //   - word at $DFF022 (direct addr): addr=$DFF022 be=0011
+                //     wdata[15:0] = value -> DSKPTL.
+                //   - unaligned long at $DFF022: addr=$DFF022 be=1111
+                //     is_long=1.  Spans DSKPTL ($DFF022,23) +
+                //     DSKLEN ($DFF024,25).  Bytes: $DFF022 <- wdata[31:24],
+                //     $DFF023 <- wdata[23:16], $DFF024 <- wdata[15:8],
+                //     $DFF025 <- wdata[7:0].  So DSKPTL <- wdata[31:16],
+                //     DSKLEN <- wdata[15:0].
+                //   - word at $DFF024 (DSKLEN, high half of long $DFF024):
+                //     addr=$DFF024 be=1100 wdata[31:16] = value -> DSKLEN.
+                //     (Some emitters use be=0011 with wdata[15:0]; handle
+                //     that too.)
+                //
+                // We trigger floppy DMA on writes that put a non-zero
+                // value in DSKLEN with bit 15 set.
                 if (addr[winner] == DSKPTH_ADDR) begin
-                    // Upper half of 32-bit DSKPT
-                    dsk_pt[31:16] <= wdata[winner][31:16];
+                    if (is_long[winner] && be[winner] == 4'b1111) begin
+                        // Aligned MOVE.L Dn, $DFF020 -- full DSKPT.
+                        dsk_pt <= wdata[winner];
+                    end else if (be[winner] == 4'b1100) begin
+                        // MOVE.W Dn, $DFF020 -- DSKPTH only.
+                        dsk_pt[31:16] <= wdata[winner][31:16];
+                    end else if (be[winner] == 4'b0011) begin
+                        // MOVE.W Dn, $DFF022 emitted with long-aligned addr.
+                        // wdata[15:0] goes to bytes $DFF022,$DFF023 = DSKPTL.
+                        dsk_pt[15:0] <= wdata[winner][15:0];
+                    end
                 end else if (addr[winner] == DSKPTL_ADDR) begin
-                    dsk_pt[15:0]  <= wdata[winner][15:0];
+                    if (is_long[winner] && be[winner] == 4'b1111) begin
+                        // Unaligned MOVE.L Dn, $DFF022 -- spans DSKPTL +
+                        // DSKLEN.  Bytes: 022,023 <- wdata[31:16] (DSKPTL),
+                        // 024,025 <- wdata[15:0] (DSKLEN).  If this DSKLEN
+                        // write has DMAEN (bit 31 = wdata[31] for old high
+                        // half, but here it's wdata[15]), kick off DMA.
+                        dsk_pt[15:0] <= wdata[winner][31:16];
+                        dsk_len      <= wdata[winner][15:0];
+                        if (wdata[winner][15] && !blk_busy) begin
+                            blk_busy    <= 1'b1;
+                            blk_byte_mode <= 1'b1;
+                            blk_cur_off <= 32'd0;
+                            // Combine DSKPTH (already set) + new DSKPTL.
+                            blk_cur_dst <= {dsk_pt[31:16], wdata[winner][31:16]};
+                            blk_dst     <= {dsk_pt[31:16], wdata[winner][31:16]};
+                            blk_count_in_bytes <= {17'd0, wdata[winner][13:0]} << 1;
+                        end
+                    end else if (be[winner] == 4'b0011 || be[winner] == 4'b1111) begin
+                        // Word write at $DFF022 (either lane-form).
+                        dsk_pt[15:0] <= wdata[winner][15:0];
+                    end else if (be[winner] == 4'b1100) begin
+                        // Word at $DFF022 with high-lane form (unusual).
+                        dsk_pt[15:0] <= wdata[winner][31:16];
+                    end
                 end else if (addr[winner] == DSKLEN_ADDR) begin
 `ifdef KICKSTART_BOOT_TRACE
-                    $display("[DSKLEN] wdata=%h dsk_pt=%h", wdata[winner], dsk_pt);
+                    $display("[DSKLEN] addr=%h be=%b is_long=%b wdata=%h dsk_pt=%h",
+                        addr[winner], be[winner], is_long[winner],
+                        wdata[winner], dsk_pt);
 `endif
-                    // Word write at $24 — value in high half of 32-bit
-                    // word (since $24 is long-aligned, addr[1]=0).
-                    dsk_len <= wdata[winner][31:16];
-                    // DMAEN bit 15: start transfer.  Re-use block-DMA
-                    // engine in byte-mode: source = current track*track_mfm,
-                    // dest = dsk_pt, count = (dsk_len & $3FFF) words << 1
-                    // bytes.
-                    if (wdata[winner][31] && !blk_busy) begin
-                        blk_busy    <= 1'b1;
-                        blk_byte_mode <= 1'b1;
-                        // Source: a "current track" register that tracks
-                        // CIA-B PRB step pulses.  POC: just start at 0
-                        // (always read track 0) so the boot block lands.
-                        blk_cur_off <= 32'd0;
-                        blk_cur_dst <= dsk_pt;
-                        blk_dst     <= dsk_pt;
-                        // dsk_len[14:0] holds the word count; the upper
-                        // bit is DMAEN.  Shift by 1 to get bytes.
-                        blk_count_in_bytes <= {17'd0, wdata[winner][29:16]} << 1;
+                    // DSKLEN is at the high half of its longword (addr[1]=0).
+                    if (is_long[winner] && be[winner] == 4'b1111) begin
+                        // Aligned MOVE.L Dn, $DFF024 -- DSKLEN in high half
+                        // (wdata[31:16]), $DFF026 (DSKDAT) in low half.
+                        // Trigger DMA on DMAEN bit set in DSKLEN value.
+                        dsk_len <= wdata[winner][31:16];
+                        if (wdata[winner][31] && !blk_busy) begin
+                            blk_busy    <= 1'b1;
+                            blk_byte_mode <= 1'b1;
+                            blk_cur_off <= 32'd0;
+                            blk_cur_dst <= dsk_pt;
+                            blk_dst     <= dsk_pt;
+                            blk_count_in_bytes <= {17'd0, wdata[winner][29:16]} << 1;
+                        end
+                    end else if (be[winner] == 4'b1100) begin
+                        dsk_len <= wdata[winner][31:16];
+                        if (wdata[winner][31] && !blk_busy) begin
+                            blk_busy    <= 1'b1;
+                            blk_byte_mode <= 1'b1;
+                            blk_cur_off <= 32'd0;
+                            blk_cur_dst <= dsk_pt;
+                            blk_dst     <= dsk_pt;
+                            blk_count_in_bytes <= {17'd0, wdata[winner][29:16]} << 1;
+                        end
+                    end else if (be[winner] == 4'b0011) begin
+                        // Some emitters send low-lane form.
+                        dsk_len <= wdata[winner][15:0];
+                        if (wdata[winner][15] && !blk_busy) begin
+                            blk_busy    <= 1'b1;
+                            blk_byte_mode <= 1'b1;
+                            blk_cur_off <= 32'd0;
+                            blk_cur_dst <= dsk_pt;
+                            blk_dst     <= dsk_pt;
+                            blk_count_in_bytes <= {17'd0, wdata[winner][13:0]} << 1;
+                        end
                     end
                 end
             end else if (winner_valid && we[winner] && is_blk_reg) begin
