@@ -502,6 +502,13 @@ test-boot-rom-bin:
 #
 # Usage: make test-kickstart-boot ROMFILE=kickstart/kick.bin
 # ---------------------------------------------------------------------------
+# ADFFILE (optional): point at a real Amiga .adf disk image (full 880KB).
+#   Default = empty -> synthesize a one-track boot disk via mkbootblock.py
+#   With ADFFILE set, MFM-encode all 160 tracks and size disk[] for the
+#   whole 1.4MB MFM payload.
+ADFFILE     ?=
+# Full ADF MFM-encoded is ~1.9 MB; 524288 32-bit words = 2 MB, fits 160 tracks.
+DISK_WORDS_FULL = 524288
 test-kickstart-boot:
 	@if [ ! -f "$(ROMFILE)" ]; then \
 	    echo "ROMFILE=$(ROMFILE) does not exist."; \
@@ -510,12 +517,24 @@ test-kickstart-boot:
 	fi
 	@mkdir -p build_kick_boot
 	$(PYTHON) tools/bin2rom.py --mem-words $(ROMSIZE_WORDS) $(ROMFILE) build_kick_boot/rom.hex
-	$(PYTHON) tools/mkbootblock.py build_kick_boot/boot.adf
-	$(PYTHON) tools/adf2mfm.py --mem-words 4096 --track 0 \
-	    build_kick_boot/boot.adf build_kick_boot/disk.hex
-	@$(MAKE) --no-print-directory build BUILD=build_kick_boot N_CORES=1 USE_CACHE=1 \
+	@if [ -n "$(ADFFILE)" ]; then \
+	    if [ ! -f "$(ADFFILE)" ]; then \
+	        echo "ADFFILE=$(ADFFILE) does not exist."; exit 1; \
+	    fi; \
+	    cp "$(ADFFILE)" build_kick_boot/boot.adf; \
+	    echo "Using user-provided ADF: $(ADFFILE)"; \
+	    $(PYTHON) tools/adf2mfm.py --mem-words $(DISK_WORDS_FULL) \
+	        build_kick_boot/boot.adf build_kick_boot/disk.hex; \
+	    DISK_WORDS_USED=$(DISK_WORDS_FULL); \
+	else \
+	    $(PYTHON) tools/mkbootblock.py build_kick_boot/boot.adf; \
+	    $(PYTHON) tools/adf2mfm.py --mem-words 4096 --track 0 \
+	        build_kick_boot/boot.adf build_kick_boot/disk.hex; \
+	    DISK_WORDS_USED=4096; \
+	fi; \
+	$(MAKE) --no-print-directory build BUILD=build_kick_boot N_CORES=1 USE_CACHE=1 \
 	    MEM_WORDS=131072 ROM_WORDS=$(ROMSIZE_WORDS) ROM_HEXFILE=rom.hex OVL_RESET=1 \
-	    DISK_WORDS=4096 DISK_HEXFILE=disk.hex \
+	    DISK_WORDS=$$DISK_WORDS_USED DISK_HEXFILE=disk.hex \
 	    VERI_DEFS='+define+KICKSTART_BOOT +define+KICKSTART_FAST_BOOT +define+KICKSTART_BOOT_TRACE $(EXTRA_VERI_DEFS)' \
 	    >build_kick_boot/_build.log 2>&1
 	$(PYTHON) $(TB_DIR)/asm68k.py tests/t63_boot_rom.s build_kick_boot/program.hex

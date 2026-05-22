@@ -1340,6 +1340,15 @@ module m68k_bus #(
                     chip_regs[{chip_idx[8:2], 2'b00}] <= wdata[winner][31:16];
                 if (be[winner][1] | be[winner][0])
                     chip_regs[{chip_idx[8:2], 2'b10}] <= wdata[winner][15:0];
+`ifdef KICKSTART_BOOT_TRACE
+                // Trace BPL1PT* and palette / display setup writes.
+                if (addr[winner] >= 32'h00DF_F0E0 && addr[winner] <= 32'h00DF_F0FF)
+                    $display("[BPLPT] addr=%h be=%b wdata=%h",
+                        addr[winner], be[winner], wdata[winner]);
+                if (addr[winner] >= 32'h00DF_F080 && addr[winner] <= 32'h00DF_F08C)
+                    $display("[COPCON] addr=%h be=%b wdata=%h",
+                        addr[winner], be[winner], wdata[winner]);
+`endif
             end else if (winner_valid && we[winner] && is_agnus_reg) begin
                 // DMACON write: bit 15 = SET (1) / CLR (0), bits 14..0 = mask.
                 if (addr[winner] == DMACON_ADDR) begin
@@ -1347,6 +1356,10 @@ module m68k_bus #(
                         dmacon <= dmacon | {1'b0, wdata[winner][14:0]};
                     else
                         dmacon <= dmacon & ~{1'b0, wdata[winner][14:0]};
+`ifdef KICKSTART_BOOT_TRACE
+                    $display("[DMACON] addr=%h be=%b wdata=%h cur=%h",
+                        addr[winner], be[winner], wdata[winner], dmacon);
+`endif
                 end
                 // DMACONR/VPOSR/VHPOSR are read-only; writes silently drop.
             end else if (winner_valid && we[winner] && is_blt_reg) begin

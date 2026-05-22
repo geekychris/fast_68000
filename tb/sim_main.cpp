@@ -243,8 +243,12 @@ static int run_regression(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
         uint32_t bpl1dat     = mem_peek_word(top, 0x00FE9104u);
         uint32_t bpl2dat     = mem_peek_word(top, 0x00FE9108u);
         uint32_t bplcon0     = mem_peek_word(top, 0x00FE911Cu);
-        printf("[sim] Agnus state: bpl_fetches=%u bpl1dat=%08x bpl2dat=%08x bplcon0=%08x\n",
-            bpl_fetches, bpl1dat, bpl2dat, bplcon0);
+        // DMACONR ($DFF002) reads the live DMACON value -- bit 8=BPLEN,
+        // bit 9=DMAEN.  Both must be high for Agnus to fetch bitplanes.
+        uint32_t dmaconr     = mem_peek_word(top, 0x00DFF002u);
+        printf("[sim] Agnus: bpl_fetches=%u dmaconr=%04x (BPLEN=%d DMAEN=%d) bplcon0=%08x bpl1dat=%08x\n",
+            bpl_fetches, dmaconr >> 16, (dmaconr >> (16 + 8)) & 1,
+            (dmaconr >> (16 + 9)) & 1, bplcon0, bpl1dat);
     }
 
     // Optional framebuffer dump as a PPM (P6) so Kickstart's rendered
