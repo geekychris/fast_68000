@@ -1427,3 +1427,42 @@ dependency / list-walk issue.  Filed task #44 with the full chain.
 
 Boot impact: no change from the S21 baseline (still r=46.3M before
 the garbage JMP fires).
+
+### S23: $4E... wall was MOVE-mem-to-mem CCR.Z stuck at 1; root cause CMPM-aside
+
+S22 misdiagnosed the wall as a Kickstart-internal library-dependency
+issue.  Tracing further showed the real cause: in OldOpenLibrary's
+search-name builder at $F81AF0:
+
+  MOVE.B (A0)+, (A1)+
+  BNE    $F81AF0
+
+the BNE never branched.  Our S_STORE K_MOVE handler was computing
+CCR.N/Z from `src_operand`, but `src_operand` is only populated for
+D-reg/A-reg sources -- for memory sources it stays 0 (the loaded
+byte lives in dc_rdata).  So *every* mem-to-mem MOVE.B set Z=1,
+the BNE fell through after one iteration, and the search string
+ended up as ".library" with the prefix smashed onto the same byte.
+
+FindResident then walked the resident list and never matched
+(the table-walk hits CMPM.B fine, but the search string was
+wrong from the start).  graphics.library stashed the 0 return
+into its $1A0 field, and the downstream `JSR $FFE2(A6=0)` walked
+off into unmapped memory.
+
+Fix: recover the moved byte/word/long from dc_wdata at S_STORE
+K_MOVE (the chained store already positioned it into the right
+lane at dst_ea[1:0]) and use that for N/Z.  Register-source moves
+keep using src_operand but with size masking.
+
+t120_move_b_ainc_ainc verifies the byte-copy + post-inc chain.
+t121_move_mem_ccr exercises the CCR set for B/W/L mem-to-mem
+with non-zero / zero / negative source bytes.
+
+Boot impact: passes the OldOpenLibrary builder, reaches r=94.4M
+(was r=46M) with three DSKLEN writes including one with a non-
+zero DSKPT ($00014FFF).  Floppy DMA is being set up for real now.
+Hits a new wall at chip-RAM $0001C051 with ILLEGAL opcode $0E16,
+filed as task #45.
+
+Status: 102/102 tests pass.
