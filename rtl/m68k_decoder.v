@@ -75,6 +75,7 @@ module m68k_decoder (
     localparam K_ADDX    = 6'd43;
     localparam K_SUBX    = 6'd44;
     localparam K_NEGX    = 6'd45;
+    localparam K_CMPM    = 6'd46;
 
     // Compute extension words for an EA (mode + reg + size).
     function [1:0] ea_ext;
@@ -655,6 +656,28 @@ module m68k_decoder (
                 src_mode = m3;
                 src_reg  = r0;
                 src_ext_words = ea_ext(m3, r0, `SZ_L);
+            end
+            // CMPM (Ay)+, (Ax)+ : pattern is `1011_???_1SS_001_???` with
+            // SS = 00/01/10 for B/W/L.  Mode bits 5:3 = 001 here mean
+            // "post-increment memory" (NOT An direct, despite the encoding
+            // overlap).  Must match BEFORE the EOR rule -- otherwise
+            // EOR.B Dn,<ea> with EA = An direct (= invalid) decodes and
+            // the boot mis-executes name-string compares in FindName.
+            16'b1011_???_100_001_???,        // CMPM.B
+            16'b1011_???_101_001_???,        // CMPM.W
+            16'b1011_???_110_001_???: begin  // CMPM.L
+                kind = K_CMPM;
+                size = size76(opcode[7:6]);
+                // src is (Ay)+ at r0; dst is (Ax)+ at r9.  Both are An
+                // post-increment.  Hand the decoder's "src" slot the Ay
+                // and "dst" slot the Ax so id_ra_idx reads Ay (via the
+                // K_CMPM rb case below) and id_rb_idx reads Ax.
+                src_mode = `EA_AINC;
+                src_reg  = r0;
+                dst_mode = `EA_AINC;
+                dst_reg  = r9;
+                src_ext_words = 2'd0;
+                dst_ext_words = 2'd0;
             end
             16'b1011_???_1??_???_???: begin   // EOR
                 kind = K_ALU;

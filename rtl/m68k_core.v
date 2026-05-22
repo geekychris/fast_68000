@@ -113,6 +113,7 @@ module m68k_core #(
     localparam K_ADDX    = 6'd43;
     localparam K_SUBX    = 6'd44;
     localparam K_NEGX    = 6'd45;
+    localparam K_CMPM    = 6'd46;
 
     // EX state.
     localparam S_RUN           = 4'd0;
@@ -139,6 +140,9 @@ module m68k_core #(
     localparam S_EXC_PUSH_ALO  = 4'd12;
     localparam S_EXC_PUSH_AHI  = 4'd13;
     localparam S_EXC_PUSH_SSW  = 4'd14;
+    // CMPM second-memory-load: first load (at Ay) completes in S_LOAD, then
+    // we issue a second load at Ax and finish in this state.
+    localparam S_CMPM_LOAD2    = 4'd15;
 
     // Helpful pure functions on byte position within a 32-bit word.
     function [3:0] be_for_byte;
@@ -493,7 +497,7 @@ module m68k_core #(
             K_MULU, K_MULS, K_DIVU, K_DIVS,
             K_BIT, K_SHIFT, K_EXG, K_CHK,
             K_ADDX, K_SUBX:                      id_rb_idx = id_reg_idx_full;
-            K_MOVE, K_MOVEA, K_MOVESR:           id_rb_idx = id_dst_base_idx;
+            K_MOVE, K_MOVEA, K_MOVESR, K_CMPM:   id_rb_idx = id_dst_base_idx;
             K_ALUI:                              id_rb_idx = {idec_dst_mode != `EA_DREG, idec_dst_reg};
             K_DBCC:                              id_rb_idx = {1'b0, idec_src_reg};
             default:                             id_rb_idx = 4'd0;
@@ -879,6 +883,10 @@ module m68k_core #(
     reg [15:0] ex_exc_ir;
     reg [15:0] ex_exc_ssw;
 
+    // CMPM (Ay)+, (Ax)+ saves the first load's data here while the second
+    // load is in flight.  Size-extracted (byte/word/long aligned).
+    reg [31:0] cmpm_ay_data;
+
     // MOVEM iterator state.
     reg [15:0] movem_mask;       // remaining bits to process (LSB-first)
     reg  [4:0] movem_idx;        // current bit position (0..15; 16 = done)
@@ -1069,12 +1077,17 @@ module m68k_core #(
                                  !bit_mem_writes &&
                                  !alui_mem_writes &&
                                  !alu_mem_dst_writes &&
+                                 (ex_kind != K_CMPM) &&
                                  !(ex_kind == K_MOVE && dst_is_mem);
     wire is_settled_after_store= (ex_state == S_STORE) && dc_ack && ex_valid && !halted;
     wire is_settled_after_tasw = (ex_state == S_TASW)  && dc_ack && ex_valid && !halted;
     wire is_settled_after_exc  = (ex_state == S_EXC_FETCH) && dc_ack && ex_valid && !halted;
     wire is_settled_after_rte  = (ex_state == S_RTE_POP_PC) && dc_ack && ex_valid && !halted;
     wire is_settled_after_rmw  = (ex_state == S_RMW_W) && dc_ack && ex_valid && !halted;
+    // CMPM second load completes here; CCR + Ax post-inc are committed by
+    // the combinational S_CMPM_LOAD2 planning, instruction settles.
+    wire is_settled_after_cmpm = (ex_state == S_CMPM_LOAD2) && dc_ack &&
+                                 ex_valid && !halted;
     // MOVEM settles only when the mask is fully exhausted AND we are not
     // mid-transaction (so the final An commit happens cleanly).
     wire is_settled_after_movem = movem_active && !movem_busy &&
@@ -1082,7 +1095,8 @@ module m68k_core #(
     wire is_settled = is_settled_in_run || is_settled_after_load ||
                       is_settled_after_store || is_settled_after_tasw ||
                       is_settled_after_exc || is_settled_after_rte ||
-                      is_settled_after_rmw || is_settled_after_movem;
+                      is_settled_after_rmw || is_settled_after_movem ||
+                      is_settled_after_cmpm;
 
     assign stall = ex_valid && !halted && !is_settled;
 
@@ -1275,6 +1289,16 @@ module m68k_core #(
                                 wb_main_data_c = alu_y;
                             end
                         end
+                    end
+                    // CMPM (Ay)+, (Ax)+ : two sequential memory reads then CMP.
+                    // First load at Ay (= ex_ra, since src_mode=AINC src_reg=Ay).
+                    // S_LOAD ack saves the first byte/word/long, kicks off the
+                    // second load at Ax, and transitions to S_CMPM_LOAD2.
+                    K_CMPM: begin
+                        want_mem  = 1'b1;
+                        want_we   = 1'b0;
+                        want_addr = src_ea;
+                        want_be   = 4'b1111;
                     end
                     // ADDX/SUBX register form (Dy,Dx).  Memory form (-(Ay),-(Ax))
                     // not yet implemented; would need 2-read + 1-write RMW.
@@ -2097,6 +2121,14 @@ module m68k_core #(
             end
             S_LOAD: begin
                 case (ex_kind)
+                    K_CMPM: begin
+                        // First load (at Ay) just arrived.  No commits here
+                        // because the instruction hasn't settled yet (we
+                        // chain a second load and finish at S_CMPM_LOAD2).
+                        // Ay/Ax post-increments are committed at the
+                        // S_CMPM_LOAD2 settle to mirror the K_MOVE
+                        // mem-to-mem deferred-commit pattern.
+                    end
                     K_MOVE: begin
                         // For memory-to-memory moves the destination is not a
                         // register, so suppress register writeback for the
@@ -2447,6 +2479,38 @@ module m68k_core #(
                 cc_n_c = byte_at(ex_tas_word, dc_addr[1:0])[7];
                 cc_z_c = (byte_at(ex_tas_word, dc_addr[1:0]) == 8'd0);
             end
+            S_CMPM_LOAD2: begin
+                if (ex_kind == K_CMPM) begin
+                    // Second load (at Ax) just arrived.  Compute CMP =
+                    // Ax_data - Ay_data, set CCR, commit BOTH Ay and Ax
+                    // post-increments.  Main writeback carries Ay (= ex_src_reg)
+                    // and aux carries Ax (= ex_dst_reg).
+                    alu_op_c   = `ALU_CMP;
+                    alu_size_c = ex_size;
+                    alu_b      = cmpm_ay_data;   // source (Ay)
+                    case (ex_size)
+                        `SZ_B: alu_a = {24'd0, byte_at(dc_rdata, dc_addr[1:0])};
+                        `SZ_W: alu_a = {16'd0, dc_addr[1] ? dc_rdata[15:0]
+                                                          : dc_rdata[31:16]};
+                        default: alu_a = dc_rdata;
+                    endcase
+                    cc_we_c = 1'b1;
+                    cc_n_c = alu_n; cc_z_c = alu_z;
+                    cc_v_c = alu_v; cc_c_c = alu_c;
+                    // CMP doesn't touch X.
+                    if (src_an_update) begin
+                        wb_main_we_c   = 1'b1;
+                        wb_main_idx_c  = {1'b1, ex_src_reg};
+                        wb_main_size_c = `SZ_L;        // An writes are 32-bit
+                        wb_main_data_c = src_an_next;
+                    end
+                    if (dst_an_update) begin
+                        wb_aux_we_c   = 1'b1;
+                        wb_aux_idx_c  = {1'b1, ex_dst_reg};
+                        wb_aux_data_c = dst_an_next;
+                    end
+                end
+            end
             default: ;
         endcase
 
@@ -2547,6 +2611,7 @@ module m68k_core #(
             movem_predec <= 1'b0;
             movem_an_update <= 1'b0;
             movem_an_idx <= 3'd0;
+            cmpm_ay_data <= 32'd0;
             dc_req_r <= 1'b0;
             dc_we <= 1'b0; dc_lock <= 1'b0;
             dc_addr <= 32'd0; dc_wdata <= 32'd0; dc_be <= 4'b1111;
@@ -2844,6 +2909,27 @@ module m68k_core #(
                                     dc_addr[1:0]);
                             endcase
                             ex_state <= S_RMW_W;
+                        end else if (ex_kind == K_CMPM) begin
+                            // CMPM (Ay)+, (Ax)+: capture the first load's
+                            // size-extracted data and issue the second load
+                            // at Ax.  The compare + CCR commit happens at
+                            // S_CMPM_LOAD2 ack.  Ay post-inc has already
+                            // been driven via wb_aux above (combinational).
+                            case (ex_size)
+                                `SZ_B: cmpm_ay_data <=
+                                    {24'd0, byte_at(dc_rdata, dc_addr[1:0])};
+                                `SZ_W: cmpm_ay_data <=
+                                    {16'd0, dc_addr[1] ? dc_rdata[15:0]
+                                                       : dc_rdata[31:16]};
+                                default: cmpm_ay_data <= dc_rdata;
+                            endcase
+                            dc_req_r <= 1'b1;
+                            dc_we    <= 1'b0;
+                            dc_lock  <= 1'b0;
+                            dc_addr  <= dst_ea;
+                            dc_be    <= 4'b1111;
+                            dc_is_long <= (ex_size == `SZ_L);
+                            ex_state <= S_CMPM_LOAD2;
                         end else if (ex_kind == K_MOVE && dst_is_mem) begin
                             // Memory-to-memory MOVE: chain a store of the
                             // loaded data to dst_ea.  For .B/.W, slot the byte
@@ -2879,6 +2965,13 @@ module m68k_core #(
                     if (dc_ack) begin
                         dc_req_r <= 1'b0;
                         dc_lock <= 1'b0;
+                        ex_state <= S_RUN;
+                    end
+                end
+                S_CMPM_LOAD2: begin
+                    if (dc_ack) begin
+                        dc_req_r <= 1'b0;
+                        dc_lock  <= 1'b0;
                         ex_state <= S_RUN;
                     end
                 end
