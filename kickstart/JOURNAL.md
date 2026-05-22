@@ -1390,3 +1390,40 @@ r=1.5M to r=46.3M before hitting a different [BAD-PC] (jump from
 $4EDFF176 to $4E550000; task #44 filed).
 
 Status: 100/100 tests pass.
+
+### S22: $4E... garbage wall traced to graphics.OldOpenLibrary("keymap.library") returning 0
+
+The "JMP to $4E..." wall at r=46M wasn't a single bad JMP -- it was a
+single `JSR $FFE2(A6)` with A6=0 at r=1,569,672 that vectored to
+$FFFFFFE2.  Memory fetches in that range return 0 from the bus, so
+the CPU walked ~45M $0000 = ORI.B #imm, D0 NOPs (each advancing PC
+by 4) until eventually some non-NOP opcode word fired a real BAD-PC
+trap.  The actual fault is at the JSR.
+
+Walking back:
+- $F96D04: `JSR $FFE2(A6)` -- A6 = 0
+- $F96D00: `MOVEA.L $01A0(A6), A6` loaded A6 from offset $1A0 of the
+  caller's A6 (= graphics base $6874).  Field was 0.
+- $F8BED2: graphics's init at $F8BE80 stores D0 at $01A0(graphics) --
+  D0 came from `JSR $FCD6(A6=ExecBase)`, i.e. LVO -810 = the
+  OldOpenLibrary equivalent at $F81ACE.
+- $F8BEC6: D0 = 7 (an index into a name table at $F81A7E -- the table
+  is "graphics\0layers\0intuition\0dos\0icon\0expansion\0utility\0
+  keymap\0..."  D0=7 -> "keymap").
+- So graphics opens "keymap.library" at init and stashes its base in
+  $1A0; downstream code reads $1A0 and JSRs through it as a library.
+
+Why does the open return 0?  In K1.3 residents are init'd in priority
+order: graphics rt_Pri = 65, keymap rt_Pri = 40.  Graphics runs
+*first*.  When graphics's init calls OldOpenLibrary("keymap.library"),
+keymap hasn't been initialised yet.  OldOpenLibrary's standard
+fallback is FindResident + InitResident on the named resident, but
+in our boot that path returns 0 -- either FindResident isn't seeing
+keymap's tag in the resident list, or InitResident on it fails.
+
+This is the new wall (task #44).  Different in flavor from the prior
+walls: no single CPU bug to fix, more likely a Kickstart-internal
+dependency / list-walk issue.  Filed task #44 with the full chain.
+
+Boot impact: no change from the S21 baseline (still r=46.3M before
+the garbage JMP fires).

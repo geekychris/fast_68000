@@ -2637,6 +2637,8 @@ module m68k_core #(
             if (ex_state == S_RUN && ex_valid && !halted && exc_launch_c)
                 $display("[EXC] r=%d pc=%h opcode=%h kind=%d vec=%d",
                     retired, ex_pc, ex_opcode, ex_kind, exc_vector_c);
+            if (is_settled && (retired[19:0] == 20'd0))
+                $display("[PC-tick] r=%d pc=%h opcode=%h", retired, ex_pc, ex_opcode);
 `endif
             if (is_settled && cc_we_c) begin
                 cc_n <= cc_n_c; cc_z <= cc_z_c; cc_v <= cc_v_c; cc_c <= cc_c_c;
