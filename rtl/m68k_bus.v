@@ -1341,12 +1341,12 @@ module m68k_bus #(
                 if (be[winner][1] | be[winner][0])
                     chip_regs[{chip_idx[8:2], 2'b10}] <= wdata[winner][15:0];
 `ifdef KICKSTART_BOOT_TRACE
-                // Trace BPL1PT* and palette / display setup writes.
+                // Trace bitplane pointer + Copper-list writes that bring
+                // up Kickstart's display.  CPU-side cop-list writes are
+                // captured separately in m68k_core via [CPUCOP] which
+                // gives PC, so we keep this trace narrow.
                 if (addr[winner] >= 32'h00DF_F0E0 && addr[winner] <= 32'h00DF_F0FF)
                     $display("[BPLPT] addr=%h be=%b wdata=%h",
-                        addr[winner], be[winner], wdata[winner]);
-                if (addr[winner] >= 32'h00DF_F080 && addr[winner] <= 32'h00DF_F08C)
-                    $display("[COPCON] addr=%h be=%b wdata=%h",
                         addr[winner], be[winner], wdata[winner]);
 `endif
             end else if (winner_valid && we[winner] && is_agnus_reg) begin

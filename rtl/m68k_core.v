@@ -2806,6 +2806,14 @@ module m68k_core #(
                     retired, ex_pc, ex_src_imm32[15:0]);
                 stop_logged_pc <= ex_pc;
             end
+            // Trace CPU writes to Copper-list-pointer regs (COP1LC / COP2LC).
+            // Useful to see when (if) Intuition.OpenScreen installs a new
+            // screen Copper list, which on a successful boot screen would
+            // appear at $DFF080 after Kickstart's initial boot list.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h00DF_F080 && dc_addr <= 32'h00DF_F087)
+                $display("[CPUCOP] r=%d pc=%h kind=%d addr=%h be=%b wdata=%h",
+                    retired, ex_pc, ex_kind, dc_addr, dc_be, dc_wdata);
             // Exception launches happen in S_RUN with exc_launch_c set --
             // that gates run_launches_exc and disables is_settled_in_run,
             // so is_settled and exc_launch_c are mutually exclusive.  Use
