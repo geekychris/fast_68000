@@ -904,6 +904,10 @@ module m68k_core #(
     reg [3:0] ex_state;
 
     reg [31:0] ex_tas_word;  // word read in TAS phase 0
+    // Latched PC of the last STOP instruction we logged, so [STOP]
+    // $display fires once per fresh STOP rather than every clock cycle
+    // the CPU sits halted at the same STOP PC.
+    reg [31:0] stop_logged_pc;
     // CCR snapshot captured at S_LOAD ack for mem-dest RMW kinds where
     // S_RMW_W settle needs the *operation's* flags (not the registered
     // CCR which may have moved on).  Used by K_ALUI mem-dest path.
@@ -2782,6 +2786,7 @@ module m68k_core #(
             halted <= 1'b0;
             halt_code <= 16'd0;
             retired <= 32'd0;
+            stop_logged_pc <= 32'hFFFF_FFFF;
         end else begin
             // Count instructions that complete each cycle. STOP doesn't count.
             if (is_settled && ex_kind != K_STOP) retired <= retired + 32'd1;
@@ -2790,9 +2795,17 @@ module m68k_core #(
                 $display("[PC] r=%d pc=%h kind=%d", retired, ex_pc, ex_kind);
 `endif
 `ifdef KICKSTART_BOOT_TRACE
-            if (ex_kind == K_STOP && is_settled)
+            // STOP logs once when it first settles -- without the edge
+            // detect, K_STOP's is_settled stays high every cycle of the
+            // halt and floods the log (76M [STOP] lines in a 200M-cycle
+            // run).  `stop_logged_pc` remembers the last PC that fired
+            // the trace; we re-fire only when PC changes (= entered a
+            // new STOP).
+            if (ex_kind == K_STOP && is_settled && ex_pc != stop_logged_pc) begin
                 $display("[STOP] r=%d pc=%h imm=%h",
                     retired, ex_pc, ex_src_imm32[15:0]);
+                stop_logged_pc <= ex_pc;
+            end
             // Exception launches happen in S_RUN with exc_launch_c set --
             // that gates run_launches_exc and disables is_settled_in_run,
             // so is_settled and exc_launch_c are mutually exclusive.  Use
@@ -2889,8 +2902,11 @@ module m68k_core #(
                 // we'd trap, but real Kickstart never executes STOP from
                 // user mode and our tests don't either.
 `ifdef KICKSTART_BOOT_TRACE
-                $display("[STOP] PC=%h imm=%h retired=%d sr_s=%b sr_i=%d sp=%h",
-                    ex_pc, ex_imm_raw[15:0], retired, sr_s, sr_i, rf_rc_data);
+                // Only log on first-touch -- this block fires every cycle
+                // STOP is in S_RUN, which would flood the log otherwise.
+                if (ex_pc != stop_logged_pc)
+                    $display("[STOP] PC=%h imm=%h retired=%d sr_s=%b sr_i=%d sp=%h",
+                        ex_pc, ex_imm_raw[15:0], retired, sr_s, sr_i, rf_rc_data);
 `endif
                 if (sr_s) begin
                     sr_t <= ex_imm_raw[`SR_T];

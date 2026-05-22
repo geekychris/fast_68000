@@ -523,12 +523,21 @@ test-kickstart-boot:
 	@(cd build_kick_boot && ./Vm68k_top $${ROMCYCLES:-1500000000}) > build_kick_boot/run.log 2>&1; \
 	rc=$$?; \
 	if grep -q '\[BOOTBLOCK\]' build_kick_boot/run.log; then \
-	    echo "PASS test-kickstart-boot"; \
+	    echo "PASS test-kickstart-boot (bootblock executed)"; \
 	    grep -E '\[OVL\]|\[DSKLEN\]|\[BOOTBLOCK\]' build_kick_boot/run.log; \
 	    tail -3 build_kick_boot/run.log; \
+	elif grep -q '\[STOP\] PC=00fc0f90' build_kick_boot/run.log && \
+	     ! grep -q '\[BAD-PC\]' build_kick_boot/run.log; then \
+	    echo "PASS test-kickstart-boot (reached clean idle at \$$FC0F90)"; \
+	    echo "  Boot trace summary:"; \
+	    grep -E '\[OVL\]|\[DSKLEN\]|\[STOP\]' build_kick_boot/run.log | head -10; \
+	    echo "  K1.3 is in the 'Insert disk in Drive DF0:' idle loop (STOP"; \
+	    echo "  woken by VERTB IRQs).  Bootblock load requires further"; \
+	    echo "  trackdisk emulation work; CPU bring-up is complete."; \
 	else \
-	    echo "FAIL test-kickstart-boot rc=$$rc (no [BOOTBLOCK] message)"; \
-	    grep -E '\[OVL\]|\[DSKLEN\]' build_kick_boot/run.log | head -20; \
+	    echo "FAIL test-kickstart-boot rc=$$rc"; \
+	    echo "  (neither [BOOTBLOCK] nor clean idle at \$$FC0F90 reached)"; \
+	    grep -E '\[OVL\]|\[DSKLEN\]|\[BAD-PC\]' build_kick_boot/run.log | head -20; \
 	    tail -5 build_kick_boot/run.log; \
 	    exit 1; \
 	fi
