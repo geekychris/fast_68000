@@ -187,6 +187,19 @@ module m68k_cache #(
                             data[idx] <= merge_be(data[idx], cpu_wdata, cpu_be);
                         if (hit && (cpu_be == 4'b1111) && (cpu_addr[1:0] == 2'b10))
                             valids[idx] <= 1'b0;
+                        // Unaligned .L write also modifies the *next* mem[]
+                        // entry on the bus.  Invalidate that cache line too
+                        // (unconditionally, regardless of tag) so any cached
+                        // aligned read of (cpu_addr & ~3) + 4 takes the bus
+                        // path and sees the second half of the just-written
+                        // longword.  Surfaced by the Musashi cosim at K1.3
+                        // boot $FC15DA (MOVE.L D1, -(A0) unaligned): a prior
+                        // aligned read of $1C84 was cached, then the
+                        // unaligned write at $1C82 silently updated the
+                        // second half of $1C84 in mem[], and the next read
+                        // hit the stale cache.
+                        if ((cpu_be == 4'b1111) && (cpu_addr[1:0] == 2'b10))
+                            valids[idx + 1'b1] <= 1'b0;
                         bus_req_r <= 1'b1;
                         bus_we  <= 1'b1;
                         bus_lock <= cpu_lock;

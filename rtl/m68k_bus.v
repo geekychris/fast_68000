@@ -352,16 +352,23 @@ module m68k_bus #(
     localparam [31:0] POT1DAT_ADDR = 32'h00DF_F014;   // pot 1 sample
     localparam [31:0] JOY0DAT_ADDR = 32'h00DF_F00A;
     localparam [31:0] JOY1DAT_ADDR = 32'h00DF_F00C;
-    // SERDATR idle: TBE (bit 13) | TSRE (bit 12), RBF (bit 14) = 0 so
-    // no spurious "received byte" wakes up the Kickstart 1.3 Romwack
-    // serial poll at $F83B98 (BTST #14, D0; BNE got-byte).  Low byte
-    // must NOT be $7F: Kickstart 1.3's post-init self-test at $F84048
-    // does `MOVE.W SERDATR, D0; AND.B #$7F, D0; CMP.B #$7F, D0; DBEQ D1`
-    // -- DBEQ loops while EQ.  A constant $7F means the loop hits the
-    // timeout exit with Z=1, which BEQs to the "SAD!" Alert path at
-    // $F83BF6.  Earlier this code thought $7F was a "self-test PASS"
-    // magic; it's actually the FAIL value.  Use $3000 (data=0).
-    localparam [15:0] SERDATR_VAL  = 16'h3000;
+    // SERDATR idle on real Amiga: serial RX line floats high so the
+    // receive buffer reads as $FF (or $7F if 7-bit mode).  Kickstart
+    // 1.3's serial self-test at $FC30DA does:
+    //   MOVE.W $DFF018, D0 ; ANDI.B #$7F, D0 ; CMPI.B #$7F, D0
+    //   DBEQ D1, -50       ; BMI Alert
+    // DBEQ exits on EQ (cc=EQ) -- so the test expects the low 7 bits
+    // to read as $7F so EQ is true on the first iteration, then BMI
+    // (testing N from the CMPI) sees N=0 and falls through.  A low
+    // byte of $00 (the previous $3000 setting) makes CMP set N=1,
+    // DBEQ loops until D1 underflows, then BMI fires and triggers
+    // ColdReboot.
+    //
+    // Bits 13 (TBE) and 12 (TSRE) signal transmit-buffer / transmit-
+    // shift-register empty; we keep them set.  RBF (bit 14) stays 0
+    // so the Romwack serial poll at $F83B98 doesn't think a byte has
+    // arrived.
+    localparam [15:0] SERDATR_VAL  = 16'h307F;
     localparam [15:0] POTGOR_VAL   = 16'hFFFF;
     localparam [15:0] POT_DAT_VAL  = 16'h0000;
     localparam [15:0] JOY_DAT_VAL  = 16'h0000;
@@ -626,13 +633,18 @@ module m68k_bus #(
                       (addr[winner] == BLKCMD_AD));
     // The legacy chipset region ($00FE_0000-$00FE_05FF) was this codebase's
     // pre-canonical-Amiga convention.  It collides with the Kickstart ROM
-    // (which lives at $00F8_0000-$00FF_FFFF) whenever the loaded ROM is
-    // larger than ~$60000 bytes — for a real 512 KB Kickstart, reads at
-    // $00FE_xxxx hit a blitter/copper/etc. slave that masks the ROM data,
-    // breaking the ROM checksum the moment it walks past $F80000+$60000.
-    // Disable the legacy window when the ROM extends into it; canonical
-    // Amiga chipset at $00DF_F000+ stays active regardless.
-    localparam LEGACY_CHIPSET = (ROM_WORDS <= 98304);
+    // window ($00F8_0000-$00FF_FFFF) any time the loaded ROM either
+    //   - is large enough to physically occupy $FE0000 (≥ ~384 KB), OR
+    //   - is a 256 KB ROM whose mirror at $FC0000-$FFFFFF covers $FE0000.
+    // K1.3 sits in the 256 KB camp: an explicit `JSR $00FE0358` in the
+    // boot path lands on a valid ROM-mirror function at offset $20358;
+    // with legacy chipset active, the legacy blitter slave at $FE0xxx
+    // intercepts the read and returns 0, so the JSR target is garbage.
+    //
+    // Disable the legacy window for any "real" Kickstart-sized ROM
+    // (>= 16 K words = 64 KB).  Test programs use smaller ROMs (≤ 4 K
+    // words) so they continue to see the legacy demos region.
+    localparam LEGACY_CHIPSET = (ROM_WORDS < 16384);
 
     wire is_blt_legacy = LEGACY_CHIPSET && (addr[winner] >= BLT_BASE) && (addr[winner] <= BLT_END);
     wire is_blt_amiga  = (addr[winner] >= BLT_AMIGA_BASE) && (addr[winner] <= BLT_AMIGA_END);

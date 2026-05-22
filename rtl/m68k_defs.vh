@@ -129,11 +129,17 @@
 //  Reset and boot
 // ----------------------------------------------------------------------------
 `ifdef KICKSTART_BOOT
-// Kickstart's first executable instruction is at $F800D2 (sets SSP via
-// LEA, so we don't need a valid reset SSP).  Real 68k would fetch
-// SSP/PC from $0/$4 here, but our trampoline-at-$400 approach is
-// shadowed by OVL=1 making low memory show the ROM.
-`define RESET_PC   32'h00F8_00D2
+// Kickstart's first executable instruction is at $FC00D2 for a 256 KB
+// Kickstart 1.x ROM, or $F800D2 for a 512 KB Kickstart 2.x+ ROM.
+// The ROM's reset vector at offset 4 reads the canonical address;
+// 256 KB K1.3 expects $00FC00D2.
+//
+// Canonical 256 KB K1.3 reset PC.  Required for K1.3's privilege-
+// violation handler at $F8090E to recognise the Supervisor() trap
+// site (it hardcodes $FC08E6 / $FC08F6 as the CMP target) and for
+// the in-ROM `JSR $FE0358` mirror call.  Was $F8 for a while; see
+// journal entries S30-S31 for the cascade that fix unblocked.
+`define RESET_PC   32'h00FC_00D2
 `else
 `define RESET_PC   32'h0000_0400
 `endif

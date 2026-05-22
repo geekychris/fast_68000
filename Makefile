@@ -172,6 +172,52 @@ $(MUSASHI_BUILD)/musashi_sim: $(MUSASHI_BUILD)/m68kops.c $(MUSASHI_DIR)/m68kcpu.
 	    $(MUSASHI_BUILD)/m68kops.c \
 	    $(TB_DIR)/musashi_main.c
 
+# Kickstart-boot variant: loads a 256 KB Kickstart ROM (not a hex-test
+# image), stubs the Amiga chipset minimally, and optionally writes a
+# per-instruction trace.  Used by the K1.3 cosim diff.
+musashi-kick: $(MUSASHI_BUILD)/musashi_kick
+$(MUSASHI_BUILD)/musashi_kick: $(MUSASHI_BUILD)/m68kops.c $(MUSASHI_DIR)/m68kcpu.c $(MUSASHI_DIR)/m68kdasm.c $(TB_DIR)/musashi_kick.c
+	$(CC) $(MUSASHI_CFLAGS) -o $@ \
+	    $(MUSASHI_DIR)/m68kcpu.c \
+	    $(MUSASHI_DIR)/m68kdasm.c \
+	    $(MUSASHI_DIR)/softfloat/softfloat.c \
+	    $(MUSASHI_BUILD)/m68kops.c \
+	    $(TB_DIR)/musashi_kick.c
+
+# Cosim: run K1.3 through both Musashi and our Verilator core,
+# diff per-instruction traces, report the first divergence.
+ROMFILE      ?= kickstart/kick_13.bin
+COSIM_INSTRS ?= 1000000
+cosim-kick: $(MUSASHI_BUILD)/musashi_kick
+	@$(MAKE) --no-print-directory test-kickstart-boot \
+	    ROMFILE=$(ROMFILE) ROMSIZE_WORDS=65536 ROMCYCLES=20000000 \
+	    EXTRA_VERI_DEFS='+define+KICKSTART_COSIM_TRACE' \
+	    >build_kick_boot/_cosim.log 2>&1 || true
+	@grep '^\[Cosim\]' build_kick_boot/run.log \
+	    | awk '{print substr($$0, index($$0,$$2))}' \
+	    > build_kick_boot/veri_trace.log
+	@grep '^\[CosimW\]' build_kick_boot/run.log \
+	    | awk '{print substr($$0, index($$0,$$2))}' \
+	    > build_kick_boot/veri_wtrace.log
+	@./$(MUSASHI_BUILD)/musashi_kick $(ROMFILE) $(COSIM_INSTRS) \
+	    build_kick_boot/musashi_trace.log \
+	    build_kick_boot/musashi_wtrace.log
+	@echo "---"
+	@echo "Verilator trace: $$(wc -l < build_kick_boot/veri_trace.log) lines"
+	@echo "Musashi  trace: $$(wc -l < build_kick_boot/musashi_trace.log) lines"
+	@n=$$(diff build_kick_boot/veri_trace.log build_kick_boot/musashi_trace.log \
+	      | head -5); \
+	if [ -n "$$n" ]; then \
+	    echo "--- first instr-trace divergence ---"; \
+	    diff -u build_kick_boot/veri_trace.log build_kick_boot/musashi_trace.log \
+	        | grep -E '^[+-]' | head -10; \
+	else \
+	    echo "Instr traces identical -- no CPU bug visible in this window"; \
+	fi
+	@echo "--- first write-trace divergence ---"
+	@diff -u build_kick_boot/veri_wtrace.log build_kick_boot/musashi_wtrace.log \
+	    | grep -E '^[+-]' | head -10 || echo "(write traces identical)"
+
 # Cross-validation: run each whitelisted test on both Verilator and Musashi
 # and diff the halt codes.  Any divergence means a real bug in one of them.
 crosscheck: $(MUSASHI_BUILD)/musashi_sim

@@ -343,7 +343,14 @@ module m68k_core #(
             // A speculative fetch may still be in flight to the cache. Mark
             // it for drain so the eventual ack is discarded before we start
             // the redirected fetch.
-            if_pc <= redirect_pc;
+            // 68000 has a 24-bit external address bus (A1..A23) -- PC is
+            // 32 bits internally but the upper 8 bits are ignored on every
+            // bus fetch.  K1.3 stores function pointers with garbage in the
+            // top byte (e.g., vector $20 = $7800090E should fetch from $90E
+            // on real hardware).  Mask redirect targets here so downstream
+            // fetch, decode, exception-frame-push etc. all use the same
+            // 24-bit address.
+            if_pc <= {8'd0, redirect_pc[23:0]};
             if_words_done <= 3'd0;
             if_busy <= 1'b0;
             if_slot <= 3'd0;
@@ -629,6 +636,11 @@ module m68k_core #(
     wire [31:0] id_ra_fwd = fwd(id_ra_idx, rf_ra_data);
     wire [31:0] id_rb_fwd = fwd(id_rb_idx, rf_rb_data);
     wire [31:0] id_sp_fwd = fwd(id_rc_idx, rf_rc_data);
+    // True A7 read (post-forwarding) used by stack ops that *also*
+    // mux the rc port to an index register (e.g. PEA d8(An,Xn)).
+    // For those instructions ex_sp is the index, not the stack
+    // pointer, so we need a separate path to the current A7.
+    wire [31:0] current_a7 = fwd(4'd15, u_rf.regs[15]);
 
     // ====================================================================
     //  ID/EX register.
@@ -651,6 +663,9 @@ module m68k_core #(
     reg  [31:0] ex_ra;
     reg  [31:0] ex_rb;
     reg  [31:0] ex_sp;
+    // Latched A7 -- always carries the real stack pointer, even when
+    // ex_sp is muxed to an index register for d8(An, Xn) operands.
+    reg  [31:0] ex_a7;
     reg  [3:0]  ex_reg_idx_full;
     reg         ex_predicted_taken;
     reg  [15:0] ex_opcode;       // current instruction word (for Group-0 IR push)
@@ -675,6 +690,7 @@ module m68k_core #(
             ex_ra <= 32'd0;
             ex_rb <= 32'd0;
             ex_sp <= 32'd0;
+            ex_a7 <= 32'd0;
             ex_reg_idx_full <= 4'd0;
             ex_predicted_taken <= 1'b0;
             ex_size <= `SZ_L;
@@ -706,6 +722,7 @@ module m68k_core #(
             ex_ra          <= id_ra_fwd;
             ex_rb          <= id_rb_fwd;
             ex_sp          <= id_sp_fwd;
+            ex_a7          <= current_a7;
             ex_opcode      <= id_op;
             ex_reg_idx_full<= id_reg_idx_full;
             ex_predicted_taken <= id_predicted_taken;
@@ -956,7 +973,13 @@ module m68k_core #(
     // Address used for the current step's bus transaction. Predec uses an
     // address one step below the tracked An (the An is decremented along with
     // the transfer); other modes use the tracked address directly.
-    wire [31:0] movem_step_addr = movem_predec ? (movem_addr - 32'd4) : movem_addr;
+    // Step size: 4 bytes per register for MOVEM.L, 2 for MOVEM.W.  Surfaced
+    // by the K1.3 boot wall at $FC6BD0 (MOVEM.W D6/D7, -(SP)): our core
+    // always advanced SP by 4 per register, smashing 4 extra bytes on the
+    // task stack and the subsequent RTS popped $0 from $18D0.
+    wire [31:0] movem_step_bytes = (ex_size == `SZ_L) ? 32'd4 : 32'd2;
+    wire [31:0] movem_step_addr = movem_predec ? (movem_addr - movem_step_bytes)
+                                                : movem_addr;
     // Combinational signal: the current bus step has just acked. Used to gate
     // intermediate regfile writes (for load-MOVEM) without going through
     // is_settled (which only fires at end-of-instruction).
@@ -1186,8 +1209,11 @@ module m68k_core #(
                     end
                     K_JSR: begin
                         // Issue store of return address; branch + SP commit at S_STORE.
+                        // Use ex_a7 (the real A7) -- for JSR d8(An, Xn) the
+                        // rc port carries Xn so ex_sp would be the index, not
+                        // SP.  Same bug class as K_PEA fixed in S32.
                         want_mem = 1'b1; want_we = 1'b1;
-                        want_addr = ex_sp - 32'd4;
+                        want_addr = ex_a7 - 32'd4;
                         want_wdata = ex_pc_next;
                         want_be = 4'b1111;
                     end
@@ -1269,20 +1295,27 @@ module m68k_core #(
                             want_be = 4'b1111;
                         end else begin
                             alu_b = src_operand;
-                            cc_we_c = 1'b1;
-                            cc_n_c = alu_n; cc_z_c = alu_z; cc_v_c = alu_v; cc_c_c = alu_c;
-                            // ADD/SUB write X; CMP doesn't.  ADDA/SUBA also
-                            // skip X per spec (Pn-dest is An here, but those
-                            // come through with ex_alu_op==ADD/SUB too -- the
-                            // 68k spec says ADDA/SUBA don't touch CCR at
-                            // all; preserved by reg_is_a path skipping
-                            // cc_we_c... actually cc_we_c is set here for
-                            // both An and Dn dst.  Live with that
-                            // pre-existing behavior for now; just make sure
-                            // ADD/SUB set X so ADDX can see it).
-                            cc_x_we_c = (ex_alu_op == `ALU_ADD) ||
-                                        (ex_alu_op == `ALU_SUB);
-                            cc_x_c = alu_x;
+                            // ADDA/SUBA leave all CCR bits unchanged
+                            // (per m68k spec).  Detect by An-destination
+                            // (ex_reg_idx_full[3]) plus ALU op = ADD/SUB.
+                            // CMPA *does* update N/Z/V/C (X unchanged), so
+                            // alu_op == CMP still falls through to the
+                            // normal CCR commit.  Surfaced by the Musashi
+                            // cosim at K1.3 boot $FC01D2 (SUBA.W #$FD8A, A6)
+                            // -- our core was clobbering N/Z/C and the
+                            // very next instruction took the wrong branch.
+                            if (!(ex_reg_idx_full[3] &&
+                                  (ex_alu_op == `ALU_ADD ||
+                                   ex_alu_op == `ALU_SUB))) begin
+                                cc_we_c = 1'b1;
+                                cc_n_c = alu_n; cc_z_c = alu_z;
+                                cc_v_c = alu_v; cc_c_c = alu_c;
+                                // ADD/SUB write X; CMP doesn't (X kept
+                                // unchanged for both CMP and CMPA).
+                                cc_x_we_c = (ex_alu_op == `ALU_ADD) ||
+                                            (ex_alu_op == `ALU_SUB);
+                                cc_x_c = alu_x;
+                            end
                             if (ex_alu_op != `ALU_CMP) begin
                                 wb_main_we_c = 1'b1;
                                 wb_main_idx_c = ex_reg_idx_full;
@@ -1348,16 +1381,21 @@ module m68k_core #(
                         alu_b = ex_imm_raw;
                         alu_size_c = ex_size;
                         if (ex_src_mode == `EA_DREG || ex_src_mode == `EA_AREG) begin
-                            // Dn/An destination: commit register + CCR
-                            // (CCR is suppressed for An per 68k spec, but
-                            // legacy behavior here writes it -- preserved
-                            // to keep regression tests green).
-                            cc_we_c = 1'b1;
-                            cc_n_c = alu_n; cc_z_c = alu_z;
-                            cc_v_c = alu_v; cc_c_c = alu_c;
-                            cc_x_we_c = (ex_alu_op == `ALU_ADD) ||
-                                        (ex_alu_op == `ALU_SUB);
-                            cc_x_c = alu_x;
+                            // ADDQ/SUBQ #imm, An: do NOT update CCR (per
+                            // 68k spec, like ADDA/SUBA).  Surfaced by the
+                            // Musashi cosim at K1.3 boot $FC19A8:
+                            //   ADDQ.B  #8, A2
+                            // -- Verilator was clearing X (and updating
+                            // N/Z/V/C); Musashi correctly left CCR alone.
+                            // ADDQ/SUBQ to Dn does update all CCR bits.
+                            if (ex_src_mode != `EA_AREG) begin
+                                cc_we_c = 1'b1;
+                                cc_n_c = alu_n; cc_z_c = alu_z;
+                                cc_v_c = alu_v; cc_c_c = alu_c;
+                                cc_x_we_c = (ex_alu_op == `ALU_ADD) ||
+                                            (ex_alu_op == `ALU_SUB);
+                                cc_x_c = alu_x;
+                            end
                             wb_main_we_c = 1'b1;
                             wb_main_idx_c = (ex_src_mode == `EA_AREG) ? {1'b1, ex_src_reg}
                                                                       : {1'b0, ex_src_reg};
@@ -1713,8 +1751,15 @@ module m68k_core #(
                     end
                     K_PEA: begin
                         // Push the EA itself (computed in src_ea) onto the stack.
+                        // Use ex_a7 (not ex_sp) -- for PEA d8(An, Xn) ex_sp
+                        // is muxed to Xn via the rc port, so the actual A7
+                        // would otherwise be lost.  Surfaced in K1.3:
+                        //   $FD6620: PEA $0(A2, D2.L)
+                        //   $FD6624: JSR $00FE0358
+                        // pushed to (D2-4) instead of (A7-4), then updated
+                        // A7 = D2-4 = $FFFFFFFC (D2 was 0).
                         want_mem  = 1'b1; want_we = 1'b1;
-                        want_addr = ex_sp - 32'd4;
+                        want_addr = ex_a7 - 32'd4;
                         want_wdata = src_ea;
                         want_be    = 4'b1111;
                     end
@@ -2012,9 +2057,15 @@ module m68k_core #(
                     wb_aux_data_c = working_sp;
                 end
             end
-            // Final cycle of RTE/RTR: write A7 := working_sp (final SP after
-            // both pops). For RTE, if we're returning to user mode the swap
-            // with usp_shadow happens; RTR never changes supervisor mode.
+            // Final cycle of RTE/RTR: write A7 := working_sp + 4 (final SP
+            // after both pops; working_sp has been advanced by +2 for the SR
+            // pop already, the +4 PC-pop bump is sequential and only commits
+            // at the next posedge, so the planning block has to add it here).
+            // For RTE returning to user mode the swap with usp_shadow
+            // happens; RTR never changes supervisor mode.  Surfaced by the
+            // Musashi cosim at K1.3 boot $FC1FC4 RTE -- Verilator was
+            // committing original+2, dropping 4 bytes of stack on every RTE,
+            // and the very next RTS popped the saved CCR word as its PC.
             S_RTE_POP_PC: begin
                 if (dc_ack) begin
                     wb_aux_we_c   = 1'b1;
@@ -2022,7 +2073,7 @@ module m68k_core #(
                     wb_aux_data_c = ((ex_kind == K_RTE) &&
                                      (ex_exc_saved_sr[`SR_S] == 1'b0))
                                     ? usp_shadow
-                                    : working_sp;
+                                    : (working_sp + 32'd4);
                 end
             end
             // MOVEM iteration. On each step ack: load-MOVEM writes the
@@ -2033,9 +2084,16 @@ module m68k_core #(
                 if (movem_busy && dc_ack && movem_dir) begin
                     // Intermediate load-step register write (gated by
                     // movem_step_commit in the wb block, not by is_settled).
+                    // MOVEM.W loads sign-extend the word into the full 32-bit
+                    // register (per spec); MOVEM.L loads write the full long.
                     wb_main_we_c   = 1'b1;
                     wb_main_idx_c  = movem_curr_reg_full;
-                    wb_main_data_c = dc_rdata;
+                    if (ex_size == `SZ_L)
+                        wb_main_data_c = dc_rdata;
+                    else
+                        wb_main_data_c = dc_addr[1]
+                            ? {{16{dc_rdata[15]}}, dc_rdata[15:0]}
+                            : {{16{dc_rdata[31]}}, dc_rdata[31:16]};
                     wb_main_size_c = `SZ_L;
                 end else if (!movem_busy && (movem_mask == 16'd0)) begin
                     // Final settle: commit An if predec/postinc.
@@ -2199,6 +2257,18 @@ module m68k_core #(
                             endcase
                             cc_we_c = 1'b1;
                             cc_n_c = alu_n; cc_z_c = alu_z; cc_v_c = alu_v; cc_c_c = alu_c;
+                            // X flag: ADD/SUB write X (= C); CMP keeps X
+                            // unchanged. The register-source K_ALU path
+                            // (EX-stage) already does this; the mem-source
+                            // path (this S_LOAD settle) was missing it,
+                            // surfaced by the Musashi cosim at K1.3 boot
+                            // $FC14F8: ADD.W -(A0), D1 inside the checksum
+                            // loop -- Verilator left X stale while Musashi
+                            // tracked C, and a downstream ADDX picked up
+                            // the wrong X.
+                            cc_x_we_c = (ex_alu_op == `ALU_ADD) ||
+                                        (ex_alu_op == `ALU_SUB);
+                            cc_x_c = alu_x;
                             if (ex_alu_op != `ALU_CMP) begin
                                 wb_main_we_c = 1'b1;
                                 wb_main_idx_c = ex_reg_idx_full;
@@ -2487,7 +2557,8 @@ module m68k_core #(
                     K_JSR: begin
                         wb_aux_we_c = 1'b1;
                         wb_aux_idx_c = 4'd15;
-                        wb_aux_data_c = ex_sp - 32'd4;
+                        // ex_a7 (real A7), not ex_sp -- see EX-stage comment.
+                        wb_aux_data_c = ex_a7 - 32'd4;
                         take_branch_c = 1'b1;
                         // src_ea is the address computed for every supported
                         // JSR source mode (same as JMP).  Using ex_ra dropped
@@ -2516,13 +2587,28 @@ module m68k_core #(
                     K_PEA: begin
                         wb_aux_we_c   = 1'b1;
                         wb_aux_idx_c  = 4'd15;
-                        wb_aux_data_c = ex_sp - 32'd4;
+                        // ex_a7 (not ex_sp) -- see EX-stage comment.
+                        wb_aux_data_c = ex_a7 - 32'd4;
                     end
                     K_CLR: begin
                         // Memory CLR: write done; commit CCR.
                         cc_we_c = 1'b1;
                         cc_z_c = 1'b1;
                         cc_n_c = 1'b0; cc_v_c = 1'b0; cc_c_c = 1'b0;
+                        // CLR.L -(SP) / (An)+ -- replay the An predec/postinc
+                        // update at settle time.  The S_RUN handler also
+                        // sets wb_aux_we_c, but wb_aux_we only propagates
+                        // when is_settled, which doesn't fire in S_RUN for
+                        // memory destinations.  Without this, two
+                        // back-to-back CLR.L -(SP) both write to the same
+                        // address (the first SP decrement is lost), as
+                        // surfaced in K1.3 InitResident's MakeLibrary call
+                        // setup at $FCABD6.
+                        if (src_an_update) begin
+                            wb_aux_we_c   = 1'b1;
+                            wb_aux_idx_c  = {1'b1, ex_src_reg};
+                            wb_aux_data_c = src_an_next;
+                        end
                     end
                     default: ;
                 endcase
@@ -2690,6 +2776,47 @@ module m68k_core #(
             if (ex_state == S_RUN && ex_valid && !halted && exc_launch_c)
                 $display("[EXC] r=%d pc=%h opcode=%h kind=%d vec=%d",
                     retired, ex_pc, ex_opcode, ex_kind, exc_vector_c);
+            if (is_settled && retired < 32'd20)
+                $display("[Early] r=%d pc=%h opcode=%h",
+                    retired, ex_pc, ex_opcode);
+`endif
+`ifdef KICKSTART_COSIM_TRACE
+            // Per-instruction state dump for the Musashi cosim diff.
+            // Format: `[Cosim] <retired> <pc> <opcode> <D0..D7> <A0..A7> <SR>`
+            if (is_settled && ex_kind != K_STOP) begin
+                $display("[Cosim] %0d %06h %04h %08h %08h %08h %08h %08h %08h %08h %08h %08h %08h %08h %08h %08h %08h %08h %08h %04h",
+                    retired, ex_pc, ex_opcode,
+                    u_rf.regs[0],  u_rf.regs[1],  u_rf.regs[2],  u_rf.regs[3],
+                    u_rf.regs[4],  u_rf.regs[5],  u_rf.regs[6],  u_rf.regs[7],
+                    u_rf.regs[8],  u_rf.regs[9],  u_rf.regs[10], u_rf.regs[11],
+                    u_rf.regs[12], u_rf.regs[13], u_rf.regs[14], u_rf.regs[15],
+                    {1'b0, sr_t, 1'b0, sr_s, 2'b0, sr_i, 3'b0,
+                     cc_x, cc_n, cc_z, cc_v, cc_c});
+            end
+            // Memory-write trace.  Fires when a write completes (dc_ack
+            // with dc_we=1) on a chip-RAM address (< 512 KB).  Format:
+            //   [CosimW] <retired> <addr> <size> <data>
+            // Size pulled from dc_be (which is what the bus actually
+            // commits): 1111 = 4 bytes long-write, 1100/0011 = 2 bytes
+            // word-write, single bit = 1 byte.  dc_is_long is only set
+            // for true .L MOVEs; BSR/JSR/exception pushes use be=1111
+            // without is_long but still write four bytes.
+            if (dc_req_r && dc_we && dc_ack && dc_addr < 32'h0008_0000) begin
+                if (dc_be == 4'b1111)
+                    $display("[CosimW] %0d %06h 4 %08h", retired, dc_addr, dc_wdata);
+                else if (dc_be == 4'b1100)
+                    $display("[CosimW] %0d %06h 2 %04h", retired, dc_addr, dc_wdata[31:16]);
+                else if (dc_be == 4'b0011)
+                    $display("[CosimW] %0d %06h 2 %04h", retired, dc_addr | 32'd2, dc_wdata[15:0]);
+                else if (dc_be == 4'b1000)
+                    $display("[CosimW] %0d %06h 1 %02h", retired, dc_addr, dc_wdata[31:24]);
+                else if (dc_be == 4'b0100)
+                    $display("[CosimW] %0d %06h 1 %02h", retired, dc_addr | 32'd1, dc_wdata[23:16]);
+                else if (dc_be == 4'b0010)
+                    $display("[CosimW] %0d %06h 1 %02h", retired, dc_addr | 32'd2, dc_wdata[15:8]);
+                else if (dc_be == 4'b0001)
+                    $display("[CosimW] %0d %06h 1 %02h", retired, dc_addr | 32'd3, dc_wdata[7:0]);
+            end
 `endif
             if (is_settled && cc_we_c) begin
                 cc_n <= cc_n_c; cc_z <= cc_z_c; cc_v <= cc_v_c; cc_c <= cc_c_c;
@@ -2818,13 +2945,20 @@ module m68k_core #(
                         // extension's index (ex_sp routed via the IDX mux)
                         // and 8-bit displacement -- Kickstart 1.3's exec
                         // init uses MOVEM.L D1/A1, $54(A6, D3.W) at $F817C0
-                        // to initialise IntVects[3,5,4,13,15], and without
-                        // this case the EA collapses to A6 + 0 so
-                        // IntVects[3] never gets its chain head pointer,
-                        // and cia.resource's AddIntServer later crashes the
-                        // boot at chip-RAM $4190.  Abs.W/Abs.L and PC-rel
-                        // MOVEM aren't exercised by Kickstart and are left
-                        // falling through to ex_ra (a known limitation).
+                        // to initialise IntVects[3,5,4,13,15].
+                        //
+                        // For EA_EXT/EA7_ABSW: ex_src_imm32 holds {mask,
+                        // abs.W} so the abs.W is in the low 16 bits and
+                        // sign-extended forms the absolute address.
+                        // Surfaced in K1.3 at $FC2FF0:
+                        //   MOVEM.L D0-D7/A0-A7, $0180.W
+                        // which clears 64 bytes starting at $180 (the
+                        // exec vector save area).  Without this case the
+                        // MOVEM collapsed to addr = ex_ra (= some register
+                        // contents) and clobbered random low memory
+                        // including ExecBase at $4, so the warm-reset
+                        // trampoline at $FC05FC then JMPed through a
+                        // garbage ExecBase to $FFFFFFFF.
                         case (ex_src_mode)
                             `EA_ADEC:
                                 movem_addr <= ex_ra;
@@ -2836,6 +2970,18 @@ module m68k_core #(
                                     + (ex_src_imm32[11] ? ex_sp
                                         : {{16{ex_sp[15]}}, ex_sp[15:0]})
                                     + {{24{ex_src_imm32[7]}}, ex_src_imm32[7:0]};
+                            `EA_EXT:
+                                // ABSW: low 16 of ex_src_imm32, sign-ext.
+                                // ABSL/PCDISP/PCIDX/IMM untouched (the
+                                // EA8_ABSL case in particular needs the
+                                // third ext word which doesn't survive
+                                // into ex_src_imm32 -- a known limitation;
+                                // K1.3 only uses abs.W MOVEM).
+                                if (ex_src_reg == `EA7_ABSW)
+                                    movem_addr <=
+                                        {{16{ex_src_imm32[15]}}, ex_src_imm32[15:0]};
+                                else
+                                    movem_addr <= ex_ra;
                             default:
                                 movem_addr <= ex_ra;
                         endcase
@@ -3054,8 +3200,8 @@ module m68k_core #(
                             // For predec, the An is decremented along with
                             // each transfer; for postinc and fixed-EA the
                             // address increases each step.
-                            if (movem_predec) movem_addr <= movem_addr - 32'd4;
-                            else              movem_addr <= movem_addr + 32'd4;
+                            if (movem_predec) movem_addr <= movem_addr - movem_step_bytes;
+                            else              movem_addr <= movem_addr + movem_step_bytes;
                         end
                     end else begin
                         // Scanning for next set bit, or done.
@@ -3069,7 +3215,6 @@ module m68k_core #(
                             dc_we    <= ~movem_dir;        // 0 = load, 1 = store
                             dc_lock  <= 1'b0;
                             dc_addr  <= movem_step_addr;
-                            dc_be    <= 4'b1111;
                             // MOVEM.L is a long-aligned transfer in size but
                             // the SP at entry can be word-aligned-not-mod-4
                             // (e.g. after the InitResident driver's LINK A5,
@@ -3079,10 +3224,19 @@ module m68k_core #(
                             // on the read response; otherwise MOVEM-load
                             // reads return mem[idx] verbatim (= the wrong
                             // half) and registers get restored to garbage.
-                            dc_is_long <= (ex_size == `SZ_L);
-                            // For store, the wdata comes from regfile ra
-                            // (overridden to movem_curr_reg_full).
-                            if (movem_dir == 1'b0) dc_wdata <= rf_ra_data;
+                            // MOVEM.W uses word byte enables selected by
+                            // the step address's bit 1.
+                            if (ex_size == `SZ_L) begin
+                                dc_be      <= 4'b1111;
+                                dc_is_long <= 1'b1;
+                                if (movem_dir == 1'b0) dc_wdata <= rf_ra_data;
+                            end else begin
+                                dc_be      <= be_for_word(movem_step_addr[1]);
+                                dc_is_long <= 1'b0;
+                                if (movem_dir == 1'b0)
+                                    dc_wdata <= word_into_word(rf_ra_data[15:0],
+                                                               movem_step_addr[1]);
+                            end
                             movem_busy <= 1'b1;
                         end else begin
                             // Bit not set: skip; shift mask, advance idx.
@@ -3190,6 +3344,10 @@ module m68k_core #(
                         dc_req_r <= 1'b0;
                         // PC redirect happens via redirect_pc = dc_rdata.
                         // A7 update happens via wb_aux from planning block.
+`ifdef KICKSTART_BOOT_TRACE
+                        $display("[VEC] r=%d vec=%d addr=%h rdata=%h",
+                            retired, ex_exc_vector, dc_addr, dc_rdata);
+`endif
                         ex_state <= S_RUN;
                     end
                 end

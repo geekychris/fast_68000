@@ -70,7 +70,264 @@ opens with a one-line **Goal**, runs through discoveries / hypotheses
 
 ## Session log
 
-### S2: `JMP $disp(PC, Xn)` was using A7 as the index
+### S35: Cosim found four real CPU bugs in the 1.26M–instr range
+
+Picking up from S34's stable 525K-instr cosim baseline.  Diff'ing
+Verilator's `[Cosim]` per-instr dump against Musashi's `instr_hook`
+dump turned up four CPU bugs and one cosim-model gap inside the
+ROM checksum / autoconfig / cold-boot path:
+
+1. **K_ALU memory-source path didn't commit X.**  At $FC14F8
+   inside the ROM checksum loop the core ran `ADD.W -(A0), D1`
+   over and over.  Our EX-stage K_ALU register-source path
+   already wrote `cc_x_we_c = (ADD|SUB)` / `cc_x_c = alu_x`
+   (the SUBA/ADDA fix from S33 sat right next to it), but the
+   S_LOAD K_ALU settle that fires for memory-source ALU ops
+   only committed N/Z/V/C.  Verilator's X went stale; the very
+   next NEGX in the checksum chain saw the wrong carry-in.
+   Fixed in `rtl/m68k_core.v` S_LOAD K_ALU block.
+   Regression: `tests/t127_alu_mem_src_x.s` (uses ADD.L/SUB.L
+   predec since the test assembler doesn't accept word-sized
+   ALU mnemonics).
+
+2. **ADDQ/SUBQ to An clobbered CCR.**  Same shape as the
+   ADDA/SUBA fix from S33 -- per spec, `ADDQ #imm, An` and
+   `SUBQ #imm, An` operate on full 32 bits and "do not affect
+   the condition codes."  The K_ALUQ handler had a comment
+   that openly admitted the bug: *"CCR is suppressed for An
+   per 68k spec, but legacy behavior here writes it --
+   preserved to keep regression tests green."*  Surfaced at
+   $FC19A8 (`ADDQ.B #8, A2`) -- Verilator dropped a sticky X
+   bit, the next conditional took the wrong branch.  Skipped
+   `cc_we_c`/`cc_x_we_c` when destination is An.  Regression:
+   `tests/t128_addq_subq_an_ccr.s`.
+
+3. **RTE in supervisor mode dropped 4 bytes of stack.**  The
+   final wb_aux that sets A7 := working_sp at the S_RTE_POP_PC
+   ack used the value of `working_sp` *before* its sequential
+   +4 PC-pop bump, so A7 ended up at `initial_sp + 2` instead
+   of `initial_sp + 6`.  Existing `tests/t12_supervisor.s`
+   never tripped this because it RTEs from supervisor *into
+   user mode* (the usp_shadow branch).  Real K1.3 hits a nested
+   supervisor exception at $FC1FC4 and the corrupted SP made
+   the following RTS pop the SR word as its PC.  Fixed to
+   `working_sp + 32'd4`.  Regression:
+   `tests/t129_rte_sup_to_sup.s`.
+
+4. **D-cache only invalidated one line on an unaligned .L
+   write.**  `MOVE.L D1, -(A0)` with A0 - 4 landing at $X02
+   writes bytes across both `mem[idx]` and `mem[idx+1]` on the
+   bus side.  The cache fix from earlier work invalidated
+   `valids[idx]` but left `valids[idx+1]` cached.  A prior
+   aligned read of $X04 sat stale and shadowed the just-written
+   second half.  At K1.3 $FC15DA the next `ADD.W -(A0), D1`
+   read the stale word and the checksum loop totally diverged
+   from there.  Now invalidate both lines.  Regression:
+   `tests/t130_unal_l_cache_inval.s`.
+
+Cosim-model gap (not a CPU bug, but blocked cosim progress):
+the Musashi `handled_read` was returning $FF for every byte in
+$E80000-$E8FFFF.  Verilator's autoconfig only returns $FF at
+offset $00 (the type byte = "no card here") and 0 everywhere
+else.  K1.3's autoconfig walker checksums multiple offsets;
+the $FF lie made Musashi's CRC differ.  Mirrored Verilator
+in `tb/musashi_kick.c`.  Also tightened the $BF0000-$BFFFFF
+CIA stub: CIA-A PRA reads return $C8 (matching `pa_in =
+8'b11001000` in `rtl/m68k_top.v`), everything else returns 0
+or $FF based on whether it lands in a CIA register stride.
+
+After all five changes the cosim now runs **1.26M instructions
+byte-identical**.  The next divergence at $FC1244 is a
+`MOVE.W #$C000, $DFF09A` (INTENA SET INTEN) -- Verilator's
+Agnus/Paula has a pending VERTB so the very next cycle takes
+a level-3 interrupt and jumps to $FC0D14; Musashi's cosim
+doesn't model the Amiga IRQ engine.  That's a chipset gap,
+not a CPU bug, and replicating it in the cosim is a
+significant undertaking.  Diminishing returns from this point
+on.
+
+Status: 111/111 tests pass (added t127, t128, t129, t130).
+
+### S36: MOVEM.W stepped by 4 bytes per register (and wrote 4 bytes!)
+
+Picking up at the K1.3 wall the cosim couldn't reach.  Live boot
+with all five S35 fixes hit a `[BAD-PC] from=00001892 to=6f667477`
+at r=3M, with chain-tripping LineF/ILLEGAL traps walking down a
+stack that had clearly been smashed.  Targeted PC trace from
+r=1300500..1300620 caught the actual first wall: at r=1300587
+RTS at $FC6C04 popped $0 from $18D0 and PC jumped to 0, then
+walked through the vector table at $0..$80 treating each long
+as code (most decoded as `ORI.B #imm, Dn` no-ops; the first
+illegal encoding hit fired vec=4).
+
+Why was $18D0 holding 0?  The function at $FC6BD0:
+
+  $FC6BD0  48A7 0300    MOVEM.W  D6/D7, -(SP)   ; mask = $0300 = 2 regs
+   ...
+  $FC6C00  3C1F         MOVE.W   (SP)+, D6
+  $FC6C02  3E1F         MOVE.W   (SP)+, D7
+  $FC6C04  4E75         RTS
+
+A 2-register MOVEM.W push should move SP by 4 (= 2 regs * 2 bytes).
+Trace showed SP at $FC6BD0 entry = $18D4, SP at $FC6BD4 (next
+instr) = $18CC -- **SP moved by 8 bytes**.  Our core was pushing
+4 words for a 2-register MOVEM.W.
+
+The K_MOVEM iterator at line 3193 / 3194 was hard-coded:
+
+  if (movem_predec) movem_addr <= movem_addr - 32'd4;
+  else              movem_addr <= movem_addr + 32'd4;
+
+  dc_be      <= 4'b1111;
+  dc_is_long <= (ex_size == `SZ_L);
+
+So the step *address* advance was 4 bytes regardless of size,
+and the byte enables wrote the full 32-bit register every step
+(via `be=1111 wdata=rf_ra_data`).  For MOVEM.W this is wrong on
+all three axes:
+  - address should advance 2 bytes per register, not 4
+  - dc_be should pick the word lane via `be_for_word(addr[1])`,
+    not 1111
+  - dc_wdata should slot the register's low 16 bits into the
+    selected lane (`word_into_word(reg[15:0], addr[1])`),
+    not pass the full 32-bit register through
+
+The matching load side at S_MOVEM dc_ack just blindly assigned
+`wb_main_data_c = dc_rdata` -- correct for .L but wrong for .W,
+which must extract the right word lane from dc_rdata and
+**sign-extend** the 16-bit value to fill the 32-bit destination
+register (per spec).
+
+Existing MOVEM tests all used MOVEM.L (t49, t102, t113, t124),
+so this bug had been sitting in the core latent.
+
+Fixed all three issues:
+  - Added `movem_step_bytes = (ex_size == `SZ_L) ? 32'd4 : 32'd2`
+  - `movem_step_addr` and the post-step `movem_addr` advance use
+    `movem_step_bytes`
+  - The step-issue block branches on `ex_size`: .L emits be=1111
+    + is_long=1 + full register; .W emits `be_for_word(addr[1])`
+    + is_long=0 + `word_into_word(reg[15:0], addr[1])`
+  - The S_MOVEM ack handler sign-extends the right half of
+    dc_rdata for .W loads
+
+Regression: `tests/t131_movem_w_step.s` covers (a) predec store
++ ROM-canonical layout check, (b) postinc load with
+sign-extension of $FFFF and $0001, (c) a 4-register predec
+case (mask = $000F → 8-byte total SP move).  112/112 tests
+pass after the fix.
+
+Status: 112/112 tests pass.  K1.3 boot re-run pending.
+
+### S37: 68000 has a 24-bit external address bus; mask the upper byte
+
+After the S36 MOVEM.W fix, K1.3 boot pushed past the $18D0 RTS-pops-0
+wall to r=1313466.  The new symptom: `[EXC] vec=8 at $FC08E6` (the
+Exec Supervisor() priv-vio entry, executed in user mode), followed
+immediately by `[BAD-PC] from=00fc08e6 to=7800090e`.
+
+vec 8 (privilege violation) reads its handler from memory at $20.
+The trace's "to=7800090e" is the long word stored there.  In 32-bit
+that lands at the 0x78000000 region -- unmapped on our bus, returns
+zero, the boot wanders off into the weeds.
+
+But the 68000 is a 24-bit-address-bus machine.  Internally PC is
+32 bits; externally only A1..A23 are wired.  Exec routinely stuffs
+flag bits (or just garbage) into the top byte of pointers, knowing
+the bus will ignore them.  The true target of vec $20's $7800090E
+on real hardware is $0000_090E.
+
+Fix: mask redirect_pc's high 8 bits in the IF stage's redirect path
+(`if_pc <= {8'd0, redirect_pc[23:0]}`) so JMP/JSR/RTS/RTE and
+exception-vector fetches all see only the low 24 bits.  Everything
+downstream (fetch addr, ex_pc, exception frame PC push) inherits
+the masked value.  Hand-picked targeted spot rather than masking
+every PC arithmetic site -- if a later test surfaces that the
+arithmetic also produced bit-31 garbage, we'll mask there too.
+
+Regression: `tests/t132_pc_24bit_mask.s` -- pushes $78001000 onto
+the stack, RTS, halts cleanly only if the destination got
+truncated to $00001000.
+
+After the mask, K1.3 boot still hits a wall at r=1313466 in
+Exec.Supervisor(): the priv-vio handler at chip-RAM $90E executes
+a Line-A trap at $93A which routes to chip-RAM $828, which lands
+in $FFFF garbage at $87A and chain-traps LineF forever, sp
+underflowing through $7FFFA → $7FFCxx → $FFFFC8xx.
+
+That's Exec's intentional user-mode-return-via-trap mechanism --
+the handler at $90E was installed by Exec into vec $20 with a
+high-byte flag ($7800090E), the Line-A inside it is the
+trap-back-to-user signal, and vec 10 must route to another Exec
+handler that does the RTE.  Both vector table entries are being
+read AFTER masking, which suggests the data Kickstart wrote into
+chip-RAM at $90E / $828 / $87A is the actual bug -- either the
+write itself was corrupted by an earlier CPU bug, or the data is
+correct and we mis-decode a 68000 instruction inside it.
+
+Diminishing returns from continuing manual K1.3 tracing in this
+session.  Five CPU bugs found and fixed in S35-S37 with regression
+tests; boot now runs roughly 18× further (r=23M+ vs r=1.3M
+previously).  Suspended at the chip-RAM Supervisor() handler
+chain; next session can drop instrumentation around r=1313466 to
+see what's actually at $90E / $828 / $87A and what's writing it.
+
+Status: 113/113 tests pass (added t131_movem_w_step,
+t132_pc_24bit_mask).  K1.3 boot reaches r~22M (was r~1.3M)
+before hitting an Exec.Supervisor()-related chip-RAM trap chain.
+
+### S38: Vec-table high-byte corruption -- where the Supervisor() trap dies
+
+Continued from S37.  After the PC-mask fix, the K1.3 wall at
+r=1313466 is a vec=8 priv-vio at $FC08E6 (Exec Supervisor() entry)
+whose vector-table read returns $7800_090E instead of the
+expected $00FC_090E.  Investigated with two new bus traces:
+
+  - `[VEC]` -- log the dc_rdata for every S_EXC_FETCH ack.
+  - `[W20]` -- log PC + opcode of every write into addr $1C..$2F
+    (the vec 7..11 table).
+
+Vec $20 was correctly initialised to $00FC_090E at r=527487 by
+Exec's startup routine at $FC03DC.  Then between r=1310538 and
+r=1313466, code at $FDB956 fires five WORD writes (be=1100,
+high half only) to the vec 7..11 table:
+
+  [W20] r=1312660 pc=fdb956 addr=$1C be=1100 wdata=86000000
+  [W20] r=1312673 pc=fdb956 addr=$20 be=1100 wdata=78000000
+  [W20] r=1312686 pc=fdb956 addr=$24 be=1100 wdata=8c000000
+  [W20] r=1312699 pc=fdb956 addr=$28 be=1100 wdata=7c000000
+  [W20] r=1312712 pc=fdb956 addr=$2C be=1100 wdata=86000000
+
+These overwrite the high WORD of each vec entry ($00_FC → $78_00
+for vec $20, etc.).  ROM at $FDB956 decodes as
+`MOVE.W d8(A2,D1.L), d8(A0,D0.L)` -- a structured table-driven
+word copy inside a loop body whose head is at $FDB930 (entered
+via a vec 27 / level-3 IRQ handler at the prior [EXC]).
+
+Real K1.3 boots fine on Amiga hardware, so something is wrong
+with what we're feeding this routine.  Suspects:
+
+  1. The source word (`$1C(A2, D1.L)`) -- whatever's at the
+     source table contains $7800/$86C0/... in our run.  Maybe
+     the table got built wrong upstream (subtle CPU bug there).
+  2. The destination address (A0+D0) -- maybe we'd be writing
+     to a different location on real hardware (e.g., a per-task
+     vec-shadow table at high chip RAM), but our state means
+     A0/D0 land in the real vec table.
+  3. The trap shouldn't fire at $FC08E6 at r=1313466 in the
+     first place -- maybe SR.S got cleared by something it
+     shouldn't have, putting us in user mode incorrectly.
+
+Suspended for next session.  Chip-RAM dump at sim-end confirms
+the corruption (vec $20 = $78000_90E, vec $24 = $8C00_0826,
+etc.).  PC mask makes the post-trap PC land in chip RAM at
+$90E, which holds a zero'd-then-LH-initialized structure -- not
+code -- and the chain trap-loops vec 10 → vec 11 → ... forever.
+
+5 real CPU bugs + 1 cache bug + 1 24-bit-mask fix landed this
+session.  Boot now runs ~18× further (r=1.3M → r=22M+).  Next
+session needs deeper tracing at $FDB930-$FDB956 to find what's
+fundamentally wrong about the values being copied.
 
 Goal: keep pulling on the render-loop thread; find which exec.library
 field is feeding `A0..A4` the bad low-chip-RAM pointers.
@@ -1509,3 +1766,546 @@ implement the 68020+ instruction subset Kickstart 45 depends
 on.  The latter is significant work and a scope expansion.
 
 Filed task #46.  100% test pass count: 102 tests.
+
+### S25: Switched to real K1.3 ROM; fixed LINK/UNLK SZ_L (unaligned-.L bug)
+
+S24 finally identified that the previously-used kick.bin was AROS exec 45
+(needs 68020+).  User provided real Amiga Forever ROMs at
+`/Users/chris/computers/amiga_forever/...`; decrypted amiga-os-130.rom
+with `tools/rom_decrypt.py` against `rom.key` -> `kickstart/kick_13.bin`,
+256 KB, exec 34.2 (28 Oct 1987).
+
+First boot attempt on real K1.3 wall-clocked at a vec=3 address error at
+$FC081C around r=7.2M, but a closer trace revealed an *earlier* wall:
+a BAD-PC at r=1,251,937 from $F8318A -> $FFFFFDD8.
+
+That was `JSR -$228(A6)` with A6=0.  Backwards trace showed the function
+that just returned (entry $F82124, K1.3 vsprintf-style format parser):
+
+  $F82124: MOVEM.L D2-D6/A2-A5, -(SP)
+  $F82128: LINK A6, #-16          ; A7=$7FEE pre-LINK -> save at $7FEA
+  ...                              ;   ($7FEA[1:0] = 2'b10 -> unaligned-.L)
+  $F82140: UNLK A6
+  $F82146: RTS
+
+LINK wrote `A6 = $00000676` (ExecBase) to memory $7FEA correctly via the
+bus's split-write path (be=1111 + addr[1:0]=10 -> two mem[] entries).
+But UNLK *read back* $00000000.  Memory wasn't clobbered between LINK
+and UNLK -- the only write was the LINK itself.
+
+Root cause: the decoder left K_LINK and K_UNLK at the default
+`size = SZ_W`, so `dc_is_long` was 0 on the bus side.  The bus's
+unaligned-.L read assembly is gated on `granted_is_long_q` -- with
+is_long=0 it just returned `mem[granted_idx_q]`, which holds the
+*aligned* longword (bytes 0..3 of mem[$1FFBA]), not the unaligned
+longword starting at $7FEA.  Read returned upper-half-zero +
+lower-half-clobbered = $00000000.
+
+Fix: decoder sets `size = SZ_L` for K_LINK and K_UNLK.  Both
+LINK/UNLK execution paths in the core already used SZ_L for the
+An writeback (LINK at line 2511, UNLK at 1709/2310 implicitly
+through the load); the missing piece was telling the bus that the
+load is a 32-bit transfer so the unaligned-.L assembly fires.
+
+t122_link_unlk_unaligned exercises the case directly: positions
+A7 to force LINK to write to addr[1:0]=2'b10, then verifies A6
+comes back intact (also covers aligned LINK + nested LINK).
+
+Boot impact: passes the $F82124 vsprintf function cleanly,
+re-establishes ExecBase post-UNLK.  Reaches r=11.2M (from r=7.2M)
+with three `[DSKLEN]` events (disk DMA setup attempts).  New wall
+is a vec=11 LINEF at chip-RAM PC=$069C with opcode $FFFF -- PC
+flew off into low memory.  Filed task #48.
+
+Status: 103/103 tests pass.
+
+### S26: CLR -(An) dropped the An predec update
+
+After the LINK/UNLK SZ_L fix (S25), K1.3 advanced to a vec=11 LINEF
+at chip-RAM PC=$069C around r=11.2M.  PC had flown into low chip
+RAM through `JSR (A1)` at $FC15AA where A1=$01B8 (a small ROM
+offset, not an address).
+
+The "A1=$01B8" came from a MakeLibrary call setup at $FCABCE:
+
+  $FCABCE: PEA  $01B8       ; push immediate $000001B8
+  $FCABD2: PEA  $0148       ; push immediate $00000148
+  $FCABD6: CLR.L -(SP)      ; push 0
+  $FCABD8: CLR.L -(SP)      ; push 0
+  $FCABDA: PEA  $FCB05A     ; push function-table ptr
+  $FCABE0: JSR  $FD3B88     ; wrapper that calls MakeLibrary
+
+The wrapper at $FD3B88 reads the args off the stack via
+`MOVEM.L $C(SP), A0/A1/A2` and `MOVEM.L $18(SP), D0/D1`.  With a
+correctly-built stack frame, A1/A2 would be the two zeros and
+D0/D1 would be $0148/$01B8.  But our trace showed the wrapper
+loading A1=$148 and A2=$1B8 -- the zero slots collapsed.
+
+Memory-write trace at the PEA/CLR sequence:
+
+  r=10895900 PEA      addr=$192C  ($1930 - 4)
+  r=10895901 PEA      addr=$1928  ($192C - 4)
+  r=10895902 CLR.L    addr=$1924  ($1928 - 4)
+  r=10895903 CLR.L    addr=$1924  ** same address! **
+  r=10895904 PEA      addr=$1924  ** still! **
+  r=10895905 JSR push addr=$1920
+
+So the first CLR.L wrote $1924 and dropped its A7 update.  The
+second CLR.L still saw A7=$1928 (stale), wrote the same address,
+again dropped its update.  The trailing PEA also saw stale A7.
+Only when JSR's hardwired `ex_sp - 4` push fired did the address
+advance.
+
+Root cause: the S_RUN K_CLR handler sets `wb_aux_we_c = 1` for the
+An predec update, but `wb_aux_we = is_settled && wb_aux_we_c` --
+and is_settled doesn't fire in S_RUN for memory-destination ops
+(they transition to S_STORE first).  The S_STORE K_CLR handler
+only committed CCR; it never replayed the An predec assignment.
+
+Fix: in S_STORE K_CLR, replay the wb_aux_we/idx/data for
+src_an_update.  src_an_next is already computed combinationally
+from ex_ra (which is still the original An value) so the replay is
+valid.
+
+t123_clr_predec exercises the two-back-to-back CLR.L -(SP)
+pattern: verifies A7 decrements by 8, the two zero slots are
+distinct, and the prior PEA values aren't clobbered.
+
+Boot impact: K1.3 advances from r=11.2M to r=47.5M -- past the
+LINEF wall, past the chip-RAM PC=$069C wall, and into a long
+~36M-instruction stretch of MakeLibrary'ing residents.  New wall
+is a vec=11 LINEF at chip-RAM PC=$11FAC -- different region,
+filed as task #49.
+
+Status: 104/104 tests pass.
+
+### S27: MOVEM with abs.W EA used An source value instead of the abs address
+
+After the CLR.L predec fix (S26), K1.3 boot reached r=47.5M then hit a
+LINEF at chip-RAM $11FAC.  Tracing back: PC walked forward through
+chip-RAM zeros from $10000 upward (each $0000 = 4-byte ORI.B #0,D0
+no-op) until eventually hitting a $FFFF and trapping.  Earlier, PC
+jumped from $FC0600 to $FFFFFFFF -- the warm-reset trampoline:
+
+  $FC05FC: MOVEA.L $4.W, A0    ; A0 = ExecBase pointer
+  $FC0600: JMP (A0)
+
+ran with A0 = $FFFFFFFF.  Memory at $4 had been clobbered.
+
+Filtering writes to $4 across the boot showed three:
+  r=525658   ExecBase init = $00000676   (correct)
+  r=5022276  ExecBase re-init = $00000676 (correct, warm restart)
+  r=5791894  pc=$FC2FF0 opcode=$48F8  wdata=$FFFFFFFF  ← BUG
+
+$FC2FF0 disassembles to:
+  $48F8 $FFFF $0180 = MOVEM.L D0-D7/A0-A7, $0180.W
+
+That's a 16-register write to absolute address $0180 (a 64-byte exec
+vector save area).  But our MOVEM wrote one of the longs to address $4,
+clobbering ExecBase.
+
+Root cause: the K_MOVEM EA initialiser had handlers for EA_ADEC,
+EA_DISP, EA_IDX, and a `default: movem_addr <= ex_ra`.  EA_EXT
+(abs.W / abs.L / PC-rel) fell into the default and grabbed `ex_ra` --
+which still held whatever An source value the regfile happened to mux
+onto port `ra`.  Since the source mode was EXT not An, ex_ra was
+arbitrary; the MOVEM walked from there writing 64 bytes of register
+contents to random low memory.  ExecBase happened to be inside the
+clobber window.
+
+Fix: in the K_MOVEM `case (ex_src_mode)`, add an `EA_EXT` branch.
+For EA7_ABSW, the absolute address sits in the low 16 bits of
+ex_src_imm32 (because `id_src_imm32 = {id_ext[0], id_ext[1]}` =
+{mask, abs.W} for MOVEM with src_ext_words=2).  Sign-extend it.
+
+abs.L MOVEM needs id_ext[2] (the address low word) which doesn't
+survive into ex_src_imm32; PC-rel MOVEM needs ex_pc + 4 + d16.
+Both are unexercised by K1.3 boot and left as known limitations
+behind a comment.
+
+t124_movem_absw exercises reg→mem and mem→reg directions of MOVEM
+with abs.W, deliberately loading An source registers with junk so
+the test fails if movem_addr collapses to ex_ra.
+
+Boot impact: passes the ExecBase-clobbering MOVEM, advances from
+r=47.5M to r=48.6M.  New wall is vec=4 ILLEGAL at PC=$400043 with
+opcode=$4540, followed by BAD-PC to $6F667477 (ASCII "oftw").
+PC is outside 256 KB RAM and SP wrapped negative -- some structure
+field that should hold an even pointer instead holds an odd word.
+Filed task #50.
+
+Status: 105/105 tests pass.
+
+### S28: Framebuffer dump + chip-RAM dump tools; K1.3 reaches Alert path
+
+Added `FB_DUMP_PPM=<path>` and `CHIPRAM_DUMP=<path>` env vars to the
+testbench so headless runs can capture both Denise's chunky 8 bpp
+framebuffer ($10000+) and the first 256 KB of chip RAM as files.  PPM
+is RGB332-expanded so a `pillow` resize is enough to view it.
+
+Verified state of K1.3 boot at r=48.6M wall:
+
+  Chipset:
+    DMACON  = $7FFF (clear all -- no DMA active)
+    BPLCON0 = $0200 (BPU=0 -- no bitplanes enabled)
+    COLOR0  = $0888 (last write, gray-ish)
+  Denise's chunky FB at $10000 is therefore never refreshed -- the
+  PPM shows only leftover black/white noise from pre-boot state.
+
+  Chip RAM has only one ASCII string:
+    "Software Failure. \0xFF\0x00\0xEA Press left mouse button to continue."
+    staged starting at offset $F (overlapping vec=3 address-error
+    handler and onwards).
+
+The clobber comes from the strcpy at $F831C8 (`MOVE.B (A0)+,(A3)+;
+BNE.S; ...`) called from $F83170 with A3 = $D -- inside the
+exception vector table.  ASCII bytes overwrite vec=3 (address
+error) / vec=4 (ILLEGAL) / vec=11 (LINEF), so the next exception
+fetches "Software" bytes as the handler PC and runs off into
+"oftw" memory -- which matches the BAD-PC to=$6F66_7477 we see
+at r=47.8M.
+
+Filed task #50: figure out why A3 ends up at $D when the Alert
+copy starts.  Likely a 16-bit A3 load (`MOVE.W ...,A3` zero-extends
+to a tiny value) or AllocMem returning garbage.  This is the bug
+to chase next session.
+
+No CPU changes this iteration -- just diagnostics + tooling.
+Status: 105/105 tests pass.
+
+### S29: SERDATR idle byte must be $7F, not $00
+
+After S28 traced the K1.3 wall to a strcpy clobbering the vector
+table with the Software Failure alert text, this iteration kept
+digging *upstream*: who calls Alert?
+
+PC trace showed the boot entering the ColdReboot path at $F805F0
+(the `MOVE.L #$20000, D0 ; SUBQ #1 ; BGT` delay loop right before
+`RESET ; MOVEA $4.W,A0 ; JMP (A0)`).  Stepping back further, the
+caller was at $FC30F4:
+
+  $FC30CE: BCLR.B #1, $00BFE001   ; CIAA poke
+  $FC30D6: DBF D0, -10            ; spin counter
+  $FC30DA: MOVE.W $DFF018, D0     ; read SERDATR
+  $FC30E0: MOVE.W #$0800, $DFF09C ; clear INTREQ RBF bit
+  $FC30E8: ANDI.B #$7F, D0
+  $FC30EC: CMPI.B #$7F, D0
+  $FC30F0: DBEQ D1, -50
+  $FC30F4: BMI.W $F805F0          ; -> ColdReboot
+
+K1.3's serial self-test reads SERDATR and expects `(low7 & $7F) ==
+$7F`.  On real hardware an idle serial RX line floats high, so the
+receive buffer reads $7F (7-bit) or $FF (8-bit).  Our SERDATR_VAL
+was $3000 (low byte 0) -- the CMP set N=1, DBEQ counter underflowed,
+BMI fired, and the boot ColdReboot'd.
+
+That was the *original* trigger for everything we'd been chasing in
+S25-S28: the spurious warm-reset, the chip-RAM PC walk, the LINEF
+at $069C, the SP corruption, the vector-table-as-alert-text clobber.
+A single byte in a chipset constant.
+
+(The previous comment on SERDATR_VAL said "DBEQ loops while EQ" --
+that's backwards.  DBEQ exits on EQ.  The earlier $7F note was about
+a different ROM, AROS-45, that had a different self-test; for the
+real K1.3 (V34.2) $7F is the *correct* value.)
+
+Fix: `SERDATR_VAL` = $307F.  TBE/TSRE bits stay set; RBF stays
+clear; low 7 bits read as $7F so the self-test exits on the first
+iteration with N=0.
+
+t100_chip_word_half updated to match the new constant.
+
+Boot impact:
+  r=48.6M → r=99.2M (~2× advance).
+  IPC: 0.243 → 0.331.
+  Vector table cleanly initialised (vec=2..11 point to ROM
+   handlers, no ASCII clobber).
+  Only exceptions seen are the expected MOVEC + PRIV probes that
+   K1.3 uses to detect a 68010+.  No BAD-PC, no spurious LINEF,
+   no SP corruption.
+  Chip RAM has just the "HELP" ColdReboot magic at $0.  Alert
+   text is *not* staged anywhere (because no Alert ever fires).
+
+Display: the chunky FB at $10000 is all-zero -- K1.3 still hasn't
+enabled bitplane DMA (BPLCON0=$0200, DMACON cleared), so Denise has
+nothing to render.  Boot is probably idling in a VBLANK/disk-insert
+wait loop.  Filed task #51 to figure out what state it's in next.
+
+Status: 105/105 tests pass.
+
+### S30: K1.3 enters Romwack because RESET_PC=$F8 doesn't match priv-handler $FC compares
+
+The S29 SERDATR fix took K1.3 boot from r=48.6M crash to r=99M idle, but
+the screen never lit up.  Sampling PC at the idle showed it stuck at
+$FC2260-$FC2262:
+
+  $FC225E: BSR.B serial_poll  ; reads SERDATR
+  $FC2260: TST.L D0           ; -1 = no char
+  $FC2262: BMI.S .loop        ; loop
+
+This is K1.3's Romwack debug-monitor entry -- waiting for a serial
+character.  K1.3 only drops into Romwack on an unhandled exception or
+explicit debug-mode entry.
+
+Tracing back through the callers ($FC2BD0 = Romwack main loop, called
+from $FC245E in the boot init) showed K1.3 *intentionally* installed
+its privilege-violation handler at $FC30B2, which is the panic/Romwack
+path.
+
+The earlier handler at $F8090E (installed during init, replaced by
+Romwack at r=1.25M) was meant to *recognise* the Supervisor() trap
+site and rewrite the stacked PC:
+
+  $F8090E: CMPI.L #$00FC08E6, $0002(SP)   ; trap from Supervisor() ?
+  $F80916: BEQ.S .rewrite
+  $F80918: CMPI.L #$00FC08F6, $0002(SP)   ; or its sibling ?
+  $F80920: BNE.S .unknown
+  $F80922: MOVE.L #$00FC08F4, $0002(SP)   ; rewrite to skip ORI
+  $F8092A: JMP (A5)                         ; jump to caller-supplied
+  ...
+  .unknown:
+  $F8092C: ORI.W #$0700, SR                 ; mask IRQs
+  $F80932: MOVE.L #$8, -(SP)                ; vec=8
+  $F80938: BRA Alert($08)                   ; ... -> ColdReboot
+
+The CMPI hardcodes $00FC08E6 / $00FC08F6.  But our boot uses
+RESET_PC = $F800D2 -- the 256 KB K1.3 ROM is *physically* mapped at
+$FC0000-$FFFFFF on a real Amiga, and the ROM-internal constants
+reflect that.  Our $F8 mirror is fine for execution (same data), but
+when a privilege violation fires from $F808E6, the stacked PC is
+$F808E6, which doesn't match $FC08E6 -- the handler falls through to
+the "unknown priv-vio" path and Alerts/ColdReboot's.
+
+Tested with `RESET_PC = $FC00D2`: the priv-vio handler then correctly
+recognises the Supervisor() trap, boot proceeds further, vec=27
+(level-3 IRQ / VBLANK) starts firing, and exec init reaches the IRQ
+enable phase.  But around r=1.3M a vec=11 fires at PC=$FE0404 (out of
+ROM/RAM zones) and PC runs away through $6CDFxxxx unmapped chip-RAM
+until r=74.8M.  An upstream CPU bug exposed by the more-complete boot.
+
+For this iteration we keep `RESET_PC = $F800D2` (the stable r=99M
+idle state is more useful than r=74.8M crash) and file task #52 for
+the $FC downstream bug.
+
+The screen is still pure black -- K1.3 hasn't enabled bitplane DMA in
+either path.  Boot is doing useful work but not yet driving display.
+
+Status: 105/105 tests pass.  No CPU/RTL changes this iteration --
+just the diagnosis and a documentation note in `m68k_defs.vh`.
+
+#### S30 follow-up: the $FC downstream wall is an autoconfig expansion-ROM call
+
+When RESET_PC=$FC00D2 was tried, the boot reached r=1.3M and then PC
+ran away.  Tracing showed:
+
+  $FD6620: PEA $0(A2, D2.L)
+  $FD6624: JSR $00FE0358
+
+K1.3 was calling into the expansion-ROM area at $FE0000+ -- almost
+certainly through a `cd_BoardInit` field of the ConfigDev struct
+populated by our FAST-RAM autoconfig.  Our bus doesn't populate
+$FE0xxx so the JSR target contains zeros; PC walked through them,
+hit opcode $FF00 at $FE0404, vec=11 fired, and the cascade ran away
+through $6CDFxxxx unmapped chip-RAM until r=74.8M.
+
+The fix for that wall (once we promote RESET_PC to $FC) will be
+either (a) leave `cd_BoardInit` NULL in our autoconfig response so
+K1.3 skips the call entirely, or (b) make unmapped reads in $FE0xxx
+return $4E75 (RTS) so the expansion-ROM call returns immediately.
+
+Filed as task #52.
+
+### S31: LEGACY_CHIPSET threshold tightened so K1.3 ROM mirror wins at $FE0xxx
+
+K1.3's boot at $FD65FE / $FD6624 does:
+  $4EB9 $00FE_0090    ; JSR $00FE0090
+  $4EB9 $00FE_0358    ; JSR $00FE0358
+
+Real K1.3 expects those addresses to resolve via the 256 KB ROM
+mirror: a 256 KB Kickstart at $FC0000-$FFFFFF is also seen at
+$F80000-$FBFFFF (and vice versa) because the ROM byte-offset wraps.
+$FE0358 maps to ROM offset $20358 which contains a real function
+prologue (MOVE.L A6, -(SP); MOVEA.L $60(A6), A6; ...; JSR LVO; RTS).
+
+But our bus had `LEGACY_CHIPSET = (ROM_WORDS <= 98304)` -- the legacy
+chipset window at $FE0000-$FE05FF was active for any ROM up to ~384
+KB.  Since the legacy blitter/copper/denise slaves win priority over
+the ROM in the read mux, reads at $FE0358 returned 0 even though the
+ROM mirror had valid code there.  K1.3's JSR target was garbage, PC
+ran off into zero-filled memory, and the cascade ended at r=74.8M
+with a vec=4 in chip-RAM.
+
+Fix: tighten the threshold to `LEGACY_CHIPSET = (ROM_WORDS < 16384)`.
+Test programs use ROM_WORDS ∈ {1, 16, 4096} (the largest is 16 KB)
+which keeps legacy chipset alive for the demos / chipset tests.  Any
+real Kickstart (256 KB+ = 65536 words+) now correctly maps $FE0xxx
+to ROM data.
+
+Boot impact: with the F8 mirror (current RESET_PC) the boot still
+ends up in the Romwack idle loop at r=99M -- the priv-vio handler's
+$FC compares still fail.  But with RESET_PC = $FC00D2 the F8/FC
+mismatch goes away, the priv-vio handler returns cleanly,
+$FE0090/$FE0358 calls land on real ROM-mirror code, and the boot
+progresses further.
+
+Switching RESET_PC to $FC currently exposes a separate
+SP-corruption bug at r=1.3M: SP somehow becomes $FFFFFFFC during a
+PEA/JSR sequence at $FD6620 (very likely a user/supervisor stack
+switch where `usp_shadow` was uninitialised when an IRQ fired).
+That's task #52 -- separate fix, not yet landed.
+
+For this iteration we keep RESET_PC at $F8 (stable Romwack idle),
+ship the LEGACY_CHIPSET fix on its own.  105/105 tests still pass.
+
+### S32: PEA d8(An, Xn) used the index register as SP
+
+Goal: chase the K1.3 r=1.3M SP-corruption that gates the $FC reset
+path.
+
+Tracing SR-S transitions and `usp_shadow` across the wall showed
+the corruption was *not* an exception switch.  At r=1298825 (just
+before the wall) SR-S = 0 (user mode) and A7 = $1900 in *user mode*;
+at r=1298826 (after the PEA) A7 = $FFFFFFFC -- still in user mode.
+No supervisor-mode entry between the two, so the swap-with-
+usp_shadow path was irrelevant.  Something inside the PEA itself
+wrote $FFFFFFFC to A7.
+
+The instruction sequence at $FD6620-$FD6624 is:
+
+  PEA   $0(A2, D2.L)          ; ($4872 $2800)
+  JSR   $00FE0358              ; ($4EB9 $00FE_0358)
+
+PEA's effective address is mode 6 = `d8(An, Xn)`.  Our ID stage
+routes the index register Xn through the **rc** regfile port (the
+same port that normally carries A7), so `ex_sp` -- the latched copy
+of rc -- holds **D2's value**, not A7.
+
+K_PEA's executor used `ex_sp - 4` for both the push target and the
+A7 writeback:
+
+  // S_RUN
+  K_PEA: want_addr = ex_sp - 32'd4;   // push address
+  // S_STORE
+  K_PEA: wb_aux_data_c = ex_sp - 32'd4; // new A7
+
+In this call site D2 was 0 (cleared a few instructions earlier),
+so PEA pushed $FE0358 to ($0 - 4) = $FFFFFFFC and set A7 =
+$FFFFFFFC.  The subsequent JSR pushed its own return PC to ($FFFF-
+FFFC - 4) and the next reload of A0 from the user task frame
+($8(A7)) read off the ROM-end mirror, returning $001E001F (odd) --
+which is what made the eventual MOVE.L A1, (A1) at $FC2DD4 fire a
+vec=3 address error.
+
+Fix: add a dedicated `ex_a7` latch fed by `fwd(4'd15, regs[15])`
+-- a forwarded read of A7 that's independent of the rc port mux.
+K_PEA's S_RUN and S_STORE use `ex_a7 - 4` for push address and the
+aux A7 writeback.  EA computation still uses ex_ra (base An) +
+ex_sp (Xn) + d8 since that's what the index mux is *for*.
+
+`t125_pea_idx` exercises PEA $0(A1, D0.L) with D0=0 and a known
+A1, verifying (a) A7 decrements by exactly 4, (b) the pushed value
+is the EA, (c) prior stack contents are untouched, and (d) PEA
+d16(An) (mode 5) still works.
+
+Other ops with similar `d8(An, Xn)` stack interaction (JSR,
+MOVEM with EA_IDX, the few BSET/BCLR variants) need the same
+treatment if they touch SP, but a quick scan didn't find another
+S_STORE handler computing A7 from ex_sp.  Leaving that as a
+follow-up if a regression shows up.
+
+Boot impact: with the PEA fix in place we promote `RESET_PC` to
+the canonical `$FC00D2`.  K1.3 boot then proceeds past the vec=3
+wall at $FC2DD4 and reaches r=1.3M with a *new* failure: an RTS
+at $FC6C04 pops $00000000 as the return PC.  Pre-RTS SP = $18D0
+in user mode; the return slot was apparently never written.
+Different bug -- filed as task #53.
+
+Status: 106/106 tests pass (added t125_pea_idx).
+
+### S33: Musashi lockstep cosim + ADDA/SUBA CCR-clobber bug
+
+Built a per-instruction lockstep cosim against Musashi:
+
+- `tb/musashi_kick.c`: Musashi harness that loads a 256 KB Kickstart
+  ROM (mirrored across $F80000-$FFFFFF), stubs the chipset
+  ($DFF000+) just enough to match what our Verilator bus returns
+  (SERDATR=$307F, POTGOR=$FFFF, DMACONR/INTREQR/INTENAR/ADKCONR
+  tracked via shadow regs on the matching write registers, VPOSR/
+  VHPOSR incrementing per cycle, CIA + autoconfig returning $FF),
+  and writes a per-instruction trace `<retired> <pc> <op>
+  <d0..d7> <a0..a7> <sr>`.
+- `rtl/m68k_core.v` gains a `KICKSTART_COSIM_TRACE` ifdef that
+  prints the same format from the Verilator side.
+- `make cosim-kick ROMFILE=… COSIM_INSTRS=…` runs both, diffs the
+  traces, and prints the first divergence.
+
+Initial reset state needs explicit syncing (Musashi reads SSP/PC
+from mem[$0]/[$4] which our Verilator's cold-boot doesn't carry;
+override Musashi via `m68k_set_reg` to SSP=$4000, PC=$FC00D2,
+SR=$2700 -- matching our harness's hard-coded reset).
+
+Immediate payoff: the first non-cosmetic divergence at r=262271
+was a real CPU bug.  Both cores executed `SUBA.W #$FD8A, A6` at
+$FC01D2; Musashi correctly left CCR untouched, our core clobbered
+N=1/C=1 from the ALU subtraction.  Per the m68k spec, ADDA/SUBA
+do *not* update CCR (CMPA does).  Our K_ALU executor was
+unconditionally setting `cc_we_c` even when the destination was
+an An.
+
+Fix in K_ALU register-source path: skip the CCR commit (and X
+write) when `ex_reg_idx_full[3]` (An dest) and `ex_alu_op` is
+ALU_ADD or ALU_SUB.  CMPA stays on the normal CCR-commit path
+(its `ex_alu_op == ALU_CMP` doesn't match the filter).
+
+t126_adda_suba_ccr exercises ADDA.L / SUBA.W with a pre-seeded
+CCR pattern (N=1, Z=1, C=1) and verifies all three flags survive
+across the operation, plus CMPA.L correctness in both equal and
+positive cases.
+
+The cosim now agrees for 262K+ instructions and the next
+divergence after this fix is a memory-model mismatch (a write
+just below our autoconfig FAST-RAM base lands in unmapped chip
+space on Verilator but in flat mem[] on Musashi), not a CPU bug.
+Cosim is now the primary tool for further CPU-bug hunting --
+much faster than tracing back from a K1.3 wall.
+
+Status: 107/107 tests pass (added t126_adda_suba_ccr).
+
+### S34: Tightened Musashi memory model — cosim now lockstep for 525K instr
+
+The S33 cosim diverged at r=262289 on a memory-model mismatch (a
+write at $C3F09A landed in unmapped chip space on Verilator but
+in flat mem[] on Musashi).  Two tweaks landed the cosim onto solid
+ground:
+
+1.  Wrong chip-RAM size in Musashi.  I had `CHIP_RAM_SIZE = 256 KB`
+    but our Verilator kickstart-boot build uses `MEM_WORDS=131072`
+    = **512 KB** of chip RAM ($0-$7FFFF).  Writes at $40000 are
+    *valid* chip-RAM writes on Verilator, not unmapped.  Fixed
+    `CHIP_RAM_SIZE = 0x80000` in `tb/musashi_kick.c`.
+
+2.  Verilator's bus has an explicit "drop unmapped writes above
+    MEM_WORDS*4" guard plus a "read-fallback returns 0" guard
+    (both `KICKSTART_BOOT`-gated).  Musashi's flat 16 MB mem[]
+    didn't match -- Musashi kept the data, Verilator forgot it.
+    Mirrored the behavior: Musashi now drops writes to addresses
+    >= 512 KB outside the ROM/chipset/CIA/autoconfig regions, and
+    reads at those addresses return 0.
+
+Re-running the cosim: **525,687 instructions byte-identical**
+between Musashi and our core (modulo the cosmetic initial-state
+difference fixed by m68k_set_reg).  First divergence is at
+r=525688 on a `MOVEM.L (SP)+, A2/A3` -- A2 is popped from stack,
+both cores read the same address, but the data at that address
+differs because some *earlier* memory write produced different
+results on the two sides.  That's a memory-content trace
+(separate digging required to find when $7FFF4 first diverged);
+not a CPU-instruction bug.
+
+525K of bit-perfect cosim is a solid foundation.  Future CPU-bug
+hunting can run cosim against this stable baseline; any
+non-cosmetic divergence is either a CPU bug or a chipset-stub
+gap we can close.
+
+Status: 107/107 tests pass.  No CPU changes this iteration --
+just the Musashi memory-model tightening to make cosim usable.

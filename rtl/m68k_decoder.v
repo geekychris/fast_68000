@@ -409,15 +409,26 @@ module m68k_decoder (
             end
 
             // LINK An, #disp16: 0100_1110_0101_0aaa (+disp16)
+            // LINK pushes An as a longword and UNLK reloads it; both must
+            // tell the bus this is a 32-bit transfer (is_long=1) so the
+            // unaligned-long path assembles correctly.  Without SZ_L, an
+            // UNLK whose frame pointer lands at addr[1:0]=10 (very common
+            // since LINK A6 with #-even-disp leaves SP at +2-aligned)
+            // would read only one mem[] word and zero-extend the rest --
+            // restoring An = 0 instead of the value LINK saved.  Surfaced
+            // in K1.3 vsprintf: LINK A6 at $F82128 saved A6=$676 to
+            // $7FEEA, UNLK A6 at $F82140 read back $00000000.
             16'b0100_1110_0101_0???: begin
                 kind = K_LINK;
                 src_reg = r0;
                 src_ext_words = 2'd1;
+                size = `SZ_L;
             end
             // UNLK An: 0100_1110_0101_1aaa
             16'b0100_1110_0101_1???: begin
                 kind = K_UNLK;
                 src_reg = r0;
+                size = `SZ_L;
             end
             // MOVE An, USP: 0100_1110_0110_0aaa
             16'b0100_1110_0110_0???: begin

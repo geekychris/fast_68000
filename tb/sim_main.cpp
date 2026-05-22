@@ -218,6 +218,58 @@ static int run_regression(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
         printf("[sim] TIMEOUT after %llu cycles\n", (unsigned long long)cycle);
         if (rc == 0) rc = 0xFFFE;
     }
+
+    // Optional chip-RAM dump (binary, byte-addressed).  Useful for
+    // poking at what Kickstart staged in memory even when bitplane DMA
+    // never ran.  CHIPRAM_DUMP=path dumps the first 256 KB of chip RAM.
+    if (const char* path = std::getenv("CHIPRAM_DUMP")) {
+        std::FILE* f = std::fopen(path, "wb");
+        if (f) {
+            for (uint32_t addr = 0; addr < 0x40000; addr += 4) {
+                uint32_t w = mem_peek_word(top, addr);
+                uint8_t b[4] = {
+                    (uint8_t)(w >> 24), (uint8_t)(w >> 16),
+                    (uint8_t)(w >> 8),  (uint8_t)w};
+                std::fwrite(b, 1, 4, f);
+            }
+            std::fclose(f);
+            printf("[sim] dumped chip RAM to %s (256 KB)\n", path);
+        }
+    }
+
+    // Optional framebuffer dump as a PPM (P6) so Kickstart's rendered
+    // output can be visualised even in headless regression runs.  The
+    // chunky 8 bpp framebuffer lives at $10000, FB_W*FB_H bytes.
+    if (const char* path = std::getenv("FB_DUMP_PPM")) {
+        const int fb_w = 256, fb_h = 192;
+        std::FILE* f = std::fopen(path, "wb");
+        if (f) {
+            std::fprintf(f, "P6\n%d %d\n255\n", fb_w, fb_h);
+            for (int y = 0; y < fb_h; y++) {
+                for (int x = 0; x < fb_w; x++) {
+                    uint32_t addr = 0x00010000u + uint32_t(y) * fb_w + uint32_t(x);
+                    uint32_t w = mem_peek_word(top, addr);
+                    uint32_t shift = (3u - (addr & 3u)) * 8u;
+                    uint8_t  p = (w >> shift) & 0xFFu;
+                    // RGB332 -> RGB888.
+                    uint8_t r = (p >> 5) & 0x7;
+                    uint8_t g = (p >> 2) & 0x7;
+                    uint8_t b = (p     ) & 0x3;
+                    uint8_t out[3] = {
+                        (uint8_t)((r * 255) / 7),
+                        (uint8_t)((g * 255) / 7),
+                        (uint8_t)((b * 255) / 3),
+                    };
+                    std::fwrite(out, 1, 3, f);
+                }
+            }
+            std::fclose(f);
+            printf("[sim] dumped framebuffer to %s (%dx%d)\n", path, fb_w, fb_h);
+        } else {
+            std::fprintf(stderr, "[sim] FB_DUMP_PPM=%s open failed\n", path);
+        }
+    }
+
     return rc;
 }
 
