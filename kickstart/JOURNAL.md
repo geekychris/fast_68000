@@ -1341,3 +1341,52 @@ no actual track read, just the register setup).  Boot reaches
 r=62.6M before stalling.
 
 Status: 99/99 tests pass (added t118_cmpm).
+
+### S21: graphics beam-wait + Kickstart self-test passed; three Agnus/SERDATR fixes
+
+After CMPM landed and Kickstart got OpenResource("ciab.resource")
+working, the new wall was graphics.library's vertical-beam wait at
+$F88F7C / $F8C5A0:
+  MOVE.L $DFF004, D0   ; VPOSR.L
+  ASR.L  #8, D0
+  AND.L  #$7FF, D0
+  ; caller compares D0 against 20 and 160 expecting V in that band.
+
+Three bugs surfaced and were fixed in the bus:
+
+1. **VPOSR long-read.**  Our Agnus only emitted the 16-bit register
+   value in the high half of the bus word; the low half was 0.
+   Canonical Amiga semantics for a MOVE.L at $DFF004 is to return
+   {VPOSR, VHPOSR} packed as one longword.  V[7:0] lives in VHPOSR's
+   high byte, so without the low-half pairing the ASR/AND extraction
+   stayed at 0 forever.
+
+2. **V8 bit position.**  We had V8 at bit 0 of the VPOSR HIGH byte
+   (= bit 8 of the word).  Real hardware puts V8 at bit 0 of the
+   word.  After ASR.L #8 that ends up at D0 bit 8.  Caller compares
+   against 256 -- with the wrong position D0 was always < 256 and a
+   second loop spun.
+
+3. **SERDATR self-test.**  Kickstart 1.3 at $F84048 runs:
+     AND.B  #$7F, D0
+     CMP.B  #$7F, D0
+     DBEQ   D1, ...
+   DBEQ loops *while EQ*.  If our SERDATR low byte is $7F, the test
+   never sees a different value, the timeout fires with Z=1, and the
+   following BEQ falls into the "SAD!" Alert at $F83BF6 (a software-
+   Alert whose handler ends up in the Romwack input-poll loop -- so
+   the boot looked stuck "waiting for serial input" but was actually
+   in the post-Alert wait).  Earlier comment had this backwards: $7F
+   is the FAIL signal, not the PASS magic.  Switched SERDATR_VAL to
+   $3000 (TBE + TSRE, data=0).
+
+t119_vposr_long regression covers the long-read + ASR/AND extraction
+to V in [20..160].  Existing t64_agnus updated to use MOVE.W for the
+"low byte = 0" check (the .L semantics changed legitimately).
+t100_chip_word_half updated to $3000.
+
+Boot impact: passes graphics beam-wait + self-test.  Runs from
+r=1.5M to r=46.3M before hitting a different [BAD-PC] (jump from
+$4EDFF176 to $4E550000; task #44 filed).
+
+Status: 100/100 tests pass.
