@@ -1466,3 +1466,46 @@ Hits a new wall at chip-RAM $0001C051 with ILLEGAL opcode $0E16,
 filed as task #45.
 
 Status: 102/102 tests pass.
+
+### S24: ROM is NOT Kickstart 1.3 -- it's exec 45 (Kickstart 3.5+ / AROS); 68020+ required
+
+While chasing the post-MOVE-mem-CCR-fix wall (boot got to r=94M
+then hit a chip-RAM ILLEGAL at $1C051), traced the chain back
+through repeated RESET-restart cycles and uncovered the actual
+root cause.
+
+- $F80E16 contains `RESET ; JMP (A0)` -- Kickstart's warm-restart
+  trampoline.  Our CPU didn't decode RESET ($4E70), so it K_BAD-
+  trapped to ILLEGAL.  vec-4 handler returned to the same PC,
+  the boot spent ~92M of the 200M-cycle budget in that trap loop.
+  Fixed by decoding RESET as a privileged NOP (e512c5a).
+
+- With RESET no-op'd, the trace showed the boot looping every
+  ~1.85M instructions through `RESET ; JMP (A0)` at $F80E16 and
+  restarting from $F800D0.  Each restart fired an ILLEGAL trap
+  at $FBFEE0 on opcode $4C41 = **MULU.L** (68020+).  $FBFEE0
+  is the body of utility.library's UMult32 (LVO -150) per the
+  function table at $FBF9C8 (entry offset $0518).
+
+- 68000 doesn't have MULU.L.  utility.library hardcodes it
+  because by its build target the OS requires 68020+.
+
+- **The ROM is not K1.3.**  Dumped the exec resident's
+  rt_IdString and got `"exec 45.23 (22.09.2016)"`.  Exec
+  version 45 corresponds to Kickstart 3.5 or later -- this
+  ROM is an AROS / AfA OS clone built for 68020+.  K1.3
+  proper is exec 34.
+
+- All the CPU/bus bugs uncovered during this boot attempt
+  (MOVEM EA_IDX, EX->ID byte forwarding, CMPM, VPOSR layout,
+  SERDATR low byte, MOVE-mem-to-mem CCR, RESET) are real
+  bugs and the fixes stand regardless of which ROM we're
+  running.  But this specific kick.bin can't boot cleanly on
+  a 68000 -- it needs MULU.L / MULS.L / DIVU.L / DIVS.L (the
+  long-form 68020+ variants of MULU/DIVU) plus probably more.
+
+Path forward: either get a real K1.3 ROM (exec 34), or
+implement the 68020+ instruction subset Kickstart 45 depends
+on.  The latter is significant work and a scope expansion.
+
+Filed task #46.  100% test pass count: 102 tests.
