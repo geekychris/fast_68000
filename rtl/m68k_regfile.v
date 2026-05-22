@@ -20,6 +20,11 @@ module m68k_regfile #(
     output wire [31:0] rb_data,
     input  wire [3:0]  rc_idx,
     output wire [31:0] rc_data,
+    // Fourth read port: dst-index register for `d8(An, Xn)` destinations.
+    // rc is busy carrying src's xreg (or fallback A7) so when *both* src and
+    // dst use EA_IDX with different Xn registers, rd provides the dst Xn.
+    input  wire [3:0]  rd_idx,
+    output wire [31:0] rd_data,
 
     input  wire        we,
     input  wire [3:0]  w_idx,
@@ -36,6 +41,7 @@ module m68k_regfile #(
     assign ra_data = regs[ra_idx];
     assign rb_data = regs[rb_idx];
     assign rc_data = regs[rc_idx];
+    assign rd_data = regs[rd_idx];
 
     function [31:0] sized_write;
         input [31:0] old_val, new_val;

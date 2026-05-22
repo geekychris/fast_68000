@@ -547,8 +547,14 @@ module m68k_core #(
     wire [3:0] id_rc_idx = id_src_is_idx ? id_src_xreg
                          : id_dst_is_idx ? id_dst_xreg
                          : 4'd15;
+    // Fourth read port: dst xreg.  rc carries src xreg (or fallback A7); when
+    // an instruction needs BOTH src and dst xregs (MOVE.W between two
+    // EA_IDX modes with different Xn), rd carries the dst xreg.  Defaults
+    // to A7 when dst isn't EA_IDX -- harmless because dst_ea only consults
+    // ex_xreg_dst for EA_IDX destinations.
+    wire [3:0] id_rd_idx = id_dst_is_idx ? id_dst_xreg : 4'd15;
 
-    wire [31:0] rf_ra_data, rf_rb_data, rf_rc_data;
+    wire [31:0] rf_ra_data, rf_rb_data, rf_rc_data, rf_rd_data;
 
     // Writeback signals (driven combinationally by EX stage below).
     reg         wb_we;
@@ -587,6 +593,8 @@ module m68k_core #(
         .rb_data  (rf_rb_data),
         .rc_idx   (id_rc_idx),
         .rc_data  (rf_rc_data),
+        .rd_idx   (id_rd_idx),
+        .rd_data  (rf_rd_data),
         .we       (wb_we),
         .w_idx    (wb_widx),
         .w_size   (wb_size),
@@ -641,6 +649,8 @@ module m68k_core #(
     // For those instructions ex_sp is the index, not the stack
     // pointer, so we need a separate path to the current A7.
     wire [31:0] current_a7 = fwd(4'd15, u_rf.regs[15]);
+    // Dst-xreg forwarded value (for MOVE between two EA_IDX modes).
+    wire [31:0] id_xreg_dst_fwd = fwd(id_rd_idx, rf_rd_data);
 
     // ====================================================================
     //  ID/EX register.
@@ -666,6 +676,11 @@ module m68k_core #(
     // Latched A7 -- always carries the real stack pointer, even when
     // ex_sp is muxed to an index register for d8(An, Xn) operands.
     reg  [31:0] ex_a7;
+    // Latched dst-index register for d8(An, Xn) destinations.  Needed for
+    // MOVE between two EA_IDX EAs (e.g., K1.3 $FDB956 MOVE.W d8(A2,D1.L),
+    // d8(A0,D0.L)): ex_sp carries the src xreg, ex_xreg_dst carries the
+    // dst xreg, so both EA computations get the right index.
+    reg  [31:0] ex_xreg_dst;
     reg  [3:0]  ex_reg_idx_full;
     reg         ex_predicted_taken;
     reg  [15:0] ex_opcode;       // current instruction word (for Group-0 IR push)
@@ -691,6 +706,7 @@ module m68k_core #(
             ex_rb <= 32'd0;
             ex_sp <= 32'd0;
             ex_a7 <= 32'd0;
+            ex_xreg_dst <= 32'd0;
             ex_reg_idx_full <= 4'd0;
             ex_predicted_taken <= 1'b0;
             ex_size <= `SZ_L;
@@ -723,6 +739,7 @@ module m68k_core #(
             ex_rb          <= id_rb_fwd;
             ex_sp          <= id_sp_fwd;
             ex_a7          <= current_a7;
+            ex_xreg_dst    <= id_xreg_dst_fwd;
             ex_opcode      <= id_op;
             ex_reg_idx_full<= id_reg_idx_full;
             ex_predicted_taken <= id_predicted_taken;
@@ -839,12 +856,19 @@ module m68k_core #(
                 dst_is_mem = 1'b1;
             end
             `EA_IDX: begin
-                // Same as src EA_IDX, but uses ex_rb (dst An base).  When dst
-                // is EA_IDX we mux rc to dst's xreg, so ex_sp holds the index
-                // value here.
+                // Same as src EA_IDX, but uses ex_rb (dst An base) and
+                // ex_xreg_dst (dst's xreg).  Previously this read ex_sp,
+                // which works only when src is NOT EA_IDX (rc falls back
+                // to dst's xreg in that case).  For MOVE between two
+                // EA_IDX modes (e.g., K1.3 $FDB956 MOVE.W d8(A2, D1.L),
+                // d8(A0, D0.L)), ex_sp carries the *src* xreg -- using
+                // it for the dst would compute A0+D1 instead of A0+D0
+                // and corrupt the priv-vio vector table (the K1.3 wall
+                // at r=1313466 that gated booting past Exec startup).
                 dst_ea = ex_rb
-                       + (ex_dst_imm32[11] ? ex_sp
-                                           : {{16{ex_sp[15]}}, ex_sp[15:0]})
+                       + (ex_dst_imm32[11] ? ex_xreg_dst
+                                           : {{16{ex_xreg_dst[15]}},
+                                              ex_xreg_dst[15:0]})
                        + {{24{ex_dst_imm32[7]}}, ex_dst_imm32[7:0]};
                 dst_is_mem = 1'b1;
             end

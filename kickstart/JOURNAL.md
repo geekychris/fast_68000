@@ -329,6 +329,68 @@ session.  Boot now runs ~18× further (r=1.3M → r=22M+).  Next
 session needs deeper tracing at $FDB930-$FDB956 to find what's
 fundamentally wrong about the values being copied.
 
+### S39: MOVE between two d8(An, Xn) EAs read the wrong dst index reg
+
+Continued from S38.  Targeted register dump at $FDB956 showed
+A0=$E, D0=$4F50 going into the MOVE.W -- a dst EA of $E + $4F50
+= $4F5E.  But the bus saw a write at $1C.  Difference = $4F42 =
+A0 + D1 - dst_intended.  Specifically $1C = A0 + D1 = $E + $E.
+
+The bug: our regfile has 3 read ports (ra, rb, rc).  `id_rc_idx`
+is muxed to whichever EA uses EA_IDX.  When BOTH src and dst
+use EA_IDX with different Xn registers (rare in K1.3 except in
+Exec's IntServer init at $FDB956), src gets priority and ex_sp
+carries src's xreg.  The dst EA computation at line 845 then
+also read ex_sp, computing A0 + src_xreg instead of A0 +
+dst_xreg.
+
+For $FDB956 = MOVE.W $1C(A2, D1.L), $00(A0, D0.L):
+  - src xreg = D1, dst xreg = D0
+  - ex_sp = D1 (= $E)
+  - dst_ea (buggy) = A0 + D1 + 0 = $E + $E = $1C
+  - dst_ea (correct) = A0 + D0 + 0 = $E + $4F50 = $4F5E
+
+The 5 word writes at $FDB956 landed on the priv-vio vector
+table ($1C, $20, $24, $28, $2C) instead of the intended target
+(some Exec-internal scratch table at $4F50+).  That overwrote
+the high half of vec $20 ($00FC_090E → $7800_090E).  Then the
+Supervisor() priv-vio at $FC08E6 loaded the corrupted vector,
+PC mask gave $0090E (chip RAM data, not code), and the boot
+chain-trapped forever.
+
+Fix: added a 4th read port `rd` to the regfile that always
+carries the dst xreg (or A7 fallback).  Latched as `ex_xreg_dst`
+at ID->EX, then used by the dst_ea EA_IDX path instead of
+ex_sp.  ra/rb/rc retain their current roles; rd is the dst
+xreg dedicated port.  Regression: `tests/t133_move_two_idx.s`
+sets D1=$40, D0=$80, A2=$1000, A0=$2000 and verifies
+MOVE.W 0(A2,D1.L), 0(A0,D0.L) writes to $2080 not $2040.
+114/114 tests pass.
+
+This was the seventh CPU bug this session.
+
+**K1.3 BOOTS!**  Post-fix, the boot reaches r=1313466's
+priv-vio cleanly (vec 8 fires correctly, handler returns,
+no [BAD-PC]), then settles into the canonical Kickstart 1.3
+**idle loop**: STOP at $FC0F90, woken every ~280K cycles by
+a level-3 (VERTB) IRQ, RTE'd back into STOP.  No further
+exceptions other than the expected ones (vec 4 from
+Kickstart's CPU-feature probe via MOVEC, vec 8 from
+Supervisor() calls, vec 25 / 27 IRQ autovectors).
+
+Unique exception PCs over the 1.8M instructions retired:
+  - $FC0564: vec  4 ILLEGAL ($4E7B = MOVEC, expected)
+  - $FC08E6: vec  8 PRIV_VIO ($007C = ORI #imm,SR Supervisor entry)
+  - $FC0C26 / $FC0F90 / ...: vec 27 IRQ (VERTB-driven wakeups)
+  - $FC1444: vec 25 IRQ (DSKBLK / TBE)
+
+That's the exact "Insert disk" idle state real Kickstart 1.3
+sits in when no floppy is inserted.  Our boot trampoline
+loads a custom bootblock onto the simulated floppy and DMAs
+it into chip RAM, so the remaining step (task #24/#51) is
+making Kickstart's trackdisk see the bootblock as ready.
+But the CPU-side bring-up of K1.3 is complete.
+
 Goal: keep pulling on the render-loop thread; find which exec.library
 field is feeding `A0..A4` the bad low-chip-RAM pointers.
 
