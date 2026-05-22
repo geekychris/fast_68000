@@ -355,11 +355,13 @@ module m68k_bus #(
     // SERDATR idle: TBE (bit 13) | TSRE (bit 12), RBF (bit 14) = 0 so
     // no spurious "received byte" wakes up the Kickstart 1.3 Romwack
     // serial poll at $F83B98 (BTST #14, D0; BNE got-byte).  Low byte
-    // $7F satisfies Kickstart 3.1's post-init self-test poll at
-    // $F84048 (reads low byte and DBEQs until it sees $7F).  Earlier
-    // $607F mistakenly set bit 14 thinking it was "TSRE" -- that
-    // confusion came from the comment, the bit layout was wrong.
-    localparam [15:0] SERDATR_VAL  = 16'h307F;
+    // must NOT be $7F: Kickstart 1.3's post-init self-test at $F84048
+    // does `MOVE.W SERDATR, D0; AND.B #$7F, D0; CMP.B #$7F, D0; DBEQ D1`
+    // -- DBEQ loops while EQ.  A constant $7F means the loop hits the
+    // timeout exit with Z=1, which BEQs to the "SAD!" Alert path at
+    // $F83BF6.  Earlier this code thought $7F was a "self-test PASS"
+    // magic; it's actually the FAIL value.  Use $3000 (data=0).
+    localparam [15:0] SERDATR_VAL  = 16'h3000;
     localparam [15:0] POTGOR_VAL   = 16'hFFFF;
     localparam [15:0] POT_DAT_VAL  = 16'h0000;
     localparam [15:0] JOY_DAT_VAL  = 16'h0000;
@@ -1587,10 +1589,30 @@ module m68k_bus #(
     wire [15:0] agnus_val_w  = (granted_agnus_sel_q == 2'd2)
                                    ? {agnus_v[7:0], agnus_h[7:0]}  // VHPOSR $DFF006 (addr[1]=1)
                              : (granted_agnus_sel_q == 2'd1)
-                                   ? {7'd0, agnus_v[8], 8'd0}      // VPOSR  $DFF004 (addr[1]=0)
+                                   // VPOSR $DFF004: bit 0 of the word = V8
+                                   // (the high bit of the 9-bit vertical
+                                   // position).  Kickstart's beam-wait code
+                                   // does `MOVE.L $DFF004, D0; ASR.L #8, D0;
+                                   // AND.L #$7FF, D0` and expects bit 8 of
+                                   // D0 after the shift = bit 0 of VPOSR_lo
+                                   // byte = V8.  We previously put V8 in
+                                   // VPOSR_hi byte bit 0 which left the
+                                   // 9-bit V always reading 0..255 (low
+                                   // byte only); the loop comparing against
+                                   // 256 never exited.
+                                   ? {15'd0, agnus_v[8]}           // VPOSR  $DFF004 (addr[1]=0)
                                    : dmacon;                       // DMACONR $DFF002 (addr[1]=1)
+    // 32-bit accesses at $DFF004 read VPOSR (high word) + VHPOSR (low word)
+    // as a single longword.  Kickstart's vbeam wait loop at $F88F7C does
+    // `MOVE.L $DFF004, D0 ; ASR.L #8, D0 ; AND.L #$7FF, D0` and needs the
+    // V[7:0] byte (which lives in VHPOSR's high byte) in the LOW half.
+    // Without this, the low half returns 0 and the loop never sees V in
+    // the [20..160] window.
+    wire [15:0] vhposr_pair_w = {agnus_v[7:0], agnus_h[7:0]};
     wire [31:0] agnus_resp_w = granted_addr_q[1] ? {16'd0, agnus_val_w}
-                                                 : {agnus_val_w, 16'd0};
+                             : (granted_agnus_sel_q == 2'd1)
+                                   ? {agnus_val_w, vhposr_pair_w} // VPOSR.L
+                                   : {agnus_val_w, 16'd0};
 
     // Autoconfig read response.  Before shutup, byte $00 returns the
     // type byte in the high lane; everything else returns 0.  After

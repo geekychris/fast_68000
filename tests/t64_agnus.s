@@ -30,8 +30,13 @@ core0:
         cmpi.l  #$0000, D3
         bne     fail_clr
 
-        ; 4. VPOSR must read 0 in low byte (high V is in bit 0 of high byte).
-        move.l  $00DFF004, D4
+        ; 4. VPOSR (16-bit read) must have 0 in low byte; high V is in bit 0
+        ; of the high byte.  MOVE.W from $DFF004 returns only the VPOSR word.
+        ; A MOVE.L from $DFF004 returns {VPOSR, VHPOSR} as one long (the
+        ; canonical Amiga semantics Kickstart's beam-wait loop relies on),
+        ; so the low byte of a .L read carries H[7:0] -- not zero.  Use .W
+        ; here to keep the original meaning of "VPOSR low byte = 0".
+        move.w  $00DFF004, D4
         andi.l  #$00FF, D4
         cmpi.l  #$0000, D4
         bne     fail_vpos
