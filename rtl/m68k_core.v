@@ -2411,9 +2411,62 @@ module m68k_core #(
                         end
                     end
                     K_MOVE: begin
+                        // CCR: N/Z based on the byte/word/long that was
+                        // actually moved.  For register-source moves
+                        // src_operand carries the value.  For memory-source
+                        // moves src_operand is 0 (it's only set for D-reg/
+                        // A-reg sources); recover the moved byte/word from
+                        // dc_wdata (the chained store's wdata, which the
+                        // S_LOAD K_MOVE sequential block already positioned
+                        // into the right lane at dst_ea[1:0]).
+                        //
+                        // Without this, Kickstart 1.3's OldOpenLibrary
+                        // string builder at $F81AF0
+                        //   MOVE.B (A0)+, (A1)+ ; BNE
+                        // saw Z=1 (= "src_operand=0") on every byte and the
+                        // BNE never branched -- the loop exited after one
+                        // iteration, the search name landed as ".library"
+                        // (with the prefix smashed), FindResident missed
+                        // every resident, and graphics.library stashed 0
+                        // in its $1A0 field.  Downstream `JSR $FFE2(0)`
+                        // walked off into garbage memory.
                         cc_we_c = 1'b1;
-                        cc_n_c = src_operand[31];
-                        cc_z_c = (src_operand == 32'd0);
+                        if (src_needs_mem) begin
+                            case (ex_size)
+                                `SZ_B: begin
+                                    cc_n_c = byte_at(dc_wdata, dc_addr[1:0])[7];
+                                    cc_z_c = (byte_at(dc_wdata, dc_addr[1:0]) == 8'd0);
+                                end
+                                `SZ_W: begin
+                                    cc_n_c = dc_addr[1] ? dc_wdata[15]
+                                                        : dc_wdata[31];
+                                    cc_z_c = dc_addr[1] ? (dc_wdata[15:0] == 16'd0)
+                                                        : (dc_wdata[31:16] == 16'd0);
+                                end
+                                default: begin
+                                    cc_n_c = dc_wdata[31];
+                                    cc_z_c = (dc_wdata == 32'd0);
+                                end
+                            endcase
+                        end else begin
+                            // Register-source: src_operand has the right
+                            // value, but it's full-width.  Mask to size
+                            // for CCR.
+                            case (ex_size)
+                                `SZ_B: begin
+                                    cc_n_c = src_operand[7];
+                                    cc_z_c = (src_operand[7:0] == 8'd0);
+                                end
+                                `SZ_W: begin
+                                    cc_n_c = src_operand[15];
+                                    cc_z_c = (src_operand[15:0] == 16'd0);
+                                end
+                                default: begin
+                                    cc_n_c = src_operand[31];
+                                    cc_z_c = (src_operand == 32'd0);
+                                end
+                            endcase
+                        end
                         if (dst_an_update) begin
                             wb_aux_we_c = 1'b1;
                             wb_aux_idx_c = {1'b1, ex_dst_reg};
@@ -2637,8 +2690,6 @@ module m68k_core #(
             if (ex_state == S_RUN && ex_valid && !halted && exc_launch_c)
                 $display("[EXC] r=%d pc=%h opcode=%h kind=%d vec=%d",
                     retired, ex_pc, ex_opcode, ex_kind, exc_vector_c);
-            if (is_settled && (retired[19:0] == 20'd0))
-                $display("[PC-tick] r=%d pc=%h opcode=%h", retired, ex_pc, ex_opcode);
 `endif
             if (is_settled && cc_we_c) begin
                 cc_n <= cc_n_c; cc_z <= cc_z_c; cc_v <= cc_v_c; cc_c <= cc_c_c;
