@@ -221,11 +221,12 @@ static int run_regression(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
 
     // Optional chip-RAM dump (binary, byte-addressed).  Useful for
     // poking at what Kickstart staged in memory even when bitplane DMA
-    // never ran.  CHIPRAM_DUMP=path dumps the first 256 KB of chip RAM.
+    // never ran.  CHIPRAM_DUMP=path dumps the first 512 KB of chip RAM
+    // (matches the kickstart-boot MEM_WORDS=131072 build).
     if (const char* path = std::getenv("CHIPRAM_DUMP")) {
         std::FILE* f = std::fopen(path, "wb");
         if (f) {
-            for (uint32_t addr = 0; addr < 0x40000; addr += 4) {
+            for (uint32_t addr = 0; addr < 0x80000; addr += 4) {
                 uint32_t w = mem_peek_word(top, addr);
                 uint8_t b[4] = {
                     (uint8_t)(w >> 24), (uint8_t)(w >> 16),
@@ -233,8 +234,17 @@ static int run_regression(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
                 std::fwrite(b, 1, 4, f);
             }
             std::fclose(f);
-            printf("[sim] dumped chip RAM to %s (256 KB)\n", path);
+            printf("[sim] dumped chip RAM to %s (512 KB)\n", path);
         }
+        // Also dump the Agnus bitplane fetch counter and the last
+        // bitplane data, so we can tell whether bitplane DMA actually
+        // ran and where it ended up.
+        uint32_t bpl_fetches = mem_peek_word(top, 0x00FE9100u);
+        uint32_t bpl1dat     = mem_peek_word(top, 0x00FE9104u);
+        uint32_t bpl2dat     = mem_peek_word(top, 0x00FE9108u);
+        uint32_t bplcon0     = mem_peek_word(top, 0x00FE911Cu);
+        printf("[sim] Agnus state: bpl_fetches=%u bpl1dat=%08x bpl2dat=%08x bplcon0=%08x\n",
+            bpl_fetches, bpl1dat, bpl2dat, bplcon0);
     }
 
     // Optional framebuffer dump as a PPM (P6) so Kickstart's rendered
