@@ -443,6 +443,18 @@ module m68k_decoder (
             end
 
             // Reserved-but-implemented control opcodes (0100_1110_0111_xxxx).
+            // RESET ($4E70): privileged.  On real 68000 it strobes the
+            // external RESET line for ~512 clocks to reset peripherals,
+            // and execution continues at the next instruction.  In our
+            // sim there is nothing to reset (the cycle-accurate Verilator
+            // model doesn't expose a reset-line state to peripherals from
+            // the CPU), so treat as a privileged NOP -- but still raise
+            // the priv-violation trap from user mode.  Kickstart 1.3
+            // boots via `RESET; JMP (A0)` at $F80E16 to reset the
+            // chipset before restarting the boot code; without this
+            // decode the opcode K_BAD-traps to ILLEGAL and Kickstart
+            // sits in the trap loop forever.
+            16'b0100_1110_0111_0000: begin kind = K_NOP; privileged = 1'b1; end
             16'b0100_1110_0111_0001: kind = K_NOP;
             16'b0100_1110_0111_0011: begin kind = K_RTE; size = `SZ_L; privileged = 1'b1; end
             16'b0100_1110_0111_0101: begin kind = K_RTS; size = `SZ_L; end
