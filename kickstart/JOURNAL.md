@@ -1289,3 +1289,55 @@ library-call stub firing with a bad base).  Filed as task #43.
 Status: 98/98 tests pass (added t116_andb_imm_dn,
 t117_fwd_byte_dn).  Forwarding fix removes an entire class of
 subtle byte/word-Dn corruption.
+
+### S20: $F8EA24 BAD-PC was CMPM not implemented; FindName name compares always mismatched
+
+Diagnosed task #43.  $F8EA24 fires `JSR $FFFA(A6)` with A6=0, so the
+target = $FFFFFFFA = bad PC.  A6 came from the stack ([sp+8])
+populated by the caller at $F8C212 with the result of
+`OpenResource("ciab.resource")` at $F8C1FE.
+
+ResourceList is at **ExecBase + $150** in K1.3 (not +$17A as
+earlier journal entries assumed; verified via OpenResource body at
+$F82408: `LEA $0150(A6), A0`).  Tracing showed cia.resource init
+*did* run to completion and *did* call AddResource for both
+ciaa.resource ($42B8) and ciab.resource ($4358).  Both nodes are in
+the ResourceList at $526C.
+
+So why does OpenResource return 0?  FindName at $F81A50 walks the
+chain comparing ln_Name byte-by-byte with **CMPM.B (A0)+, (A1)+**
+at $F81A56.  Our CPU didn't implement CMPM.
+
+The opcode pattern `1011_???_1SS_001_???` overlapped the decoder's
+catch-all EOR rule (`1011_???_1??_???_???`), and the EOR rule fired
+with src_mode=001 = An direct -- an invalid EOR encoding that
+K_ALU's `alu_mem_dst` path silently routed through a broken RMW-to-
+An path.  Net effect: bytes never compared, strings never matched,
+every OpenResource / FindResource / FindName returned 0.
+
+Fix:
+
+- Decoder: explicit CMPM.B/.W/.L patterns BEFORE the broad EOR
+  rule.  Routes to a new K_CMPM kind with src_mode=AINC (Ay) and
+  dst_mode=AINC (Ax).
+
+- Core: new state S_CMPM_LOAD2.  S_RUN K_CMPM issues a load at Ay
+  via the central `want_mem` path.  S_LOAD's sequential handler
+  captures the size-extracted result into a new `cmpm_ay_data`
+  register and chains a second load at Ax, transitioning to
+  S_CMPM_LOAD2.  When that load completes the combinational planner
+  runs CMP (Ax_data - Ay_data), commits CCR, and writes both Ay
+  (main wb) and Ax (aux wb) post-increments.
+  `is_settled_after_cmpm` joins the settle disjunction;
+  `is_settled_after_load` now excludes K_CMPM.
+
+- t118_cmpm.s regression: B/W/L variants, match/mismatch paths,
+  post-inc verification.
+
+Boot impact: OpenResource("ciab.resource") now returns $4358
+(verified via trace).  graphics.library finishes init.  Trackdisk
+writes DSKLEN at $DFF024 ($4000_0000 = DMA enable bit only -- still
+no actual track read, just the register setup).  Boot reaches
+r=62.6M before stalling.
+
+Status: 99/99 tests pass (added t118_cmpm).
