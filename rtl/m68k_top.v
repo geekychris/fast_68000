@@ -202,16 +202,15 @@ module m68k_top #(
     //   bit 5: /DSKRDY  (active low)     -- 0 (drive ready / spinning)
     //   bit 4: /DSKTRACK0 (active low)   -- 0 (at track 0 cylinder)
     //   bit 3: /DSKWRPRO  (active low)   -- 1 (NOT write-protected -> high)
-    //   bit 2: /DSKCHANGE (active low)   -- 0 (active = "disk just
-    //                                       changed", which Kickstart
-    //                                       1.3 polls for at boot to
-    //                                       know it should read the
-    //                                       trackdisk; real hw clears
-    //                                       it after the drive steps).
-    //   bit 1: /OVL                       -- driven by CIA, not input
-    //   bit 0: /LED                       -- driven by CIA, not input
-    // pa_in = bits 7|6|3 = 0xC8.  Bits 5/4 stay 0 (ready + at T0); bit
-    // 2 stays 0 (disk-just-changed) so trackdisk runs.
+    //   bit 5: /DSKRDY  (driven low by drive once motor is up).  Now
+    //                   driven by `fl_dskrdy_low` (gated on motor on
+    //                   for ~16K cycles), declared below alongside
+    //                   the CIA-B PB step detector.
+    //   bit 2: /DSKCHANGE -- starts 0 (active, "disk just changed"
+    //                   since boot), goes 1 after the first /STEP
+    //                   pulse from CIA-B PB0, like real hw.
+    //   bit 1: /OVL     -- driven by CIA, not input
+    //   bit 0: /LED     -- driven by CIA, not input
     cia u_cia_a (
         .clk      (clk),
         .rst_n    (rst_n),
@@ -223,7 +222,13 @@ module m68k_top #(
         .tick     (1'b1),
         .kbd_wr   (cia_a_kbd_wr),
         .kbd_byte (cia_a_kbd_byte),
-        .pa_in    (8'b1100_1000),
+        // PRA input bit composition (active-low signals):
+        //   [7]=FIRE=1, [6]=SEL2=1, [5]=DSKRDY (motor-gated),
+        //   [4]=DSKTRACK0=0 (always at T0), [3]=DSKWRPRO=1,
+        //   [2]=DSKCHANGE (cleared after CIA-B drives a step),
+        //   [1:0] driven by the CIA, not the peripheral.
+        .pa_in    ({2'b11, !fl_dskrdy_low, 1'b0, 1'b1,
+                    dskchange_cleared, 2'b00}),
         .pb_in    (8'd0),
         .pa_out   (cia_a_pa_out),
         .pa_oe    (cia_a_pa_oe),
@@ -232,6 +237,11 @@ module m68k_top #(
         .int_o    (cia_a_int)
     );
 
+    // CIA-B PB drives the floppy interface lines: PB7 /MOTOR, PB6..PB3
+    // /SEL3..SEL0, PB2 /SIDE, PB1 /DIRECTION, PB0 /STEP.  Expose pb_out
+    // so we can model real-hw side effects (motor → DSKRDY, step →
+    // DSKCHANGE clear) on the CIA-A PRA input.
+    wire [7:0] cia_b_pb_out;
     cia u_cia_b (
         .clk      (clk),
         .rst_n    (rst_n),
@@ -247,10 +257,55 @@ module m68k_top #(
         .pb_in    (8'd0),
         .pa_out   (),
         .pa_oe    (),
-        .pb_out   (),
+        .pb_out   (cia_b_pb_out),
         .pb_oe    (),
         .int_o    (cia_b_int)
     );
+
+    // ----- Simulated floppy drive state -----------------------------
+    // Real Amiga floppy lines wired to CIA-A PRA inputs:
+    //   PRA[5] = /DSKRDY    (low when motor spun up and disk present)
+    //   PRA[4] = /DSKTRACK0 (low while head over cylinder 0)
+    //   PRA[2] = /DSKCHANGE (low while a disk-change is pending; the
+    //                       drive clears it high after the head steps)
+    // Our previous model hard-wired these to "ready, at T0, change
+    // pending" which sufficed for early-boot but stalled trackdisk
+    // before it would issue a step (it kept seeing DSKRDY=0 without
+    // having turned the motor on, decided the drive was bogus).
+    //
+    // Now: track CIA-B PB7 (/MOTOR) to gate DSKRDY, and look for
+    // /STEP rising edges (PB0 0→1) with a drive selected (any
+    // PB6..PB3 low) to clear DSKCHANGE.  Spin-up delay is a token
+    // 16-bit counter -- enough for K1.3 to observe a transition,
+    // not so long the regression tests slow to a crawl.
+    reg pb0_step_prev;
+    reg dskchange_cleared;
+    reg [15:0] motor_on_counter;       // counts cycles since motor cmd on
+    wire motor_on_now = !cia_b_pb_out[7];                  // /MOTOR active-low
+    wire any_drive_selected = !(&cia_b_pb_out[6:3]);       // any /SEL low
+    // After 16K cycles of motor-on with a drive selected, declare drive
+    // ready.  Threshold picked small for sim throughput; real hw is ~0.5s.
+    wire fl_dskrdy_low = (motor_on_counter >= 16'd16384);  // DSKRDY active-low
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            pb0_step_prev     <= 1'b1;
+            dskchange_cleared <= 1'b0;
+            motor_on_counter  <= 16'd0;
+        end else begin
+            pb0_step_prev <= cia_b_pb_out[0];
+            // /STEP rising edge with a drive selected = head step.
+            // Clear /DSKCHANGE on the first step we observe.
+            if (cia_b_pb_out[0] && !pb0_step_prev && any_drive_selected)
+                dskchange_cleared <= 1'b1;
+            // Motor spin-up counter.
+            if (motor_on_now && any_drive_selected) begin
+                if (motor_on_counter != 16'hFFFF)
+                    motor_on_counter <= motor_on_counter + 16'd1;
+            end else begin
+                motor_on_counter <= 16'd0;
+            end
+        end
+    end
 
     // Blitter instance.  Its master port plugs into the bus at index
     // BLT_PORT (the slot past all CPU I/D ports).
