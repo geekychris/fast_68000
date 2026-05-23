@@ -190,14 +190,29 @@ module minimig_blt_xcheck_top (
 
     // Our blitter memory write: take the half-word from mst_wdata
     // selected by mst_be (high or low half).
+    reg [31:0] our_write_count;
     always @(posedge clk) begin
+        if (our_write_count == 32'hFFFFFFFF) our_write_count <= 0;
         if (init_we) our_mem[init_addr] <= init_wdata;
         else if (our_mst_req && our_mst_we) begin
-            // half_be returns 4'b1100 for high-half (addr[1]=0), 4'b0011 for low.
+            if (our_write_count < 6)
+                $display("[OUR_WR_%0d] addr=%h be=%b wdata=%h",
+                    our_write_count, our_mst_addr, our_mst_be, our_mst_wdata);
+            our_write_count <= our_write_count + 1;
             if (our_mst_be == 4'b1100)
                 our_mem[our_mst_addr[15:1]] <= our_mst_wdata[31:16];
             else if (our_mst_be == 4'b0011)
                 our_mem[our_mst_addr[15:1]] <= our_mst_wdata[15:0];
+        end
+    end
+    reg [31:0] mm_write_count;
+    always @(posedge clk) begin
+        if (mm_write_count == 32'hFFFFFFFF) mm_write_count <= 0;
+        if (!init_we && mm_reqdma && mm_we_o) begin
+            if (mm_write_count < 6)
+                $display("[MM_WR_%0d]  addr=%h data=%h",
+                    mm_write_count, {mm_addr_out, 1'b0}, mm_data_out);
+            mm_write_count <= mm_write_count + 1;
         end
     end
 
