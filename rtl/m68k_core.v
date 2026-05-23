@@ -2830,6 +2830,43 @@ module m68k_core #(
                 retired >= 32'd2103600 && retired <= 32'd2106000 &&
                 ex_pc >= 32'h00fe_ac00 && ex_pc <= 32'h00fe_b000)
                 $display("[TRKPC] r=%d pc=%h kind=%d", retired, ex_pc, ex_kind);
+            // Trace each CMP.L (A1)+,D1 in $FEABCC's pattern-search inner
+            // loop.  Shows D1 (= 4 bytes from buffer at A0) and A1's prior
+            // value (i.e. the pattern entry being compared this iter).
+            if (is_settled && ex_pc == 32'h00fe_ac06)
+                $display("[SYNCSCAN] r=%d D1=%h A1=%h D0=%h A0=%h",
+                    retired, u_rf.regs[1], u_rf.regs[9], u_rf.regs[0], u_rf.regs[8]);
+            // Trace successful exit at $FEAC10 (match found).
+            if (is_settled && ex_pc == 32'h00fe_ac10)
+                $display("[SYNCSCAN] r=%d MATCH A0=%h", retired, u_rf.regs[8]);
+            // Trace $FEABCC entry to see what scan range was set up.
+            if (is_settled && ex_pc == 32'h00fe_abcc)
+                $display("[SYNCSCAN] r=%d $FEABCC ENTER A0=%h D0=%h", retired, u_rf.regs[8], u_rf.regs[0]);
+            // hdr_chk compare site ($FEACF8: CMP.L D0,D6)
+            if (is_settled && ex_pc == 32'h00fe_acf8)
+                $display("[HDRCHK] r=%d D6=%h D0=%h (expect equal)", retired, u_rf.regs[6], u_rf.regs[0]);
+            // D2==0 path: hdr_chk pair read at $FEACB2/$FEACB6.
+            if (is_settled && ex_pc == 32'h00fe_acb2)
+                $display("[HDRCHK_RD] r=%d D2=0 path: pre hdr_chk_odd read A0=%h A4=%h", retired, u_rf.regs[8], u_rf.regs[12]);
+            if (is_settled && ex_pc == 32'h00fe_acb6)
+                $display("[HDRCHK_RD] r=%d D2=0 path: post-odd A0=%h", retired, u_rf.regs[8]);
+            if (is_settled && ex_pc == 32'h00fe_acba)
+                $display("[HDRCHK_RD] r=%d D2=0 path: post-even A0=%h", retired, u_rf.regs[8]);
+            // $FEAA0E entry — combines odd/even pair: D0 = (odd << 1) | even.
+            if (is_settled && ex_pc == 32'h00fe_aa0e)
+                $display("[MFM_COMBINE] r=%d A0=%h (mem0=%h mem4=%h)", retired, u_rf.regs[8],
+                    u_rf.regs[8], u_rf.regs[8]);
+            if (is_settled && ex_pc == 32'h00fe_acfa)
+                $display("[HDRCHK] r=%d post-CMP CC bits (ccr next)", retired);
+            // Format byte check ($FEAD10: BNE if format != $FF)
+            if (is_settled && ex_pc == 32'h00fe_ad08)
+                $display("[INFO] r=%d info decoded D3=%h", retired, u_rf.regs[3]);
+            // Track number check ($FEAD1C: BNE if track != $4B(A3))
+            if (is_settled && ex_pc == 32'h00fe_ad18)
+                $display("[TRACK] r=%d cmp D0=%h vs $4B(A3) (A3=%h)", retired, u_rf.regs[0], u_rf.regs[11]);
+            // Error path ($FEAE6C)
+            if (is_settled && ex_pc == 32'h00fe_ae6c)
+                $display("[BADSEC] r=%d error path D0=%h D3=%h D6=%h A0=%h", retired, u_rf.regs[0], u_rf.regs[3], u_rf.regs[6], u_rf.regs[8]);
 `endif
 `ifdef KICKSTART_BOOT_TRACE
             // Edge-triggered watch for user-mode A7 dipping below $200.
