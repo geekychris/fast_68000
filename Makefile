@@ -367,6 +367,34 @@ $(MINIMIG_BUILD)/Vminimig_xcheck_top: $(MINIMIG_DIR)/rtl/minimig/paula_intcontro
 crosscheck-minimig: $(MINIMIG_BUILD)/Vminimig_xcheck_top
 	@(cd $(MINIMIG_BUILD) && ./Vminimig_xcheck_top) | tee $(MINIMIG_BUILD)/last.log
 
+# MiniMig blitter cosim: drives identical register-write sequences
+# into both blitters, compares the final memory state.
+MINIMIG_BLT_BUILD := build_minimig_blt
+minimig-blt: $(MINIMIG_BLT_BUILD)/Vminimig_blt_xcheck_top
+$(MINIMIG_BLT_BUILD)/Vminimig_blt_xcheck_top: \
+        $(MINIMIG_DIR)/rtl/minimig/agnus_blitter.v \
+        $(TB_DIR)/minimig_blt_xcheck_top.sv \
+        $(TB_DIR)/minimig_blt_xcheck.cpp \
+        $(RTL_DIR)/chipset/blitter.v
+	@mkdir -p $(MINIMIG_BLT_BUILD)
+	$(VERILATOR) -Wno-fatal --cc --exe --build --no-timing \
+	    --noassert -CFLAGS "-std=c++17 -O1" \
+	    -I$(RTL_DIR) -I$(MINIMIG_DIR)/rtl/minimig \
+	    --top-module minimig_blt_xcheck_top \
+	    -Mdir $(MINIMIG_BLT_BUILD) \
+	    -o Vminimig_blt_xcheck_top \
+	    $(TB_DIR)/minimig_blt_xcheck_top.sv \
+	    $(RTL_DIR)/chipset/blitter.v \
+	    $(MINIMIG_DIR)/rtl/minimig/agnus_blitter.v \
+	    $(MINIMIG_DIR)/rtl/minimig/agnus_blitter_minterm.v \
+	    $(MINIMIG_DIR)/rtl/minimig/agnus_blitter_fill.v \
+	    $(MINIMIG_DIR)/rtl/minimig/agnus_blitter_barrelshifter.v \
+	    $(MINIMIG_DIR)/rtl/minimig/agnus_blitter_adrgen.v \
+	    $(TB_DIR)/minimig_blt_xcheck.cpp
+
+crosscheck-minimig-blt: $(MINIMIG_BLT_BUILD)/Vminimig_blt_xcheck_top
+	@(cd $(MINIMIG_BLT_BUILD) && ./Vminimig_blt_xcheck_top) | tee $(MINIMIG_BLT_BUILD)/last.log
+
 # ---------------------------------------------------------------------------
 # C multicore demos.  Each demos/c/*.c is compiled inside the m68k-elf-gcc
 # Docker image (tools/cc68k/) and run through the default 2-core build.
