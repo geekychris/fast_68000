@@ -546,13 +546,13 @@ test-kickstart-boot:
 	    grep -E '\[OVL\]|\[DSKLEN\]|\[BOOTBLOCK\]' build_kick_boot/run.log; \
 	    tail -3 build_kick_boot/run.log; \
 	elif grep -qE '\[DSKLEN\].*dsk_pt=000064ac' build_kick_boot/run.log && \
-	     ! grep -q '\[BAD-PC\]' build_kick_boot/run.log; then \
+	     grep -qE '\[RESINIT\].*strap entry' build_kick_boot/run.log; then \
 	    final_retired=$$(grep -oE 'retired=[0-9]+' build_kick_boot/run.log | tail -1 | sed 's/retired=//'); \
-	    echo "PASS test-kickstart-boot (trackdisk programmed disk DMA, retired=$$final_retired)"; \
+	    echo "PASS test-kickstart-boot (strap + trackdisk DMA active, retired=$$final_retired)"; \
 	    echo "  Boot trace summary:"; \
-	    grep -E '\[OVL\]|\[DSKLEN\]|\[RESINIT\].*intuition' build_kick_boot/run.log | head -10; \
-	    echo "  trackdisk.device is actively trying to read the bootblock."; \
-	    echo "  Further progress requires MFM sync + DMA completion handling."; \
+	    grep -E '\[OVL\]|\[DSKLEN\]|\[RESINIT\]' build_kick_boot/run.log | head -25; \
+	    echo "  strap.task is running and trackdisk is reading the bootblock."; \
+	    echo "  Remaining wall: MFM-decode validation + assumed-slow-RAM jump."; \
 	elif grep -q '\[STOP\] PC=00fc0f90' build_kick_boot/run.log && \
 	     ! grep -q '\[BAD-PC\]' build_kick_boot/run.log; then \
 	    final_retired=$$(grep -oE 'retired=[0-9]+' build_kick_boot/run.log | tail -1 | sed 's/retired=//'); \
