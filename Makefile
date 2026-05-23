@@ -141,7 +141,13 @@ CROSSCHECK_TESTS := \
     $(TESTS_DIR)/t53_bit_ops.s \
     $(TESTS_DIR)/t54_shifts.s \
     $(TESTS_DIR)/t55_addressing_modes.s \
-    $(TESTS_DIR)/t57_exg_pcidx.s
+    $(TESTS_DIR)/t57_exg_pcidx.s \
+    $(TESTS_DIR)/t88_eor_dn_dm.s
+# t87_irq_usp_capture is intentionally NOT in CROSSCHECK_TESTS: it
+# triggers an address error mid-IDX-mode-EA, and Musashi's address-error
+# behavior in that window differs from real 68000 / our impl (it
+# computes the EA slightly differently and falls through to trap #14
+# instead of vec 3).  The test does still run under `make test`.
 
 fetch-musashi: $(MUSASHI_DIR)/m68k.h
 $(MUSASHI_DIR)/m68k.h:
