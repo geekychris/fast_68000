@@ -2821,6 +2821,16 @@ module m68k_core #(
             if (is_settled && ex_kind != K_STOP)
                 $display("[PC] r=%d pc=%h kind=%d", retired, ex_pc, ex_kind);
 `endif
+`ifdef KICKSTART_TRACKDISK_TRACE
+            // Narrow window trace: K1.3 trackdisk decoder PCs during the
+            // iter-1-pass → iter-2-fail window.  $FEAC00..$FEB000 covers
+            // the sector validator + clock-bit recon helpers.  Window
+            // tuned to one validation attempt (~2200 cycles).
+            if (is_settled && ex_kind != K_STOP &&
+                retired >= 32'd2103600 && retired <= 32'd2106000 &&
+                ex_pc >= 32'h00fe_ac00 && ex_pc <= 32'h00fe_b000)
+                $display("[TRKPC] r=%d pc=%h kind=%d", retired, ex_pc, ex_kind);
+`endif
 `ifdef KICKSTART_BOOT_TRACE
             // Edge-triggered watch for user-mode A7 dipping below $200.
             // Catches tasks running with a smashed stack pointer.  Kept
