@@ -2067,12 +2067,26 @@ module m68k_core #(
                 // next instruction boundary. Detected here in S_RUN, where the
                 // current instruction is about to dispatch. Saved PC = ex_pc
                 // (so RTE will re-execute the suppressed instruction).
+                //
+                // EXCEPTION for K_STOP: STOP loads SR and waits in S_RUN
+                // forever until an IRQ arrives.  The SR load is idempotent
+                // (we re-do it every cycle the CPU is parked in STOP), so by
+                // the time the IRQ check fires, STOP has effectively
+                // "executed."  We must save ex_pc_next (= post-STOP PC) so
+                // RTE returns to the instruction after STOP -- not back to
+                // STOP itself, which would re-park the CPU and never let
+                // the dispatcher at $FC0F94 run.  This is the K1.3 Exec
+                // idle loop's wakeup path: STOP $2000 -> IRQ -> handler ->
+                // RTE -> BRA back to TaskReady dispatcher.  Without this
+                // fix the CPU oscillates between STOP and a brief handler
+                // run and never re-dispatches a READY task.
+                //
                 // Only fires if no other exception is already being launched.
                 if (!exc_launch_c && (ipl_i > sr_i)) begin
                     exc_launch_c   = 1'b1;
                     exc_is_irq_c   = 1'b1;
                     exc_vector_c   = 8'd24 + {5'd0, ipl_i};
-                    exc_saved_pc_c = ex_pc;
+                    exc_saved_pc_c = (ex_kind == K_STOP) ? ex_pc_next : ex_pc;
                 end
             end
             // Final cycle of exception entry sequence: write A7 := working_sp

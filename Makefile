@@ -547,12 +547,18 @@ test-kickstart-boot:
 	    tail -3 build_kick_boot/run.log; \
 	elif grep -q '\[STOP\] PC=00fc0f90' build_kick_boot/run.log && \
 	     ! grep -q '\[BAD-PC\]' build_kick_boot/run.log; then \
-	    echo "PASS test-kickstart-boot (reached clean idle at \$$FC0F90)"; \
+	    final_retired=$$(grep -oE 'retired=[0-9]+' build_kick_boot/run.log | tail -1 | sed 's/retired=//'); \
+	    if [ -z "$$final_retired" ] || [ "$$final_retired" -lt 2000000 ]; then \
+	        echo "FAIL test-kickstart-boot: K1.3 stuck at idle STOP (retired=$$final_retired < 2M)"; \
+	        echo "  Regression guard: post-S42 STOP+IRQ fix made boot progress past r=2M."; \
+	        echo "  If we're back below 2M, the dispatcher isn't running post-VBlank."; \
+	        exit 1; \
+	    fi; \
+	    echo "PASS test-kickstart-boot (idle STOP reached + boot progressed past r=2M, retired=$$final_retired)"; \
 	    echo "  Boot trace summary:"; \
-	    grep -E '\[OVL\]|\[DSKLEN\]|\[STOP\]' build_kick_boot/run.log | head -10; \
-	    echo "  K1.3 is in the 'Insert disk in Drive DF0:' idle loop (STOP"; \
-	    echo "  woken by VERTB IRQs).  Bootblock load requires further"; \
-	    echo "  trackdisk emulation work; CPU bring-up is complete."; \
+	    grep -E '\[OVL\]|\[DSKLEN\]|\[RESINIT\].*intuition|\[STOP\]' build_kick_boot/run.log | head -12; \
+	    echo "  Intuition init returns successfully; K1.3 now runs in chip-RAM."; \
+	    echo "  Further progress requires trackdisk to load the bootblock."; \
 	else \
 	    echo "FAIL test-kickstart-boot rc=$$rc"; \
 	    echo "  (neither [BOOTBLOCK] nor clean idle at \$$FC0F90 reached)"; \
