@@ -2844,18 +2844,26 @@ module m68k_core #(
                 $display("[SYNCSCAN] r=%d $FEABCC ENTER A0=%h D0=%h", retired, u_rf.regs[8], u_rf.regs[0]);
             // hdr_chk compare site ($FEACF8: CMP.L D0,D6)
             if (is_settled && ex_pc == 32'h00fe_acf8)
-                $display("[HDRCHK] r=%d D6=%h D0=%h (expect equal)", retired, u_rf.regs[6], u_rf.regs[0]);
+                $display("[HDRCHK] r=%d t=%0t D6=%h D0=%h (expect equal)", retired, $time, u_rf.regs[6], u_rf.regs[0]);
             // D2==0 path: hdr_chk pair read at $FEACB2/$FEACB6.
             if (is_settled && ex_pc == 32'h00fe_acb2)
-                $display("[HDRCHK_RD] r=%d D2=0 path: pre hdr_chk_odd read A0=%h A4=%h", retired, u_rf.regs[8], u_rf.regs[12]);
+                $display("[HDRCHK_RD] r=%d t=%0t D2=0 path: pre hdr_chk_odd read A0=%h A4=%h", retired, $time, u_rf.regs[8], u_rf.regs[12]);
             if (is_settled && ex_pc == 32'h00fe_acb6)
                 $display("[HDRCHK_RD] r=%d D2=0 path: post-odd A0=%h", retired, u_rf.regs[8]);
             if (is_settled && ex_pc == 32'h00fe_acba)
                 $display("[HDRCHK_RD] r=%d D2=0 path: post-even A0=%h", retired, u_rf.regs[8]);
             // $FEAA0E entry — combines odd/even pair: D0 = (odd << 1) | even.
             if (is_settled && ex_pc == 32'h00fe_aa0e)
-                $display("[MFM_COMBINE] r=%d A0=%h (mem0=%h mem4=%h)", retired, u_rf.regs[8],
-                    u_rf.regs[8], u_rf.regs[8]);
+                $display("[MFM_COMBINE] r=%d ENTER A0=%h", retired, u_rf.regs[8]);
+            // After MOVE.L (A0)+, D0 at $FEAA0E (so next PC = $FEAA10)
+            if (is_settled && ex_pc == 32'h00fe_aa10)
+                $display("[MFM_COMBINE] r=%d post-load-odd D0=%h A0=%h", retired, u_rf.regs[0], u_rf.regs[8]);
+            // After MOVE.L (A0)+, D1 at $FEAA10 (so next PC = $FEAA12)
+            if (is_settled && ex_pc == 32'h00fe_aa12)
+                $display("[MFM_COMBINE] r=%d post-load-even D0=%h D1=%h", retired, u_rf.regs[0], u_rf.regs[1]);
+            // After OR.L D1, D0 at $FEAA20 (so next PC = $FEAA22 RTS)
+            if (is_settled && ex_pc == 32'h00fe_aa22)
+                $display("[MFM_COMBINE] r=%d RTS D0=%h", retired, u_rf.regs[0]);
             if (is_settled && ex_pc == 32'h00fe_acfa)
                 $display("[HDRCHK] r=%d post-CMP CC bits (ccr next)", retired);
             // Format byte check ($FEAD10: BNE if format != $FF)
@@ -2867,6 +2875,20 @@ module m68k_core #(
             // Error path ($FEAE6C)
             if (is_settled && ex_pc == 32'h00fe_ae6c)
                 $display("[BADSEC] r=%d error path D0=%h D3=%h D6=%h A0=%h", retired, u_rf.regs[0], u_rf.regs[3], u_rf.regs[6], u_rf.regs[8]);
+            // Trace CPU writes to the local-var slots $5DC8 / $5DCC where the
+            // hdr_chk pair is staged before $FEAA0E.  Identifies any code
+            // path that scribbles over the local between $FEACB6 and the
+            // MFM-combine read.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h0000_5DC8 && dc_addr <= 32'h0000_5DCF)
+                $display("[HDRCHK_LOC_PC] r=%d pc=%h kind=%d addr=%h be=%b wdata=%h",
+                    retired, ex_pc, ex_kind, dc_addr, dc_be, dc_wdata);
+            // Watch CPU writes that hit the disk-buffer hdr_chk pair area
+            // ($64DC..$64E7).  Find whoever clobbers it between DMA refills.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h0000_64DC && dc_addr <= 32'h0000_64E7)
+                $display("[HDRCHK_BUF_PC] r=%d pc=%h kind=%d addr=%h be=%b wdata=%h",
+                    retired, ex_pc, ex_kind, dc_addr, dc_be, dc_wdata);
 `endif
 `ifdef KICKSTART_BOOT_TRACE
             // Edge-triggered watch for user-mode A7 dipping below $200.

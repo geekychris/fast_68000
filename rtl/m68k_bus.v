@@ -255,6 +255,13 @@ module m68k_bus #(
     reg [31:0] blk_cnt;     // sectors remaining
     reg        blk_busy;
     reg [31:0] blk_cur_off; // current disk word offset
+`ifdef HDRCHK_WATCH
+    reg [31:0] cyc_count;   // free-running cycle counter for trace ordering
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) cyc_count <= 32'd0;
+        else        cyc_count <= cyc_count + 32'd1;
+    end
+`endif
     reg [31:0] blk_cur_dst; // current dest byte addr
     reg        blk_busy_last;
     // When the DSKLEN-DMA path triggers it, blk_count_in_bytes is set to
@@ -1259,6 +1266,11 @@ module m68k_bus #(
                     blk_byte_mode <= 1'b0;
                 end else begin
                     mem[blk_cur_dst[AIDX_BITS+1:2]] <= disk[blk_cur_off[DISK_IDX_BITS+1:2]];
+`ifdef HDRCHK_WATCH
+                    if (blk_cur_dst >= 32'h0000_64DC && blk_cur_dst <= 32'h0000_64E7)
+                        $display("[HDRCHK_WR] cyc=%0d DMA dst=%h off=%h data=%h",
+                            cyc_count, blk_cur_dst, blk_cur_off, disk[blk_cur_off[DISK_IDX_BITS+1:2]]);
+`endif
                     blk_cur_off <= blk_cur_off + 32'd4;
                     blk_cur_dst <= blk_cur_dst + 32'd4;
                 end
@@ -1551,6 +1563,21 @@ module m68k_bus #(
                     if (be[winner][1]) mem[mem_idx][15:8]  <= wdata[winner][15:8];
                     if (be[winner][0]) mem[mem_idx][7:0]   <= wdata[winner][7:0];
                 end
+`ifdef HDRCHK_WATCH
+                // Watch writes that touch \$64DC..\$64E7 (hdr_chk + data_chk
+                // pair in the K1.3 disk-decode buffer).  Helps pin down what
+                // clobbers the buffer between trackdisk validation passes.
+                if (addr[winner] >= 32'h0000_64DC && addr[winner] <= 32'h0000_64E7) begin
+                    $display("[HDRCHK_WR] cyc=%0d port=%0d addr=%h be=%b wdata=%h blk_busy=%b",
+                        cyc_count, winner, addr[winner], be[winner], wdata[winner], blk_busy);
+                end
+                // Watch writes to local-var slots $5DC8/$5DCC where the
+                // hdr_chk pair is copied to before $FEAA0E.
+                if (addr[winner] >= 32'h0000_5DC0 && addr[winner] <= 32'h0000_5DCF) begin
+                    $display("[HDRCHK_LOC] cyc=%0d port=%0d addr=%h be=%b wdata=%h",
+                        cyc_count, winner, addr[winner], be[winner], wdata[winner]);
+                end
+`endif
             end
 
             // Latch for delayed response.
