@@ -112,14 +112,23 @@ def encode_sector(track: int, sector: int, data: bytes) -> bytes:
     # Sector label: zeroes for OS sectors.
     label_raw = b"\x00" * SECTOR_LABEL_BYTES
 
-    # Header = info (4 bytes = 1 long) + label (16 bytes = 4 longs).
-    header_raw = info_raw + label_raw
-    hdr_odd, hdr_even = odd_even_halves(header_raw)
-    out.extend(hdr_odd)
-    out.extend(hdr_even)
+    # Amiga on-disk layout splits info and label into separate odd/even
+    # sections (NOT one combined header).  K1.3 trackdisk reads:
+    #   $00..$03  info_odd  (4 bytes)
+    #   $04..$07  info_even (4 bytes)
+    #   $08..$17  label_odd (16 bytes)
+    #   $18..$27  label_even (16 bytes)
+    # then computes the header checksum across all 40 bytes.
+    info_odd,  info_even  = odd_even_halves(info_raw)
+    label_odd, label_even = odd_even_halves(label_raw)
+    out.extend(info_odd)
+    out.extend(info_even)
+    out.extend(label_odd)
+    out.extend(label_even)
 
-    # Header checksum = XOR of header odd+even halves, masked.
-    hdr_chk = amiga_checksum(hdr_odd + hdr_even)
+    # Header checksum = XOR of every 4-byte longword in (info_odd +
+    # info_even + label_odd + label_even), masked to $55555555.
+    hdr_chk = amiga_checksum(info_odd + info_even + label_odd + label_even)
     hdr_chk_odd, hdr_chk_even = odd_even_halves(hdr_chk.to_bytes(4, "big"))
     out.extend(hdr_chk_odd)
     out.extend(hdr_chk_even)

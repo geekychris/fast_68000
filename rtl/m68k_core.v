@@ -1349,7 +1349,16 @@ module m68k_core #(
                             end
                             if (ex_alu_op != `ALU_CMP) begin
                                 wb_main_we_c = 1'b1;
-                                wb_main_idx_c = ex_reg_idx_full;
+                                // EOR.L Dn,Dm (the only direction=1 K_ALU
+                                // op that allows EA_DREG) writes back to
+                                // the EA's data reg, not the reg-field.
+                                // K1.3 trackdisk header-checksum loop
+                                // ($FEACAC: EOR.L D0,D6) silently dropped
+                                // every XOR step pre-fix.
+                                wb_main_idx_c = (ex_direction == 1'b1 &&
+                                                 ex_src_mode == `EA_DREG)
+                                                ? {1'b0, ex_src_reg}
+                                                : ex_reg_idx_full;
                                 wb_main_data_c = alu_y;
                             end
                         end

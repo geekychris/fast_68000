@@ -411,7 +411,10 @@ module m68k_bus #(
     localparam [31:0] DSKBYTR_ADDR = 32'h00DF_F01A;
     localparam [31:0] DSKDATR_ADDR = 32'h00DF_F008;
     localparam [31:0] DSKSYNC_ADDR = 32'h00DF_F07E;
+    localparam [31:0] ADKCON_ADDR  = 32'h00DF_F09E;
     reg [15:0] dsksync;  // sync pattern set by CPU writes
+    reg [14:0] adkcon;   // ADKCON.  Only bit 10 (WORDSYNC) is consulted today.
+    wire       adkcon_wordsync = adkcon[10];
 
     // ----- Agnus bitplane / control register STORAGE ---------------
     // Kickstart writes a lot of bitplane setup state before kicking
@@ -464,7 +467,8 @@ module m68k_bus #(
     wire is_dsk_reg = (addr[winner] == DSKPTH_ADDR) ||
                       (addr[winner] == DSKPTL_ADDR) ||
                       (addr[winner] == DSKLEN_ADDR) ||
-                      (addr[winner] == DSKSYNC_ADDR);
+                      (addr[winner] == DSKSYNC_ADDR) ||
+                      (addr[winner] == ADKCON_ADDR);
     wire is_shadow_reg =
         ((addr[winner] >= 32'h00DF_F020 && addr[winner] <= 32'h00DF_F02E) ||
          (addr[winner] >= 32'h00DF_F040 && addr[winner] <= 32'h00DF_F07F) ||
@@ -1118,6 +1122,7 @@ module m68k_bus #(
             dsk_pt    <= 32'd0;
             dsk_len   <= 16'd0;
             dsksync   <= 16'h4489;  // power-on default per Amiga HRM
+            adkcon    <= 15'h0000;
             autoconfig_shutup  <= 1'b0;
             autoconfig_base_hi <= 8'd0;
             autoconfig_base_lo <= 8'd0;
@@ -1322,7 +1327,11 @@ module m68k_bus #(
                         if (wdata[winner][15] && !blk_busy) begin
                             blk_busy    <= 1'b1;
                             blk_byte_mode <= 1'b1;
-                            blk_cur_off <= 32'd0;
+                            // WORDSYNC=1: skip the $AAAA gap so the buffer
+                            // starts at the first $4489 sync (matching real
+                            // PLL behaviour where DMA only stores from sync
+                            // onward).  adf2mfm emits exactly 2 bytes of gap.
+                            blk_cur_off <= adkcon_wordsync ? 32'd2 : 32'd0;
                             // Combine DSKPTH (already set) + new DSKPTL.
                             blk_cur_dst <= {dsk_pt[31:16], wdata[winner][31:16]};
                             blk_dst     <= {dsk_pt[31:16], wdata[winner][31:16]};
@@ -1350,7 +1359,7 @@ module m68k_bus #(
                         if (wdata[winner][31] && !blk_busy) begin
                             blk_busy    <= 1'b1;
                             blk_byte_mode <= 1'b1;
-                            blk_cur_off <= 32'd0;
+                            blk_cur_off <= adkcon_wordsync ? 32'd2 : 32'd0;
                             blk_cur_dst <= dsk_pt;
                             blk_dst     <= dsk_pt;
                             blk_count_in_bytes <= {17'd0, wdata[winner][29:16]} << 1;
@@ -1360,7 +1369,7 @@ module m68k_bus #(
                         if (wdata[winner][31] && !blk_busy) begin
                             blk_busy    <= 1'b1;
                             blk_byte_mode <= 1'b1;
-                            blk_cur_off <= 32'd0;
+                            blk_cur_off <= adkcon_wordsync ? 32'd2 : 32'd0;
                             blk_cur_dst <= dsk_pt;
                             blk_dst     <= dsk_pt;
                             blk_count_in_bytes <= {17'd0, wdata[winner][29:16]} << 1;
@@ -1371,7 +1380,7 @@ module m68k_bus #(
                         if (wdata[winner][15] && !blk_busy) begin
                             blk_busy    <= 1'b1;
                             blk_byte_mode <= 1'b1;
-                            blk_cur_off <= 32'd0;
+                            blk_cur_off <= adkcon_wordsync ? 32'd2 : 32'd0;
                             blk_cur_dst <= dsk_pt;
                             blk_dst     <= dsk_pt;
                             blk_count_in_bytes <= {17'd0, wdata[winner][13:0]} << 1;
@@ -1383,6 +1392,23 @@ module m68k_bus #(
                     // low half if addr[1]=1.  $DFF07E has addr[1]=1.
                     if (be[winner] == 4'b0011)        dsksync <= wdata[winner][15:0];
                     else if (be[winner] == 4'b1100)   dsksync <= wdata[winner][31:16];
+                end else if (addr[winner] == ADKCON_ADDR) begin
+                    // ADKCON write: bit 15 = SET (1) / CLR (0), bits 14:0 = mask.
+                    // We only model bit 10 (WORDSYNC) -- when set, disk DMA
+                    // skips the leading $AAAA gap so the buffer starts at
+                    // the first $4489 sync (matching real-hw PLL behavior).
+                    // ADKCON lives at $DFF09E (addr[1]=1), so the word is
+                    // typically in the low half (be=0011).
+                    if (be[winner] == 4'b0011) begin
+                        if (wdata[winner][15]) adkcon <= adkcon |  wdata[winner][14:0];
+                        else                   adkcon <= adkcon & ~wdata[winner][14:0];
+                    end else if (be[winner] == 4'b1100) begin
+                        if (wdata[winner][31]) adkcon <= adkcon |  wdata[winner][30:16];
+                        else                   adkcon <= adkcon & ~wdata[winner][30:16];
+                    end
+`ifdef KICKSTART_BOOT_TRACE
+                    $display("[ADKCON] addr=%h be=%b wdata=%h", addr[winner], be[winner], wdata[winner]);
+`endif
                 end
             end else if (winner_valid && we[winner] && is_blk_reg) begin
                 // Block-device control register write.  BLKCMD with bit 0
