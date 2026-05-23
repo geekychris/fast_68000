@@ -2733,3 +2733,74 @@ a blitter destination-pointer bug in our chipset (BLTDPT defaults
 unprogrammed, or modulo handling sends DST walking into low memory).
 
 Status: 120/120 tests pass.
+
+### S44 (LANDED): bus xlat preserves both halves of MOVE.L to chipset pointers
+
+The "blitter clobbers $4-$7" task #67 was misdiagnosed.  The blitter
+wasn't broken -- the bus xlat was dropping half the data on every
+MOVE.L to a 32-bit chipset pointer register.
+
+K1.3 wrote pointers like this:
+
+```
+MOVE.L #ptr, $DFF054   ; BLTDPT = ptr
+MOVE.L #lc,  $DFF080   ; COP1LC = lc
+```
+
+The bus xlat at line 838 (BLTDPTH) looked up the Amiga reg by
+`blt_amiga_reg = addr[5:1]` = $A (= BLTDPTH).  amiga_wdata_half
+took wdata[31:16] (= the bytes at addr+0/+1, which IS the
+canonical BLTDPTH high half).  But it then COMBINED that with
+`canon_bltdpt[15:0]` -- the shadow's LOW half, which stayed at
+0 forever because the LOW half of wdata (= the BLTDPTL bytes,
+which the CPU put at wdata[15:0]) was never picked up.
+
+For MOVE.L #$00064AC, $DFF054:
+  - bus sees addr=$DFF054, wdata=$000064AC, is_long=1, be=4'b1111
+  - amiga_wdata_half = wdata[31:16] = $0000 (= BLTDPTH value)
+  - slv_wdata = {$0000, canon_bltdpt[15:0]=0} = $00000000
+  - BLTDPT becomes $0 (!) -- the $64AC low half is lost
+
+Result: K1.3 trackdisk set BLTDPT to a chip-RAM destination, but
+our blitter saw $0 and incrementing -- walked through low memory
+clobbering ExecBase at $4 with $0.  `MOVEA.L $4.L, A6` then read
+$0 -> JSR $FF3A(0) -> [BAD-PC] at r=2235386 wall.
+
+Fix: when is_long && be==$F, slv_wdata gets the full wdata directly:
+```verilog
+blt_xlat_wdata = (is_long[winner] && be[winner] == 4'b1111)
+                 ? wdata[winner]
+                 : {amiga_wdata_half, canon_bltdpt[15:0]};
+```
+
+Same fix applied to BLTAPT/BPT/CPT and COP1LC/COP2LC.  Same change
+mirrored in canon_blt*pt and canon_cop*lc shadow updates so a
+follow-up .W to the L reg doesn't re-zero the H half.
+
+**Boot impact** (massive again):
+  Before S44: K1.3 stalls at r=9.4M (BAD-PC from corrupted ExecBase).
+  After S44:  K1.3 reaches r=34.7M -- a 3.7x advance.  Three new
+              residents fire:
+                [RESINIT] r=2055634 mathffp.library code
+                [RESINIT] r=2055862 romboot.library code
+                [RESINIT] r=2056453 strap entry
+              `strap` is K1.3's bootloader -- it reads the bootblock
+              from disk via trackdisk.device and chains into the
+              loaded code.  After S44, strap is ACTIVELY trying to
+              load the bootblock (DSKLEN traces show dsk_pt=$64ac
+              with the read-enable bit set, repeatedly).
+              LibList grew from 5 to 7 entries.
+
+**Regression**: no isolated `tests/*.s` test added -- chipset .L
+write semantics depend on enough chipset plumbing that a single-file
+test would just duplicate the K1.3 plumbing.  `test-kickstart-boot`
+requires retired > 2M; with S44 the chipram dump confirms mathffp
+and romboot in LibList.
+
+**Next wall**: K1.3 still doesn't complete the boot.  The MFM disk
+DMA path needs more work -- the floppy emulation produces MFM-encoded
+sectors but our blitter (which K1.3 uses to MFM-decode the disk
+data) and disk-DMA sync detection aren't fully there yet.  See task #58
+(MFM sync + DSKSYNC IRQ).
+
+Status: 120/120 tests pass.
