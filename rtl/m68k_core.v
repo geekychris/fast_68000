@@ -2885,7 +2885,60 @@ module m68k_core #(
                     // -- inside $FDB67A --
                     32'h00fdb67a: $display("[INTU] r=%d $FDB67A ENTER A6=%h", retired, u_rf.regs[14]);
                     32'h00fdb6ba: $display("[INTU] r=%d $FDB67A post $FE03F8 D0=%h", retired, u_rf.regs[0]);
-                    32'h00fdb6cc: $display("[INTU] r=%d $FDB67A post 2nd internal call", retired);
+                    32'h00fdb6cc: $display("[INTU] r=%d $FDB67A at BNE($FDB718) D0=%h", retired, u_rf.regs[0]);
+                    32'h00fdb71e: $display("[INTU] r=%d $FDB67A post $FDE600 D0=%h", retired, u_rf.regs[0]);
+                    32'h00fdb76e: $display("[INTU] r=%d $FDB67A at $FDB76E", retired);
+                    32'h00fdb7c8: $display("[INTU] r=%d $FDB67A at JSR $FDB868", retired);
+                    32'h00fdb7ce: $display("[INTU] r=%d $FDB67A post $FDB868", retired);
+                    32'h00fdb7f8: $display("[INTU] r=%d $FDB67A at JSR $FDB914", retired);
+                    32'h00fdb7fe: $display("[INTU] r=%d $FDB67A post $FDB914 / at JSR $FDC70A", retired);
+                    32'h00fdb804: $display("[INTU] r=%d $FDB67A post $FDC70A / at JSR $FD8556", retired);
+                    32'h00fdb80a: $display("[INTU] r=%d $FDB67A post $FD8556", retired);
+                    32'h00fdb812: $display("[INTU] r=%d $FDB67A at BEQ ($FDB862)", retired);
+                    32'h00fdb820: $display("[INTU] r=%d $FDB67A at JSR $FDD6C0", retired);
+                    32'h00fdb83c: $display("[INTU] r=%d $FDB67A at JSR $FE0318 #1", retired);
+                    32'h00fdb858: $display("[INTU] r=%d $FDB67A at JSR $FE0318 #2", retired);
+                    32'h00fdb862: $display("[INTU] r=%d $FDB67A at MOVEM (epilogue)", retired);
+                    32'h00fdb866: $display("[INTU] r=%d $FDB67A RTS  A6=%h D0=%h", retired, u_rf.regs[14], u_rf.regs[0]);
+                    32'h00fde600: $display("[INTU] r=%d $FDE600 ENTER A6=%h", retired, u_rf.regs[14]);
+                    32'h00fde624: $display("[INTU] r=%d $FDE600 RTS  D0=%h", retired, u_rf.regs[0]);
+                    // -- inside $FDC70A (called from $FDB7FE) --
+                    32'h00fdc70a: $display("[INTU] r=%d $FDC70A ENTER A6=%h", retired, u_rf.regs[14]);
+                    32'h00fdc718: $display("[INTU] r=%d $FDC70A post ObtainSem(4)", retired);
+                    32'h00fdc71e: $display("[INTU] r=%d $FDC70A post $FDC8AC", retired);
+                    32'h00fdc73c: $display("[INTU] r=%d $FDC70A post list-walk loop", retired);
+                    32'h00fdc746: $display("[INTU] r=%d $FDC70A post ReleaseSem(4)", retired);
+                    32'h00fdc74c: $display("[INTU] r=%d $FDC70A post $FDC754", retired);
+                    32'h00fdc752: $display("[INTU] r=%d $FDC70A RTS", retired);
+                    32'h00fdc754: $display("[INTU] r=%d $FDC754 ENTER (sem #5 wrapper)", retired);
+                    32'h00fdc764: $display("[INTU] r=%d $FDC754 post $FDC7E6 (about to $FDC778)", retired);
+                    32'h00fdc76a: $display("[INTU] r=%d $FDC754 post $FDC778", retired);
+                    32'h00fdc776: $display("[INTU] r=%d $FDC754 RTS", retired);
+                    32'h00fdc7e6: $display("[INTU] r=%d $FDC7E6 ENTER", retired);
+                    32'h00fdc778: $display("[INTU] r=%d $FDC778 ENTER A6=%h", retired, u_rf.regs[14]);
+                    32'h00fdc788: $display("[INTU] r=%d $FDC778 post ObtainSem(4)", retired);
+                    32'h00fdc7a2: $display("[INTU] r=%d $FDC778 post $FE0460", retired);
+                    32'h00fdc7ac: $display("[INTU] r=%d $FDC778 post $FE0488", retired);
+                    32'h00fdc7b2: $display("[INTU] r=%d $FDC778 post $FE04F4", retired);
+                    32'h00fdc7c2: $display("[INTU] r=%d $FDC778 post DMACON writes", retired);
+                    32'h00fdc7ca: $display("[INTU] r=%d $FDC778 post $FE06E4 #1", retired);
+                    32'h00fdc7d2: $display("[INTU] r=%d $FDC778 post $FE06E4 #2", retired);
+                    32'h00fdc7dc: $display("[INTU] r=%d $FDC778 post ReleaseSem(4)", retired);
+                    32'h00fdc7e4: $display("[INTU] r=%d $FDC778 RTS", retired);
+                    // gfx LVO wrappers in Intuition
+                    32'h00fe0460: $display("[INTU] r=%d $FE0460 wrapper ENTER", retired);
+                    32'h00fe0488: $display("[INTU] r=%d $FE0488 wrapper ENTER", retired);
+                    32'h00fe04f4: $display("[INTU] r=%d $FE04F4 wrapper ENTER", retired);
+                    32'h00fe06e4: $display("[INTU] r=%d $FE06E4 wrapper ENTER", retired);
+                    // vec=8 trap source (Supervisor() call site)
+                    32'h00fc08e6: $display("[INTU] r=%d at $FC08E6 (ORI.W #2000,SR)", retired);
+                    // -- ObtainSemaphore at $FC2DF0 --
+                    32'h00fc2df0: $display("[INTU] r=%d ObtainSem ENTER A0=%h ThisTask=$1970", retired, u_rf.regs[8]);
+                    32'h00fc2e36: $display("[INTU] r=%d ObtainSem succeeded (recursive or first)", retired);
+                    32'h00fc2e3e: $display("[INTU] r=%d ObtainSem RTS", retired);
+                    32'h00fc2e10: $display("[INTU] r=%d ObtainSem WAIT path (BLOCKING)", retired);
+                    32'h00fc2e24: $display("[INTU] r=%d ObtainSem BSR $FC1624 (AddTail to wait list)", retired);
+                    32'h00fc2e2a: $display("[INTU] r=%d ObtainSem about to call Wait #16", retired);
                     // $FE03F8 wrapper: load A6 from $64(A6), then JSR $FFB8(A6)
                     32'h00fe03f8: $display("[INTU] r=%d $FE03F8 wrapper ENTER A6=%h", retired, u_rf.regs[14]);
                     32'h00fe0406: $display("[INTU] r=%d $FE03F8 post JSR FFB8(A6) D0=%h", retired, u_rf.regs[0]);
