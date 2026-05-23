@@ -374,6 +374,32 @@ module m68k_bus #(
     localparam [15:0] JOY_DAT_VAL  = 16'h0000;
     localparam [15:0] ADKCONR_VAL  = 16'h0000;
 
+    // ----- Disk-status read registers (DSKBYTR / DSKDATR / DSKSYNC) ----
+    // K1.3's trackdisk.device polls DSKBYTR for DMAON to confirm the
+    // floppy DMA is in progress.  Our previous model returned $0 for
+    // these addresses (default unmapped), so K1.3 saw DMAON=0 always and
+    // bailed out of its wait-for-DMA loop early.
+    //
+    // DSKBYTR ($DFF01A):
+    //   bit 15: DSKBYT     (1 when byte ready, clears on read)
+    //   bit 14: DMAON      (1 when disk DMA enabled and running)
+    //   bit 13: DSKWRITE   (0 = read, 1 = write)
+    //   bit 12: WORDEQUAL  (1 when last word == DSKSYNC)
+    //   bits 7-0: last data byte from disk
+    //
+    // We track DMAON = blk_busy (set during the DMA copy) so K1.3 sees a
+    // genuine "DMA in progress" then "DMA done" transition.
+    //
+    // DSKDATR ($DFF008): just returns the last disk word data; we keep
+    // it 0 since the data is delivered via DMA to chip RAM anyway.
+    //
+    // DSKSYNC ($DFF07E): K1.3 writes the sync pattern (typically $4489)
+    // and reads it back to confirm; track the last write so reads match.
+    localparam [31:0] DSKBYTR_ADDR = 32'h00DF_F01A;
+    localparam [31:0] DSKDATR_ADDR = 32'h00DF_F008;
+    localparam [31:0] DSKSYNC_ADDR = 32'h00DF_F07E;
+    reg [15:0] dsksync;  // sync pattern set by CPU writes
+
     // ----- Agnus bitplane / control register STORAGE ---------------
     // Kickstart writes a lot of bitplane setup state before kicking
     // the system: BPLxPTH/L (bitplane DMA pointers), BPLxMOD (modulo),
@@ -424,7 +450,8 @@ module m68k_bus #(
     // out of the shadow region so writes hit the floppy state machine.
     wire is_dsk_reg = (addr[winner] == DSKPTH_ADDR) ||
                       (addr[winner] == DSKPTL_ADDR) ||
-                      (addr[winner] == DSKLEN_ADDR);
+                      (addr[winner] == DSKLEN_ADDR) ||
+                      (addr[winner] == DSKSYNC_ADDR);
     wire is_shadow_reg =
         ((addr[winner] >= 32'h00DF_F020 && addr[winner] <= 32'h00DF_F02E) ||
          (addr[winner] >= 32'h00DF_F040 && addr[winner] <= 32'h00DF_F07F) ||
@@ -675,7 +702,10 @@ module m68k_bus #(
                            (addr[winner] == POT0DAT_ADDR) ||
                            (addr[winner] == POT1DAT_ADDR) ||
                            (addr[winner] == JOY0DAT_ADDR) ||
-                           (addr[winner] == JOY1DAT_ADDR);
+                           (addr[winner] == JOY1DAT_ADDR) ||
+                           (addr[winner] == DSKBYTR_ADDR) ||
+                           (addr[winner] == DSKDATR_ADDR) ||
+                           (addr[winner] == DSKSYNC_ADDR);
     wire is_pau_amiga  = (addr[winner] >= PAU_AMIGA_BASE) && (addr[winner] <= PAU_AMIGA_END)
                          && !is_agnus_reg && !is_paula_ro_reg && !is_shadow_reg;
     wire is_autoconfig_reg = (addr[winner] >= AUTOCONFIG_BASE) &&
@@ -1074,6 +1104,7 @@ module m68k_bus #(
             blk_count_in_bytes <= 32'd0;
             dsk_pt    <= 32'd0;
             dsk_len   <= 16'd0;
+            dsksync   <= 16'h4489;  // power-on default per Amiga HRM
             autoconfig_shutup  <= 1'b0;
             autoconfig_base_hi <= 8'd0;
             autoconfig_base_lo <= 8'd0;
@@ -1333,6 +1364,12 @@ module m68k_bus #(
                             blk_count_in_bytes <= {17'd0, wdata[winner][13:0]} << 1;
                         end
                     end
+                end else if (addr[winner] == DSKSYNC_ADDR) begin
+                    // CPU sets the sync pattern (typically $4489).
+                    // Word write -- 16 bits in high half if addr[1]=0,
+                    // low half if addr[1]=1.  $DFF07E has addr[1]=1.
+                    if (be[winner] == 4'b0011)        dsksync <= wdata[winner][15:0];
+                    else if (be[winner] == 4'b1100)   dsksync <= wdata[winner][31:16];
                 end
             end else if (winner_valid && we[winner] && is_blk_reg) begin
                 // Block-device control register write.  BLKCMD with bit 0
@@ -1638,6 +1675,17 @@ module m68k_bus #(
               : (addr[winner] == POT0DAT_ADDR) ? POT_DAT_VAL
               : (addr[winner] == POT1DAT_ADDR) ? POT_DAT_VAL
               : (addr[winner] == JOY0DAT_ADDR) ? JOY_DAT_VAL
+              : (addr[winner] == JOY1DAT_ADDR) ? JOY_DAT_VAL
+              // DSKBYTR: bit 14 = DMAON tracks blk_busy.  Bit 15
+              // (DSKBYT = byte ready) we leave 0; K1.3 doesn't poll
+              // it under DMA mode.  Last data byte 0.
+              : (addr[winner] == DSKBYTR_ADDR) ? {1'b0, blk_busy, 14'd0}
+              // DSKDATR: returns last disk word.  We don't track it
+              // (data flows via DMA), so return 0.
+              : (addr[winner] == DSKDATR_ADDR) ? 16'd0
+              // DSKSYNC: returns the last value the CPU wrote
+              // (typically $4489).
+              : (addr[winner] == DSKSYNC_ADDR) ? dsksync
               :                                  JOY_DAT_VAL;
         end
     end
