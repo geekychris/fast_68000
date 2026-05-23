@@ -2804,3 +2804,44 @@ data) and disk-DMA sync detection aren't fully there yet.  See task #58
 (MFM sync + DSKSYNC IRQ).
 
 Status: 120/120 tests pass.
+
+### Session summary: S42-S44 (massive boot progression)
+
+This session landed three CPU/bus fixes that together took K1.3
+boot from "stuck at idle STOP at r=1.3M" to "strap.task actively
+loading the bootblock at r=34.7M" (a 26x advance).  Each fix
+unblocked a distinct boot phase that the previous fix exposed:
+
+| Fix | Symptom before | After | What it does |
+|-----|----------------|-------|--------------|
+| S42 | r=1.3M idle STOP forever | r=7.4M | IRQ-from-STOP saved-PC was the STOP PC, so RTE re-entered STOP.  Save `ex_pc_next` so RTE advances. |
+| S43 | r=7.4M, RTE pops $1C08F4 (corrupt high byte $FC->$1C) | r=9.4M | SR push at unaligned SSP wrote to wrong half of mem[], smearing SR over PC's high half.  Honor `(working_sp - 2)[1]` for `be` and wdata layout. |
+| S44 | r=9.4M, blitter clobbers ExecBase at $4 | r=34.7M | Bus xlat dropped the low half of MOVE.L to 32-bit chipset ptr regs (BLTDPT, COP1LC, etc.).  Pick up full wdata when is_long && be=$F. |
+
+Boot artifacts post-S44:
+  - LibList: exec, expansion, graphics, layers, intuition, **mathffp,
+    **romboot** (7 libraries; was 5 before this session)
+  - [RESINIT]: **alert.hook**, **mathffp.library**, **romboot.library**,
+    **strap entry** (all new this session)
+  - [DSKLEN]: trackdisk programs disk DMA with dsk_pt=$64ac repeatedly
+  - Chip RAM at $64ac: MFM-encoded track 0 sector data ($AAAA $4489 $4489 ...)
+  - 28 sync words ($4489) detected in chip RAM (= 14 sectors loaded)
+
+Remaining walls (next session):
+  - K1.3 retries the disk read continuously -- something fails
+    after the DMA completes.  Suspect MFM-decode validation
+    (checksum mismatch) or our DMA always reading offset 0
+    regardless of step state.
+  - Eventually an RTE goes to $00CE0000 (slow-RAM region we don't
+    model).  Either provide RAM in that range, or trace the
+    chain that leads to that PC.
+
+Tests: 120/120 pass.  Two new regression tests added (t136 was
+removed since STOP-as-halt semantics differ in the regular test
+build; t137 covers the exception SR-push alignment).
+
+The session demonstrated a common pattern: the boot reaches a
+plateau, the symptom looks like a CPU bug deep in K1.3 code, but
+the actual root cause is a bus-translation or exception-state
+edge case that wasn't exercised before because earlier walls
+masked it.
