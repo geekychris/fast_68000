@@ -1346,11 +1346,19 @@ module m68k_bus #(
                     end
                 end else if (addr[winner] == DSKLEN_ADDR) begin
 `ifdef KICKSTART_BOOT_TRACE
-                    $display("[DSKLEN] addr=%h be=%b is_long=%b wdata=%h dsk_pt=%h",
+                    $display("[DSKLEN] addr=%h be=%b is_long=%b wdata=%h dsk_pt=%h blk_busy=%b",
                         addr[winner], be[winner], is_long[winner],
-                        wdata[winner], dsk_pt);
+                        wdata[winner], dsk_pt, blk_busy);
 `endif
                     // DSKLEN is at the high half of its longword (addr[1]=0).
+                    // K1.3 trackdisk's "arm" sequence writes DSKLEN twice
+                    // ($4000 to disarm, $4000 again, $9CBE to arm, $9CBE
+                    // again to fire).  The first $9CBE sets DMAEN=1 from 0
+                    // and starts DMA; subsequent writes with DMAEN=0 must
+                    // STOP the previous DMA so the next $9CBE pair starts
+                    // a fresh one (otherwise the prior DMA keeps running
+                    // and clobbers buffer modifications K1.3 made between
+                    // sectors).
                     if (is_long[winner] && be[winner] == 4'b1111) begin
                         // Aligned MOVE.L Dn, $DFF024 -- DSKLEN in high half
                         // (wdata[31:16]), $DFF026 (DSKDAT) in low half.
@@ -1363,6 +1371,10 @@ module m68k_bus #(
                             blk_cur_dst <= dsk_pt;
                             blk_dst     <= dsk_pt;
                             blk_count_in_bytes <= {17'd0, wdata[winner][29:16]} << 1;
+                        end else if (!wdata[winner][31]) begin
+                            // DMAEN cleared -- abort any running DMA.
+                            blk_busy <= 1'b0;
+                            blk_byte_mode <= 1'b0;
                         end
                     end else if (be[winner] == 4'b1100) begin
                         dsk_len <= wdata[winner][31:16];
@@ -1373,6 +1385,9 @@ module m68k_bus #(
                             blk_cur_dst <= dsk_pt;
                             blk_dst     <= dsk_pt;
                             blk_count_in_bytes <= {17'd0, wdata[winner][29:16]} << 1;
+                        end else if (!wdata[winner][31]) begin
+                            blk_busy <= 1'b0;
+                            blk_byte_mode <= 1'b0;
                         end
                     end else if (be[winner] == 4'b0011) begin
                         // Some emitters send low-lane form.
