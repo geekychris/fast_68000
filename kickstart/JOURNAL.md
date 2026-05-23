@@ -2668,3 +2668,68 @@ in post-push aliased memory.
 
 Tasks: #65 (slow RAM didn't help; closed), #66 (RTE PC corruption,
 open).
+
+### S43 (LANDED): Exception SR push + RTE SR pop must honor SSP word alignment
+
+The "RTE pops $001C08F4" mystery from S43-deferred was real and now fixed.
+Root cause: `S_EXC_PUSH_SR` unconditionally used `be=4'b0011` with
+`wdata={16'd0, ex_exc_saved_sr}` -- writing the SR to the LOW half
+(bytes [15:0]) of `mem[idx]`.  Correct only when
+`(working_sp - 2)[1] == 1` (= byte address ends in `$2/$6/$A/$E`).
+
+When the pre-exception SSP entered with `[1:0] == 10` (16-bit aligned
+but not 32-bit), `working_sp - 2` has `[1] == 0` -- the SR's bytes
+should land at bytes [31:16] of `mem[idx]`, not [15:0].  Our hardcoded
+`be=4'b0011` wrote the SR into the WRONG half of the aligned word,
+silently overwriting bytes 2-3 of the just-pushed PC.
+
+For the K1.3 case:
+  - pre-IRQ SSP = `$7FDBA` (`[1:0] == 10`)
+  - PC pushed at `$7FDB6-$7FDB9` = `$00, $FC, $08, $F4`
+  - SR pushed at `$7FDB4-$7FDB5` should have been `$00, $1C`
+  - But with wrong be, SR went to `$7FDB6-$7FDB7`, smearing `$00, $1C`
+    over the PC's high half
+  - Net mem: `$7FDB4-$7FDB7` = `$??, $??, $00, $1C, $08, $F4`
+                                (high half lost, low half corrupted)
+  - RTE later popped PC as `$001C08F4`
+
+`S_RTE_POP_SR` had the mirror bug -- always read SR from `dc_rdata[15:0]`
+regardless of `working_sp[1]`.  Both directions fixed:
+```verilog
+if ((working_sp - 32'd2) & 32'd2) begin
+    dc_wdata <= {16'd0, ex_exc_saved_sr};   dc_be <= 4'b0011;
+end else begin
+    dc_wdata <= {ex_exc_saved_sr, 16'd0};   dc_be <= 4'b1100;
+end
+```
+
+This alignment scenario only matters when an exception nests on top of
+a 16-bit-aligned-but-not-.L-aligned SSP, which happens every few
+exceptions on a chain.  Pre-S42 (STOP+IRQ fix) the dispatcher never
+ran post-IRQ so the bug was masked -- only after S42 unblocked the
+scheduler did the corruption start to bite.
+
+**Boot impact** (massive again):
+  Before S43: K1.3 stalls at r=7.4M.  RTE returns to $001C08F4 garbage,
+              user-mode runs ORI.B-NOP-walks in zero-fetch land.
+  After S43:  K1.3 reaches r=9.4M.  `trackdisk.device` actively
+              programs disk DMA -- the boot trace shows
+              `[DSKLEN] dsk_pt=000064ac` with read-enable bit set.
+              Multiple repeated DSKLEN writes indicate the bootblock
+              load handshake is in flight.
+
+**Regression**: `tests/t137_exc_frame_alignment.s` covers the fix
+path with a TRAP #15 that exercises the SR push alignment.  Pass +
+runtime verification of saved PC + SR.
+
+`test-kickstart-boot` Makefile now also accepts "dsk_pt=000064ac in
+DSKLEN trace" as a pass marker (boot reached trackdisk read).
+
+**Next wall** (task #67): blitter (winner=2 on the bus) repeatedly
+writes `$0` / `$082A` / `$0834` to addresses `$4-$7` during boot,
+clobbering ExecBase ($676 → $0).  K1.3 later does `MOVEA.L $4.L, A6`
+and gets A6=0, then `JSR $FF3A(A6)` → `[BAD-PC]` at $FFFFFF3A.  Likely
+a blitter destination-pointer bug in our chipset (BLTDPT defaults
+unprogrammed, or modulo handling sends DST walking into low memory).
+
+Status: 120/120 tests pass.

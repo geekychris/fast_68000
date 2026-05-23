@@ -2846,11 +2846,6 @@ module m68k_core #(
             if (is_settled && retired >= 32'd1296100 && retired <= 32'd1296140)
                 $display("[PRESIG] r=%d pc=%h opcode=%h D0=%h A1=%h",
                     retired, ex_pc, ex_opcode, u_rf.regs[0], u_rf.regs[9]);
-            // Trace K1.3 BAD-PC at $FD3C42 (JSR $FF3A(A6)) at r=2235386 to
-            // see whether A6 was 0 or $676 when the JSR computed target.
-            if (is_settled && retired >= 32'd2235380 && retired <= 32'd2235395)
-                $display("[BAD] r=%d pc=%h opcode=%h A6=%h",
-                    retired, ex_pc, ex_opcode, u_rf.regs[14]);
             // Watch writes to byte $1909 = MP_SIGBIT of a critical MsgPort whose
             // value is read at $FC1BCA before Signal is called.  If MP_SIGBIT is
             // 31 ($1F), Signal mask becomes $80000000 (SIGF_DOS reserved).
