@@ -2573,3 +2573,65 @@ migration).  Sprite DMA (4-5) goes in a second PR.
 This is gated on the Intuition init hang being unblocked -- without
 Intuition installing a real screen, even a perfect Copper has
 nothing meaningful to render.
+
+### S42: STOP+IRQ saved PC must be ex_pc_next, not ex_pc
+
+S40 had pinpointed the K1.3 boot wall to "WaitTOF blocks, signal
+arrives, but Wait doesn't return."  The signal/wait code paths
+looked correct; ThisTask was in TaskReady with state=READY and
+SigRecvd had the awaited bit set -- yet the dispatcher at $FC0F90
+STOP kept idling.  S42 found why: **the dispatcher was never
+running between IRQs.**
+
+Adding a memory-write trace on A2 around the cosim "divergence"
+at r=525688 showed the write was from MOVEM-pop, not the prior
+MOVE.L A2,$2C.W.  Comparing veri[N] vs musashi[N+1] register
+state showed our trace logs POST-instruction state while
+musashi's `instr_hook` logs PRE-instruction state -- the r=525688
+"divergence" was a trace-timing artifact, not a CPU bug.
+
+Pushing the cosim past r=525K to ~1.3M, the **first REAL register
+divergence** is at r=1264597: a `BTST #5, $00BFE001` (= /DSKRDY
+bit of CIA-A PRA).  Musashi returns the static $C8 reset value
+(bit 5 = 0 -> Z=1, BEQ taken).  Our model returns the dynamic
+floppy state (bit 5 = 1 when motor off, no disk-ready -> Z=0,
+BEQ not taken).  This is a CHIPSET model difference, not a CPU
+bug -- both paths converge to the same idle state eventually.
+
+The real CPU bug was hiding behind the K1.3-stuck symptom.  A
+[DISP] trace at $FC0F84 (the dispatcher's BNE check) showed it
+NEVER fired between VBlank IRQs.  That means after each VBlank
+handler's RTE, the CPU went BACK to STOP $FC0F90 -- not forward
+to the BRA $FC0F94 → dispatcher.
+
+The fix is one line in m68k_core.v's S_RUN IRQ check:
+
+```verilog
+exc_saved_pc_c = (ex_kind == K_STOP) ? ex_pc_next : ex_pc;
+```
+
+The IRQ check at line 2071 saves ex_pc for ALL instructions, which
+is correct for "instruction-about-to-dispatch is suppressed and
+re-executed on RTE."  But STOP loads SR every cycle while parked
+in S_RUN (idempotent), so by the time the IRQ check fires STOP
+has effectively executed.  RTE must advance past STOP, not back
+to it.
+
+**Boot impact** (massive):
+  Before fix:  K1.3 stalls at r=1,313,655 (STOP $FC0F90, never wakes)
+  After fix:   K1.3 reaches r=7,398,473 (5.6x further), then enters
+               chip-RAM execution after Intuition completes.
+  LibList now contains intuition.library (ver=34).
+  [RESINIT] for alert.hook fires (was missing before).
+  Boot is now blocked on disk operations (strap/trackdisk), not on
+  the scheduler.
+
+**Regression**: an isolated `tests/*.s` test isn't writable because
+the default test build treats STOP as halt-simulator (only
+KICKSTART_BOOT mode preserves the wait-for-IRQ semantics).  Instead
+the Makefile's `test-kickstart-boot` pass condition now requires
+`retired > 2,000,000` (the boot was previously stuck at 1.3M).  Any
+regression of this fix immediately fails the kickstart-boot test.
+
+Status: 119/119 tests pass.  test-kickstart-boot now passes with
+retired=7,398,473 (was 1,313,655).
