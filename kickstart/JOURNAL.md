@@ -2490,3 +2490,86 @@ Files touched this iteration:
                          intuition-internal trace points
   - (no CPU bugs found yet in the Intuition path)
 Status: 107/107 tests pass.
+
+### S40: Intuition hang narrowed to WaitTOF; SigRecvd corrupted with $80000000
+
+This iteration drove the diagnostic two more layers deep.  The hang
+is inside `graphics.library WaitTOF` called from
+$FDB7FE -> JSR $FDC70A -> JSR $FDC754 -> JSR $FDC778 -> JSR $FE04F4
+(the WaitTOF wrapper at +$10E in gfx.lib).  WaitTOF's standard
+flow is:
+
+  1. Allocate signal #4 ($10)
+  2. Build a local Interrupt with `ln_Name = ThisTask`
+  3. AddTail to GfxBase.WaitTOF_list at $C0(GfxBase) -- the
+     gfx top-pri VBlank handler at $FC6D6C walks this list each
+     frame and calls Signal(task, $10)
+  4. Wait(signal $10)
+  5. RemTail, FreeSignal, RTS
+
+We confirmed steps 1-3 happen correctly:
+  - $C0(GfxBase) -> list at $184C with one node
+  - Node $184C has `ln_Name = $1970` (= ThisTask, correct K1.3 idiom)
+  - gfx VBlank server is active and signals each frame
+
+But step 4 never unblocks.  At end-of-sim the task state is:
+
+```
+Task $1970 (ROM string "exec.library", InitCode trampoline):
+  tc_State    = 3 (READY -- can be dispatched)
+  tc_SigWait  = $00000010 (waiting on signal #4)
+  tc_SigRecvd = $80000010 (got signal #4 AND mysterious bit 31 set!)
+  tc_TDNestCnt = $FF (abnormal -- normally 0/1)
+  tc_SPReg    = $17DE (inside stack range $968..$1968, valid)
+```
+
+The $80000000 bit in SigRecvd is SIGF_ABORT.  Holding bit 31
+constantly set explains the pin: Wait may special-case bit 31
+to keep the task in some "to-be-aborted" state instead of
+returning normally.
+
+Two open questions for next session:
+
+1.  **Where does $80000000 get OR'd into SigRecvd?**  Possible
+    causes: a CPU bug where MOVEQ #-1 or ADDQ.L #-1 sign-extends
+    into D0 then gets passed to Signal(); or some library call
+    that fires Signal(task, $FFFFFFFF) as a wake-all.
+2.  **Why doesn't the dispatcher dispatch a READY task?**  We
+    observe TaskReady has both `input.device` (head) and
+    `$1970` (next) at end of sim, but the dispatcher at $FC0F90
+    keeps idling.  $FC0F84 `BNE $FC0F96` must be falling
+    through, meaning `(TaskReady.HEAD).ln_Succ` == 0 at STOP
+    entry -- but at end-of-sim it is $1970.  Race or list
+    re-stitch in interrupt handler?
+
+Trace points added: 50+ `[INTU]` log entries through Intuition's
+$FD68B4 / $FD65E4 / $FDB67A / $FDC70A / $FDC754 / $FDC778 paths
+and the WaitTOF / Signal / ObtainSemaphore call chains.
+
+Status: 114/114 tests pass.  No CPU code changed this iteration --
+all additions are KICKSTART_BOOT_TRACE-gated $display statements.
+
+### S41 (planned): canonical-Amiga Copper rewrite
+
+A `Plan` agent surveyed the chipset and produced a step-by-step
+plan to migrate from the existing 32-bit-target Copper encoding
+to canonical Amiga 16-bit MOVE/WAIT/SKIP.  Plan summary
+(deferred; not landed in this iteration):
+
+  Step 1: Audit legacy demos (`t23/t24/t37/t73`).
+  Step 2: Rewrite `rtl/chipset/copper.v` as a 4-byte/2-word engine
+          modelled on `external/minimig/rtl/minimig/agnus_copper.v`
+          and `tools/render_k13_screen.py:CopperSim`.  MOVE writes
+          go through the existing canonical $DFF000 decoder, so the
+          bus translation layer in `m68k_bus.v` stays unchanged.
+  Step 3: Trim `m68k_bus.v` Copper translation.
+  Step 4: Add Agnus sprite-DMA prologue (POS/CTL injection per line).
+  Step 5: Verify Denise sprite compositing wiring + COLOR17..31.
+  Step 6: Migrate legacy tests, add `t201/t202/t203`.
+
+Stop-here cut: Steps 1-3 + 6 = one PR (Copper rewrite + test
+migration).  Sprite DMA (4-5) goes in a second PR.
+
+This is gated on the Intuition init hang being unblocked -- without
+Intuition installing a real screen, even a perfect Copper has
+nothing meaningful to render.
