@@ -2846,6 +2846,11 @@ module m68k_core #(
             if (is_settled && retired >= 32'd1296100 && retired <= 32'd1296140)
                 $display("[PRESIG] r=%d pc=%h opcode=%h D0=%h A1=%h",
                     retired, ex_pc, ex_opcode, u_rf.regs[0], u_rf.regs[9]);
+            // Trace K1.3 BAD-PC at $FD3C42 (JSR $FF3A(A6)) at r=2235386 to
+            // see whether A6 was 0 or $676 when the JSR computed target.
+            if (is_settled && retired >= 32'd2235380 && retired <= 32'd2235395)
+                $display("[BAD] r=%d pc=%h opcode=%h A6=%h",
+                    retired, ex_pc, ex_opcode, u_rf.regs[14]);
             // Watch writes to byte $1909 = MP_SIGBIT of a critical MsgPort whose
             // value is read at $FC1BCA before Signal is called.  If MP_SIGBIT is
             // 31 ($1F), Signal mask becomes $80000000 (SIGF_DOS reserved).
@@ -3468,17 +3473,34 @@ module m68k_core #(
                     if (dc_ack) begin
                         // PC pushed at working_sp.  Push 16-bit SR next at
                         // (working_sp - 2): the canonical 68000 frame puts SR
-                        // immediately below PC, total 6 bytes.  With the SP
-                        // aligned, the SR word lands in bytes 2-3 of the
-                        // 32-bit aligned word at working_sp - 4, so the byte
-                        // enables are 4'b0011 and the value goes in
-                        // dc_wdata[15:0].
+                        // immediately below PC, total 6 bytes.  Byte enables
+                        // depend on the alignment of (working_sp - 2) within
+                        // the 4-byte mem[] word:
+                        //   addr[1]=0 (= ends in $0/$4/$8/$C):  high half of
+                        //     mem[idx] -> be=4'b1100, wdata = SR << 16
+                        //   addr[1]=1 (= ends in $2/$6/$A/$E):  low half of
+                        //     mem[idx] -> be=4'b0011, wdata = SR
+                        // Previously we unconditionally used be=0011 + low
+                        // half, which silently overwrote bytes 2-3 of the
+                        // just-pushed PC whenever working_sp-2 had addr[1]=0.
+                        // Symptom: K1.3 boot wall at r=2080000 -- RTE popped
+                        // $001C08F4 instead of the pushed $00FC08F4 (high
+                        // byte $FC replaced by SR's low byte $1C).  This
+                        // alignment scenario happens whenever pre-exception
+                        // SSP[1:0]=10 (16-bit aligned but not 32-bit), which
+                        // recurs once every 6 bytes of nested exception
+                        // pushes.
                         working_sp <= working_sp - 32'd2;
                         dc_req_r <= 1'b1;
                         dc_we    <= 1'b1;
                         dc_addr  <= working_sp - 32'd2;
-                        dc_wdata <= {16'd0, ex_exc_saved_sr};
-                        dc_be    <= 4'b0011;
+                        if ((working_sp - 32'd2) & 32'd2) begin
+                            dc_wdata <= {16'd0, ex_exc_saved_sr};
+                            dc_be    <= 4'b0011;
+                        end else begin
+                            dc_wdata <= {ex_exc_saved_sr, 16'd0};
+                            dc_be    <= 4'b1100;
+                        end
                         ex_state <= S_EXC_PUSH_SR;
                     end
                 end
@@ -3571,22 +3593,42 @@ module m68k_core #(
                 end
                 S_RTE_POP_SR: begin
                     if (dc_ack) begin
-                        // The cache returns the full 32-bit aligned word that
-                        // contains the SR.  With working_sp[1:0] == 10 (the
-                        // canonical 6-byte frame), SR lives in bytes 2-3 of
-                        // the aligned word -> dc_rdata[15:0].  Restore CCR
-                        // always; restore the upper SR byte only for RTE.
-                        ex_exc_saved_sr <= dc_rdata[15:0];
-                        if (ex_kind == K_RTE) begin
-                            sr_t <= dc_rdata[`SR_T];
-                            sr_s <= dc_rdata[`SR_S];
-                            sr_i <= dc_rdata[10:8];
+                        // Bus returns the full 32-bit aligned word containing
+                        // the SR.  SR.W lives at bytes 0-1 (addr[1]=0,
+                        // high half = dc_rdata[31:16]) OR at bytes 2-3
+                        // (addr[1]=1, low half = dc_rdata[15:0]) depending
+                        // on which half of the aligned word working_sp
+                        // points into.  Previously we assumed [1:0]=10 and
+                        // always read [15:0]; this was wrong whenever SSP
+                        // entered the exception .L-not-mod-4-aligned (which
+                        // happens once every 6 bytes of nested exception
+                        // depth -- pre-S42 it never came up because the
+                        // dispatcher couldn't progress past STOP).
+                        if (working_sp & 32'd2) begin
+                            ex_exc_saved_sr <= dc_rdata[15:0];
+                            if (ex_kind == K_RTE) begin
+                                sr_t <= dc_rdata[`SR_T];
+                                sr_s <= dc_rdata[`SR_S];
+                                sr_i <= dc_rdata[10:8];
+                            end
+                            cc_x <= dc_rdata[`SR_X];
+                            cc_n <= dc_rdata[`SR_N];
+                            cc_z <= dc_rdata[`SR_Z];
+                            cc_v <= dc_rdata[`SR_V];
+                            cc_c <= dc_rdata[`SR_C];
+                        end else begin
+                            ex_exc_saved_sr <= dc_rdata[31:16];
+                            if (ex_kind == K_RTE) begin
+                                sr_t <= dc_rdata[16+`SR_T];
+                                sr_s <= dc_rdata[16+`SR_S];
+                                sr_i <= dc_rdata[16+10:16+8];
+                            end
+                            cc_x <= dc_rdata[16+`SR_X];
+                            cc_n <= dc_rdata[16+`SR_N];
+                            cc_z <= dc_rdata[16+`SR_Z];
+                            cc_v <= dc_rdata[16+`SR_V];
+                            cc_c <= dc_rdata[16+`SR_C];
                         end
-                        cc_x <= dc_rdata[`SR_X];
-                        cc_n <= dc_rdata[`SR_N];
-                        cc_z <= dc_rdata[`SR_Z];
-                        cc_v <= dc_rdata[`SR_V];
-                        cc_c <= dc_rdata[`SR_C];
                         working_sp <= working_sp + 32'd2;
                         dc_req_r <= 1'b1;
                         dc_we    <= 1'b0;
