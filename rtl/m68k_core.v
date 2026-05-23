@@ -2814,6 +2814,84 @@ module m68k_core #(
                 dc_addr >= 32'h00DF_F080 && dc_addr <= 32'h00DF_F087)
                 $display("[CPUCOP] r=%d pc=%h kind=%d addr=%h be=%b wdata=%h",
                     retired, ex_pc, ex_kind, dc_addr, dc_be, dc_wdata);
+            // [RESINIT] log when execution enters each known K1.3 Resident
+            // init function.  For libraries/devices, rt_Init points to an
+            // auto-init *table*; the actual init code is at table[12].
+            // For NT_TASK residents (workbench.task), rt_Init IS the task
+            // entry point.  Addresses extracted from the K1.3 ROM via
+            // tools/find_residents (Python).
+            if (is_settled && ex_kind != K_STOP) begin
+                case (ex_pc)
+                    // -- exec & per-resident init entry points --
+                    32'h00fc00d2: $display("[RESINIT] r=%d exec.library", retired);
+                    32'h00fc4c56: $display("[RESINIT] r=%d expansion.library code", retired);
+                    32'h00fc4840: $display("[RESINIT] r=%d disk.resource code", retired);
+                    32'h00fe4314: $display("[RESINIT] r=%d misc.resource code", retired);
+                    32'h00fe45cc: $display("[RESINIT] r=%d ramlib.library code", retired);
+                    32'h00fc3586: $display("[RESINIT] r=%d audio.device code", retired);
+                    32'h00fd3db6: $display("[RESINIT] r=%d intuition.library code", retired);
+                    32'h00fc3128: $display("[RESINIT] r=%d alert.hook code", retired);
+                    32'h00fe3eac: $display("[RESINIT] r=%d mathffp.library code", retired);
+                    32'h00feb496: $display("[RESINIT] r=%d workbench.task entry", retired);
+                    32'h00ff3e94: $display("[RESINIT] r=%d dos.library code", retired);
+                    32'h00feb0a8: $display("[RESINIT] r=%d romboot.library code", retired);
+                    32'h00fe8444: $display("[RESINIT] r=%d strap entry", retired);
+                    32'h00fcaba2: $display("[RESINIT] r=%d graphics.library code", retired);
+                    32'h00fe0a2c: $display("[RESINIT] r=%d layers.library code", retired);
+                    32'h00fe97be: $display("[RESINIT] r=%d trackdisk.device code", retired);
+                    32'h00fc45e0: $display("[RESINIT] r=%d cia.resource code", retired);
+                    32'h00fe4424: $display("[RESINIT] r=%d potgo.resource code", retired);
+                    32'h00fe7f24: $display("[RESINIT] r=%d keymap.resource code", retired);
+                    32'h00fe4f44: $display("[RESINIT] r=%d keyboard.device code", retired);
+                    32'h00fe53b0: $display("[RESINIT] r=%d gameport.device code", retired);
+                    32'h00fe5ad0: $display("[RESINIT] r=%d input.device code", retired);
+                    32'h00fe66e4: $display("[RESINIT] r=%d console.device code", retired);
+                    32'h00fe8df4: $display("[RESINIT] r=%d timer.device code", retired);
+                    // -- intuition init internals (to find where it bails) --
+                    32'h00fd3dc0: $display("[INTU] r=%d wrapper post-JSR (MOVE.L A6,D0) A6=%h", retired, u_rf.regs[14]);
+                    32'h00fd3dc4: $display("[INTU] r=%d wrapper RTS A6=%h D0=%h", retired, u_rf.regs[14], u_rf.regs[0]);
+                    32'h00fd68d8: $display("[INTU] r=%d $FD68B4 RTS A6=%h", retired, u_rf.regs[14]);
+                    32'h00fd68a4: $display("[INTU] r=%d $FD65E4 RTS (intuition init body) A6=%h", retired, u_rf.regs[14]);
+                    // post-JSR PCs inside $FD65E4 (returned from each JSR target)
+                    32'h00fd6604: $display("[INTU] r=%d post $FE0090 NewList #1", retired);
+                    32'h00fd662a: $display("[INTU] r=%d post $FE0358", retired);
+                    32'h00fd664e: $display("[INTU] r=%d post $FE0208", retired);
+                    32'h00fd6678: $display("[INTU] r=%d post $FE0340", retired);
+                    32'h00fd668c: $display("[INTU] r=%d post $FE01A0", retired);
+                    32'h00fd669c: $display("[INTU] r=%d post $FE0340 #2", retired);
+                    32'h00fd66b0: $display("[INTU] r=%d post $FE01A0 #2", retired);
+                    32'h00fd66c2: $display("[INTU] r=%d post $FE01DC", retired);
+                    32'h00fd66d0: $display("[INTU] r=%d post $FE05B4", retired);
+                    32'h00fd66dc: $display("[INTU] r=%d post $FE01DC #2", retired);
+                    32'h00fd66ea: $display("[INTU] r=%d post $FE0438", retired);
+                    32'h00fd66f4: $display("[INTU] r=%d post $FE0438 #2", retired);
+                    32'h00fd66fa: $display("[INTU] r=%d post $FD65A8 (BSR)", retired);
+                    32'h00fd671a: $display("[INTU] r=%d post $FDA76E (deep init)", retired);
+                    32'h00fd6790: $display("[INTU] r=%d post $FD651C (BSR)", retired);
+                    32'h00fd67a2: $display("[INTU] r=%d post $FD6562 (BSR)", retired);
+                    32'h00fd67c0: $display("[INTU] r=%d post $FD643A (BSR)", retired);
+                    32'h00fd6846: $display("[INTU] r=%d post $FE0584", retired);
+                    32'h00fd6872: $display("[INTU] r=%d post $FE01DC #3", retired);
+                    32'h00fd6884: $display("[INTU] r=%d post $FDB580", retired);
+                    32'h00fd6894: $display("[INTU] r=%d post $FDB5DA", retired);
+                    // -- inside $FDB5DA (called from $FD688E) --
+                    32'h00fdb5da: $display("[INTU] r=%d $FDB5DA ENTER D0=%h D2=%h D3=%h A2=%h", retired, u_rf.regs[0], u_rf.regs[2], u_rf.regs[3], u_rf.regs[10]);
+                    32'h00fdb5fa: $display("[INTU] r=%d $FDB5DA post $FDB62A", retired);
+                    32'h00fdb608: $display("[INTU] r=%d $FDB5DA post $FDB67A", retired);
+                    32'h00fdb61e: $display("[INTU] r=%d $FDB5DA post $FD7F2C", retired);
+                    32'h00fdb628: $display("[INTU] r=%d $FDB5DA RTS  D0=%h", retired, u_rf.regs[0]);
+                    // -- inside $FDB62A ($FDB5DA helper) --
+                    32'h00fdb62a: $display("[INTU] r=%d $FDB62A ENTER", retired);
+                    // -- inside $FDB67A --
+                    32'h00fdb67a: $display("[INTU] r=%d $FDB67A ENTER A6=%h", retired, u_rf.regs[14]);
+                    32'h00fdb6ba: $display("[INTU] r=%d $FDB67A post $FE03F8 D0=%h", retired, u_rf.regs[0]);
+                    32'h00fdb6cc: $display("[INTU] r=%d $FDB67A post 2nd internal call", retired);
+                    // $FE03F8 wrapper: load A6 from $64(A6), then JSR $FFB8(A6)
+                    32'h00fe03f8: $display("[INTU] r=%d $FE03F8 wrapper ENTER A6=%h", retired, u_rf.regs[14]);
+                    32'h00fe0406: $display("[INTU] r=%d $FE03F8 post JSR FFB8(A6) D0=%h", retired, u_rf.regs[0]);
+                    default: ;
+                endcase
+            end
             // Exception launches happen in S_RUN with exc_launch_c set --
             // that gates run_launches_exc and disables is_settled_in_run,
             // so is_settled and exc_launch_c are mutually exclusive.  Use

@@ -2417,3 +2417,76 @@ gap we can close.
 
 Status: 107/107 tests pass.  No CPU changes this iteration --
 just the Musashi memory-model tightening to make cosim usable.
+
+### S39: K1.3 boot reaches Intuition init at r=1.3M; init blocks inside $FDB67A
+
+After S38 the kickstart-boot test reports PASS via the "clean idle
+at $FC0F90" pass condition.  But the rendered chip RAM shows the
+boot Copper list at $2368 only sets sprite pointers; no real
+screen is installed.  Investigation revealed why:
+
+**LibList walk shows what's actually been created.**  Walking
+ExecBase task/library/device lists at clean-idle (using corrected
+struct offsets per devdocs -- LibList lives at +$17A, *not* +$178)
+shows:
+
+```
+LibList:      exec, expansion, graphics, layers
+DeviceList:   keyboard, gameport, timer, audio, input, console, trackdisk
+ResourceList: potgo, keymap, ciaa, ciab, disk, misc
+TaskReady:    input.device (pri 20), exec (pri 0)
+```
+
+**Intuition.library is NOT in LibList.**  That is the bug: nothing
+downstream of Intuition runs (no mathffp, no dos, no strap, no
+workbench.task -- so no OpenScreen, so the visible state is just
+the boot Copper's blue background).
+
+**Tracing the Intuition init path.**  Extended the [RESINIT] trace
+in `m68k_core.v` with all 24 known K1.3 Resident init addresses
+(extracted by walking the ROM for $4AFC MatchWords + reading the
+auto-init table[12] entry for AUTOINIT residents).  Then added
+per-JSR-return [INTU] traces inside Intuition's init function
+$FD65E4 (called from the auto-init wrapper at $FD3DB6).  The
+trace shows:
+
+```
+r=1299671 intuition.library code (enters wrapper)
+r=1299694 post $FE0090 NewList #1
+...                                  (12 NewLists, all return)
+r=1301818 post $FDA76E (deep init)   (returns at +904 instr)
+r=1309332 post $FE0584
+r=1309537 post $FE01DC #3
+r=1311220 post $FDB580
+r=1311224 $FDB5DA ENTER D0=$5400 D2=$20 D3=$1C A2=$4C6A
+r=1312189 $FDB5DA post $FDB62A
+r=1312192 $FDB67A ENTER A6=$4984      (IntuitionBase=$4984)
+r=1312206 $FE03F8 wrapper ENTER A6=$4984
+r=1312627 $FE03F8 post JSR FFB8(A6) D0=$23c8   <- gfx library call returned
+r=1312629 $FDB67A post $FE03F8 D0=$23c8
+r=1312634 $FDB67A post 2nd internal call (PC=$FDB6CC, a BNE)
+                                       <- no more traces fire
+r=1313625 [EXC] kind=13 vec=8 pc=$FC08E6 opcode=$007C  (priv violation)
+r=1313655 [STOP] pc=$FC0F90 (Exec idle loop)
+```
+
+So Intuition's init progresses *past* the call to gfx via $FE03F8,
+runs ~1000 instructions of code inside $FDB67A, then dies via a
+privilege violation (vec=8 from `ORI.W` to SR at $FC08E6 in user
+mode).  Exec's vec=8 handler returns to the scheduler, which finds
+no ready task and parks at $FC0F90 STOP.
+
+**Status: identified, not fixed.**  The path forward to a visible
+K1.3 screen requires either:
+  (a) Find/fix the missing CPU op or chipset register that causes
+      Intuition's init to bail before AddLibrary,
+  (b) Build out the Verilog Copper + sprite DMA so even the partial
+      idle Copper list at $2368 renders something visible, or
+  (c) Bypass Intuition entirely (patch the ROM init list) and
+      observe what the rest of the boot does.
+
+Files touched this iteration:
+  - `rtl/m68k_core.v` -- [RESINIT] expanded to 24 residents + 30
+                         intuition-internal trace points
+  - (no CPU bugs found yet in the Intuition path)
+Status: 107/107 tests pass.
