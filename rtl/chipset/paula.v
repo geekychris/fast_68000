@@ -56,6 +56,7 @@ module paula (
     input  wire        cop_int_i,      // COPER  (bit 4,  IPL 3)
     input  wire        vblank_int_i,   // VERTB  (bit 5,  IPL 3)
     input  wire        dskblk_int_i,   // DSKBLK (bit 1,  IPL 1) — floppy DMA done
+    input  wire        dsksyn_int_i,   // DSKSYN (bit 12, IPL 5) — disk sync word matched
 
     // 3-bit IPL output for the CPU's IRQ controller.  Computed from the
     // priority of INTREQ & INTENA bits when INTEN (intena[14]) is set.
@@ -81,16 +82,27 @@ module paula (
     // Edge-detect external pins; the rising-edge OR into INTREQ.
     reg cia_a_int_last, cia_b_int_last, blt_int_last, cop_int_last, vblank_int_last;
     reg dskblk_int_last;
+    reg dsksyn_int_last;
     wire cia_a_edge  = cia_a_int_i  & ~cia_a_int_last;
     wire cia_b_edge  = cia_b_int_i  & ~cia_b_int_last;
     wire blt_edge    = blt_int_i    & ~blt_int_last;
     wire cop_edge    = cop_int_i    & ~cop_int_last;
     wire vblank_edge = vblank_int_i & ~vblank_int_last;
     wire dskblk_edge = dskblk_int_i & ~dskblk_int_last;
+    wire dsksyn_edge = dsksyn_int_i & ~dsksyn_int_last;
+`ifdef KICKSTART_BOOT_TRACE
+    always @(posedge clk) if (rst_n) begin
+        if (dsksyn_edge)
+            $display("[DSKSYN] paula edge fired (will set INTREQ[12] if enabled): intena=%b",
+                intena);
+        if (dskblk_edge)
+            $display("[DSKBLK] paula edge fired (INTREQ[1]): intena=%b", intena);
+    end
+`endif
 
     wire [13:0] intreq_hw_set = {
         cia_b_edge,           // 13 EXTER
-        1'b0,                 // 12 DSKSYN
+        dsksyn_edge,          // 12 DSKSYN
         1'b0,                 // 11 RBF
         1'b0,                 // 10 AUD3
         1'b0,                 // 9 AUD2
@@ -240,6 +252,7 @@ module paula (
             cop_int_last    <= 1'b0;
             vblank_int_last <= 1'b0;
             dskblk_int_last <= 1'b0;
+            dsksyn_int_last <= 1'b0;
         end else begin
             // Latch external interrupt-source pins one cycle for edge detect.
             cia_a_int_last  <= cia_a_int_i;
@@ -248,6 +261,7 @@ module paula (
             cop_int_last    <= cop_int_i;
             vblank_int_last <= vblank_int_i;
             dskblk_int_last <= dskblk_int_i;
+            dsksyn_int_last <= dsksyn_int_i;
 
             // Hardware sources rising-edge OR into INTREQ every cycle.  A
             // simultaneous software write below can further set/clear bits;

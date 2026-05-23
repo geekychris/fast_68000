@@ -3064,6 +3064,19 @@ module m68k_core #(
             end
             // USP write (MOVE An,USP — supervisor only, handled by planning).
             if (is_settled && usp_we_c) usp_shadow <= usp_data_c;
+`ifdef KICKSTART_BOOT_TRACE
+            // Watch USP being assigned a small value — likely stack overflow
+            // or dispatch into a task with garbage tc_SPReg.  $200 picks up
+            // anything close to the $00000008 we've been chasing.
+            if (is_settled && usp_we_c && usp_data_c < 32'h0000_0200)
+                $display("[USPLOW] r=%d pc=%h usp_new=%h kind=%d (via MOVE An,USP)",
+                    retired, ex_pc, usp_data_c, ex_kind);
+            // Also watch the SR-write S->U path that captures live A7.
+            if (is_settled && sr_we_c && sr_s &&
+                sr_data_c[`SR_S] == 1'b0 && rf_rc_data < 32'h0000_0200)
+                $display("[USPLOW2] r=%d pc=%h usp_new=%h (via MOVE-to-SR S->U)",
+                    retired, ex_pc, rf_rc_data);
+`endif
 
             // STOP.  Real 68k: load imm into SR (privileged), then suspend
             // until an interrupt arrives.  Our regression tests have always
@@ -3503,6 +3516,11 @@ module m68k_core #(
                     if (dc_ack) begin
                         // Enforce supervisor mode (matches old behavior).
                         if (ex_exc_was_user) usp_shadow <= rf_rc_data;
+`ifdef KICKSTART_BOOT_TRACE
+                        if (ex_exc_was_user && rf_rc_data < 32'h0000_0200)
+                            $display("[USPLOW3] r=%d pc=%h usp_captured=%h (via EXC from user)",
+                                retired, ex_pc, rf_rc_data);
+`endif
                         sr_s <= 1'b1;
                         sr_t <= 1'b0;
                         sr_i <= ex_exc_new_sri;

@@ -141,6 +141,12 @@ module m68k_bus #(
     // INTREQ bit 5, IPL 3) fires once per frame.
     output wire                           vblank_pulse_o,
     output wire                           dskblk_pulse_o,
+    // One-cycle pulse fired at the start of every disk DMA read.  Our DMA
+    // is "minimig-style" memcpy and skips the real bit-stream PLL/sync
+    // search; this pulse stands in for the DSKSYN event Paula would raise
+    // when DSKSYNC matched.  K1.3 trackdisk waits on DSKSYN to start
+    // processing the buffered MFM track.
+    output wire                           dsksyn_pulse_o,
     // One-cycle pulse on OVL 1 -> 0 transition.  Wired to every cache's
     // inval_all input so cached pre-OVL ROM-overlay reads at $00000-$7FFFF
     // are invalidated when low memory switches to RAM.
@@ -260,6 +266,13 @@ module m68k_bus #(
     reg [31:0] blk_count_in_bytes;
     // One-cycle pulse on the busy 1->0 transition (DMA completion).
     assign dskblk_pulse_o = blk_busy_last && !blk_busy;
+    // One-cycle pulse on the busy 0->1 transition (DMA start), gated to
+    // DSKLEN-driven disk reads only (not BLK* shadow-DMA writes).
+    // K1.3 sets DSKSYNC=$4489 and ADKCON WORDSYNC=1, then expects DSKSYN
+    // when sync is locked.  We don't model bit-stream PLLs, so we raise it
+    // at the moment DMA starts: the trackdisk buffer's first MFM word is
+    // already $4489.
+    assign dsksyn_pulse_o = !blk_busy_last && blk_busy && blk_byte_mode;
 
     // OVL latch: set on reset, cleared the first time CIA-A drives /OVL low.
     reg ovl_active;

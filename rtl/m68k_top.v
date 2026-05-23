@@ -191,6 +191,7 @@ module m68k_top #(
         .kbd_inject_byte(cia_a_kbd_byte),
         .vblank_pulse_o (vblank_pulse),
         .dskblk_pulse_o (dskblk_pulse),
+        .dsksyn_pulse_o (dsksyn_pulse),
         .ovl_clear_pulse_o (ovl_clear_pulse)
     );
 
@@ -440,6 +441,7 @@ module m68k_top #(
     wire [2:0] paula_irq_level;
     wire       vblank_pulse;
     wire       dskblk_pulse;
+    wire       dsksyn_pulse;
     wire       ovl_clear_pulse;
 
     paula u_pau (
@@ -466,6 +468,7 @@ module m68k_top #(
         .cop_int_i   (1'b0),           // copper int not wired yet
         .vblank_int_i(vblank_pulse),
         .dskblk_int_i(dskblk_pulse),
+        .dsksyn_int_i(dsksyn_pulse),
         .irq_level_o (paula_irq_level)
     );
 
