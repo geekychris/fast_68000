@@ -1870,14 +1870,48 @@ module m68k_bus #(
         if (granted_valid_q) resp_valid[granted_port_q] = 1'b1;
     end
 
+    // DMA writes bypass the bus arbiter (mem[] is written directly at the
+    // top of the always block), so they don't naturally show up on the
+    // snoop bus.  That means D-caches won't invalidate stale entries
+    // covering the DMA destination range -- the CPU later reads pre-DMA
+    // cached values and validation fails.  Register the DMA write
+    // address one cycle delayed (matches granted_*_q timing) and OR
+    // into the snoop output.
+    reg        dma_snoop_we_q;
+    reg [31:0] dma_snoop_addr_q;
+    wire dma_writing_now = blk_busy &&
+        !((blk_byte_mode && blk_cur_dst >= blk_dst + blk_count_in_bytes) ||
+          (!blk_byte_mode && blk_cur_dst >= blk_dst + (blk_cnt << 9)));
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            dma_snoop_we_q   <= 1'b0;
+            dma_snoop_addr_q <= 32'd0;
+        end else begin
+            dma_snoop_we_q   <= dma_writing_now;
+            dma_snoop_addr_q <= blk_cur_dst;
+        end
+    end
+
     // Snoop broadcast: every successful write goes out 1 cycle later.
     // (Suppress for blitter-register writes since those don't touch memory.)
+    // DMA writes take priority -- both can fire in the same cycle, but in
+    // practice CPU writes during DMA are rare since the CPU is usually
+    // polling DSKBYTR waiting for completion.
+    wire arb_snoop_valid = granted_valid_q && granted_we_q
+                           && !granted_blt_we_q && !granted_cop_we_q
+                           && !granted_den_we_q && !granted_pau_we_q
+                           && !granted_ciaa_we_q && !granted_ciab_we_q;
     always @* begin
-        snoop_valid  = granted_valid_q && granted_we_q
-                       && !granted_blt_we_q && !granted_cop_we_q
-                       && !granted_den_we_q && !granted_pau_we_q
-                       && !granted_ciaa_we_q && !granted_ciab_we_q;
-        snoop_addr   = granted_addr_q;
-        snoop_src_id = granted_port_q;
+        if (dma_snoop_we_q) begin
+            snoop_valid  = 1'b1;
+            snoop_addr   = dma_snoop_addr_q;
+            // Use BLT_PORT-like src_id (not equal to any cache CORE_ID
+            // 0..2*N_CORES-1) so every D-cache invalidates.
+            snoop_src_id = {$clog2(N_PORTS){1'b1}};
+        end else begin
+            snoop_valid  = arb_snoop_valid;
+            snoop_addr   = granted_addr_q;
+            snoop_src_id = granted_port_q;
+        end
     end
 endmodule

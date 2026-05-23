@@ -35,14 +35,14 @@ N_CORES   ?= 1
 MEM_WORDS ?= 65536
 BUILD     ?= build
 
-TESTS  := $(filter-out $(TESTS_DIR)/t61_ovl.s $(TESTS_DIR)/t63_boot_rom.s $(TESTS_DIR)/t65_blockdev.s $(TESTS_DIR)/t66_boot_rom_ext.s $(TESTS_DIR)/t68_floppy_dsklen.s $(TESTS_DIR)/t69_fake_kickstart.s,$(wildcard $(TESTS_DIR)/*.s))
+TESTS  := $(filter-out $(TESTS_DIR)/t61_ovl.s $(TESTS_DIR)/t63_boot_rom.s $(TESTS_DIR)/t65_blockdev.s $(TESTS_DIR)/t66_boot_rom_ext.s $(TESTS_DIR)/t68_floppy_dsklen.s $(TESTS_DIR)/t69_fake_kickstart.s $(TESTS_DIR)/t111_dma_cache_snoop.s,$(wildcard $(TESTS_DIR)/*.s))
 # Multicore tests (t06_multicore, t07_coherence) need N_CORES >= 2.
 ifeq ($(N_CORES),1)
 TESTS := $(filter-out $(TESTS_DIR)/t06_multicore.s $(TESTS_DIR)/t07_coherence.s,$(TESTS))
 endif
 BENCHES:= $(wildcard $(BENCH_DIR)/*.s)
 
-.PHONY: all build test test-ovl test-all test-boot-rom test-boot-rom-ext test-blockdev test-floppy test-boot-rom-bin test-fake-kickstart test-kickstart-boot bench clean demo demo-fb demo-os demo-blt demo-cop demo-den demo-pau demo-poly demo-spr demo-morph demo-ham demo-coprainbow demo-showcase demo-hires demo-kickstart demo-fashion fetch-musashi musashi crosscheck fetch-fx68k fx68k crosscheck-fx68k crosscheck-all demos-c demos-c-build cc68k-image fetch-minimig minimig crosscheck-minimig
+.PHONY: all build test test-ovl test-all test-boot-rom test-boot-rom-ext test-blockdev test-floppy test-dma-snoop test-boot-rom-bin test-fake-kickstart test-kickstart-boot bench clean demo demo-fb demo-os demo-blt demo-cop demo-den demo-pau demo-poly demo-spr demo-morph demo-ham demo-coprainbow demo-showcase demo-hires demo-kickstart demo-fashion fetch-musashi musashi crosscheck fetch-fx68k fx68k crosscheck-fx68k crosscheck-all demos-c demos-c-build cc68k-image fetch-minimig minimig crosscheck-minimig
 
 all: test
 
@@ -98,7 +98,7 @@ test:
 	[ $$fail -eq 0 ]
 
 # All tests including special-build OVL test.
-test-all: test test-ovl
+test-all: test test-ovl test-dma-snoop
 
 # ---------------------------------------------------------------------------
 # External Musashi 68000 core (https://github.com/kstenerud/Musashi).  Fetched
@@ -627,6 +627,22 @@ test-blockdev:
 	rc=$$?; \
 	if [ $$rc -eq 0 ]; then echo "PASS t65_blockdev"; \
 	else echo "FAIL t65_blockdev rc=$$rc"; tail -n 6 build_blk/t65.log | sed 's/^/      /'; exit 1; fi
+
+# DMA cache-snoop coherence test.  Verifies that a DMA write to a
+# CPU-cached address triggers cache invalidation so subsequent reads
+# see the DMA-updated value (not the stale cached sentinel).  Without
+# the snoop fix in m68k_bus.v this test FAILs.
+test-dma-snoop:
+	@mkdir -p build_dma_snoop
+	cp tests/disk_test.hex build_dma_snoop/disk_test.hex
+	@$(MAKE) --no-print-directory build BUILD=build_dma_snoop N_CORES=2 USE_CACHE=1 \
+	    MEM_WORDS=65536 DISK_WORDS=2048 DISK_HEXFILE=disk_test.hex \
+	    >build_dma_snoop/_build.log 2>&1
+	$(PYTHON) $(TB_DIR)/asm68k.py tests/t111_dma_cache_snoop.s build_dma_snoop/program.hex
+	@(cd build_dma_snoop && ./Vm68k_top 1000000) > build_dma_snoop/t111.log 2>&1; \
+	rc=$$?; \
+	if [ $$rc -eq 0 ]; then echo "PASS t111_dma_cache_snoop"; \
+	else echo "FAIL t111_dma_cache_snoop rc=$$rc"; tail -n 6 build_dma_snoop/t111.log | sed 's/^/      /'; exit 1; fi
 
 # Floppy DSKLEN-style DMA test.  Same disk[] backing as test-blockdev,
 # but driven by the canonical floppy register protocol (DSKPT + DSKLEN).
