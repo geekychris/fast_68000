@@ -2814,6 +2814,31 @@ module m68k_core #(
                 dc_addr >= 32'h00DF_F080 && dc_addr <= 32'h00DF_F087)
                 $display("[CPUCOP] r=%d pc=%h kind=%d addr=%h be=%b wdata=%h",
                     retired, ex_pc, ex_kind, dc_addr, dc_be, dc_wdata);
+            // Watch CPU writes to ThisTask.tc_SigRecvd = $198A (within $1970+$1A..$198D)
+            // Bit 31 (SIGF_ABORT) becoming set explains why the dispatcher
+            // refuses to wake the READY task.  Catch the offending write and
+            // its PC so we can find who's ORing $80000000 in.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h0000_1988 && dc_addr <= 32'h0000_198C)
+                $display("[SIGREC] r=%d pc=%h kind=%d addr=%h be=%b wdata=%h",
+                    retired, ex_pc, ex_kind, dc_addr, dc_be, dc_wdata);
+            // Trace every Signal() entry to find who passes $80000000 as the
+            // signal mask.  Signal is at $FC1E84.  Log A1 (task ptr) and D0 (mask).
+            if (is_settled && ex_pc == 32'h00fc_1e84)
+                $display("[SIG] r=%d Signal ENTER A1=%h D0=%h SP=%h",
+                    retired, u_rf.regs[9], u_rf.regs[0], u_rf.regs[15]);
+            // Trace every PC in the window leading up to the Signal($1970, $80000000)
+            // call at r~1296136 so we can see who's calling.
+            if (is_settled && retired >= 32'd1296100 && retired <= 32'd1296140)
+                $display("[PRESIG] r=%d pc=%h opcode=%h D0=%h A1=%h",
+                    retired, ex_pc, ex_opcode, u_rf.regs[0], u_rf.regs[9]);
+            // Watch writes to byte $1909 = MP_SIGBIT of a critical MsgPort whose
+            // value is read at $FC1BCA before Signal is called.  If MP_SIGBIT is
+            // 31 ($1F), Signal mask becomes $80000000 (SIGF_DOS reserved).
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h0000_1908 && dc_addr <= 32'h0000_190B)
+                $display("[SIGBIT] r=%d pc=%h kind=%d addr=%h be=%b wdata=%h",
+                    retired, ex_pc, ex_kind, dc_addr, dc_be, dc_wdata);
             // [RESINIT] log when execution enters each known K1.3 Resident
             // init function.  For libraries/devices, rt_Init points to an
             // auto-init *table*; the actual init code is at table[12].
