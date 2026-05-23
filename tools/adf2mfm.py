@@ -52,14 +52,17 @@ TRACKS_PER_DISK = 160
 SECTOR_LABEL_BYTES = 16
 
 # Per-sector disk-byte budget:
-#   2 gap + 4 sync + 8 (header info) + 32 (label) + 8 (hdr chk)
-#   + 8 (data chk) + 1024 (data) = 1086 bytes
-SECTOR_DISK_BYTES = 1086
+#   4 gap + 4 sync + 8 (header info) + 32 (label) + 8 (hdr chk)
+#   + 8 (data chk) + 1024 (data) = 1088 bytes
+# K1.3 trackdisk computes inter-sector positions as `sector_index * $440`
+# (= 1088); a smaller per-sector size makes every sector after the first
+# land at the wrong offset and trip TDERR_BadSecPreamble at $FEAE70.
+SECTOR_DISK_BYTES = 1088
 
-# Pre-sync MFM-encoded gap.  Two raw $00 bytes -> $AA $AA $AA $AA on
-# disk (MFM expansion: each 0 data bit gets a 1 clock bit).  We emit
-# the pre-expanded form.
-GAP_RAW = bytes([0xAA, 0xAA])
+# Pre-sync MFM-encoded gap.  K1.3's gap check at $FEAD9A does a
+# CMPI.L #$AAAAAAAA (or #$2AAAAAAA) on the 4 bytes immediately before
+# the $4489 $4489 sync, so we need a 4-byte gap, not 2.
+GAP_RAW = bytes([0xAA, 0xAA, 0xAA, 0xAA])
 
 
 def odd_even_halves(buf: bytes) -> tuple[bytes, bytes]:
