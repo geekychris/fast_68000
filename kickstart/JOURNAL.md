@@ -2635,3 +2635,36 @@ regression of this fix immediately fails the kickstart-boot test.
 
 Status: 119/119 tests pass.  test-kickstart-boot now passes with
 retired=7,398,473 (was 1,313,655).
+
+### S43 (deferred): Next wall is corrupted exception-frame PC
+
+After S42 the boot progresses far enough that the next CPU-side bug
+becomes visible.  At r=2080000 an RTE pops the exception frame and
+PC becomes `$001C08F4` instead of the original `$00FC08F4` that was
+pushed by the interrupting VBlank exception.  The low half (`$08F4`)
+is intact; only the high byte differs (`$FC` -> `$1C`).
+
+`$FC` XOR `$1C` = `$E0` = bits 21-23 cleared.  Equivalently,
+`$00FC08F4 AND $001FFFFF = $001C08F4`.  Looks like a "mask to 21 bits"
+operation got applied somewhere along the exception-push or pop path.
+
+Three candidate root causes (untested):
+  (a) Exception push wrote the wrong value (CPU bug -- mask on the
+      `dc_wdata <= exc_saved_pc_c` path)
+  (b) Memory at `$7FDB6` (the saved-PC location for this frame) got
+      overwritten between push and pop by an aliased bus write
+  (c) Bus write path truncates bits 21-23 for some addresses
+
+Result: the user task resumes at the wild PC `$001C08F4`, walks
+through unmapped chip-RAM-aliased zero memory as 4-byte
+`ORI.B #0,D0` NOPs, each VBlank IRQ momentarily preempts the
+walk and RTEs back to the wild PC.  Boot is effectively stalled
+in this nothing-loop.
+
+Diagnostic infrastructure (the `[BADPC]` trace window) is in place
+for the next session to add a memory-write watch on the exception
+frame address and pinpoint whether the corruption is in push or
+in post-push aliased memory.
+
+Tasks: #65 (slow RAM didn't help; closed), #66 (RTE PC corruption,
+open).
