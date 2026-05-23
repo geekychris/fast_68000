@@ -1,50 +1,59 @@
-// Amiga-Copper-inspired display-list coprocessor (Phase 2).
+// Canonical-Amiga Copper (S41 rewrite).
 //
-// Reads a memory-resident program (the "Copper list") and executes simple
-// MOVE / WAIT / HALT instructions on its own bus master port.  Used to
-// chain blitter operations and reprogram chip registers without CPU
-// involvement.
+// Two-word instruction encoding, exactly as on real Agnus.  Each
+// instruction is 4 bytes = two 16-bit words IR1, IR2, stored in chip
+// RAM big-endian-word-addressed.  A single 32-bit aligned bus read at
+// `pc` yields `{IR1, IR2}` because chip RAM is BE: the byte sequence
+// (b0 b1 b2 b3) at address `pc` is read as 32'h{b0,b1,b2,b3}, with
+// IR1 = high half ([31:16]) and IR2 = low half ([15:0]).
 //
-// Differences from the real Amiga Copper (intentional):
-//   - 32-bit-friendly instruction encoding: each instruction is 8 bytes
-//     (two longs) instead of the Amiga's two 16-bit words.
-//   - Raster WAIT compares against Denise's `row_idx` only (no horizontal
-//     position).  Sufficient for per-scanline palette/register swaps.
+// Instruction decode:
+//   IR1[0] = 0  MOVE
+//     reg  = IR1[8:1] & 0x1FE          (16-bit chipset register offset)
+//     data = IR2                        (16-bit value)
+//     -> bus write of `IR2` to address $00DF_F000 | reg (be=4'b0011).
+//        The bus arbiter already decodes $DFF000..$DFF1FF for the
+//        chipset.  Special registers handled internally without a
+//        master cycle:
+//          $088 COPJMP1   -> PC <- cop1lc, restart S_FETCH
+//          $08A COPJMP2   -> PC <- cop2lc, restart S_FETCH
+//          $08C COPINS    -> accept and discard (no-op)
+//          $08E COPCON    -> accept and discard (no-op)
 //
-// Instruction encoding (per 8-byte slot):
+//   IR1[0] = 1, IR2[0] = 0  WAIT
+//     vp_target = IR1[15:8]
+//     hp_target = IR1[7:1]
+//     vp_mask   = IR2[14:8]
+//     hp_mask   = IR2[6:1]
+//     Stall until ((vbeam_v & vp_mask) >= vp_target)
+//                 AND ((vbeam_h & hp_mask) >= hp_target).
+//     End-of-list sentinel: $FFFE, $FFFE (vp=$FF h=$7F mask=$7F/$3F)
+//     can never be reached -> Copper stalls until reset/COPJMP.
 //
-//   long 0 = target address (32-bit byte address)
-//   long 1 = data (32-bit, written to target on MOVE; Y position for
-//                  raster WAIT/SKIP; ignored otherwise)
+//   IR1[0] = 1, IR2[0] = 1  SKIP
+//     Same compare as WAIT.  If the condition is currently TRUE
+//     (raster already past the target position), skip the next 4
+//     bytes (advance PC by 4 instead of just continuing).
 //
-//   Special target values:
-//       $FFFF_FFFF : HALT - stop the Copper, COP_BUSY <- 0.
-//       $FFFF_FFFE : WAIT-BLITTER - block until blitter goes busy then
-//                    idle.
-//       $FFFF_FFFD : SKIP-IF-BLITTER-BUSY - skip the next instruction
-//                    (8 bytes) if the blitter is currently busy.
-//       $FFFF_FFFC : WAIT-RASTER - block until vbeam_i >= data_q[15:0].
-//                    Used to synchronise to Denise's scanline so a
-//                    subsequent MOVE rewrites a Denise register before
-//                    the rasterizer reaches the relevant rows.
-//       $FFFF_FFFB : SKIP-IF-RASTER-PAST - skip the next instruction if
-//                    vbeam_i >= data_q[15:0].
-//       (everything else) : MOVE - write long 1 to the target address.
+// vbeam_i carries the Denise raster row (V) only -- there is no Agnus
+// H-position signal in this codebase yet.  The H comparison in WAIT/
+// SKIP is therefore treated as ALWAYS SATISFIED for now: the V
+// comparison alone decides.  This is sufficient for every line-grain
+// raster trick a Copper list does, and matches the simplification
+// already used by `tools/render_k13_screen.py`.  TODO: wire a real H
+// counter (e.g. from Agnus when it lands) and tighten the compare.
 //
-//   MOVE writes are 32-bit-wide bus transactions with BE = 4'b1111.
-//   For 16-bit blitter half-registers, the receiver simply latches the
-//   full 32 bits (low 16 are usually the relevant value in our blitter
-//   register-set, which is already 32-bit-wide).
-//
-// Register map (CPU-facing slave port at $00FE_0040..$00FE_007F):
-//
-//   $00FE_0040 COP1LC   RW   32-bit byte address of Copper list 1
-//   $00FE_0044 COPJMP1  W    write any value to (re)start the Copper at COP1LC
+// Slave port (legacy harness compat, kept verbatim) at
+// $00FE_0040..$00FE_007F:
+//   $00FE_0040 COP1LC   RW   list-1 byte address
+//   $00FE_0044 COPJMP1  W    strobe to (re)start at COP1LC
 //   $00FE_0048 COPSTAT  RO   bit 0 = COP_BUSY
-//   $00FE_004C COP2LC   RW   32-bit byte address of Copper list 2
-//   $00FE_0050 COPJMP2  W    write any value to (re)start the Copper at COP2LC
-
-
+//   $00FE_004C COP2LC   RW   list-2 byte address
+//   $00FE_0050 COPJMP2  W    strobe to (re)start at COP2LC
+//
+// The bus translates canonical $DFF080..$DFF08A CPU writes into the
+// equivalent slave-port writes (see m68k_bus.v cop_xlat_*), so user
+// code can program the Copper either way.
 
 module copper (
     input  wire        clk,
@@ -67,12 +76,13 @@ module copper (
     input  wire        mst_ack,
     input  wire [31:0] mst_rdata,
 
-    // Live blitter-busy signal so we can implement WAIT.
+    // Live blitter-busy signal (unused under canonical encoding but
+    // kept on the port for legacy harness compat).
     input  wire        blt_busy_i,
 
-    // Current Denise raster row (valid while Denise is rasterising; held
-    // at its last value when idle).  Lets the Copper synchronise to the
-    // bitplane pipeline so it can rewrite Denise registers per-scanline.
+    // Current Denise raster row.  Carries V only; H is unavailable in
+    // this codebase, so WAIT/SKIP treat the H comparator as always
+    // satisfied (see header comment).
     input  wire [15:0] vbeam_i
 );
     // ---------------- Registers programmed by the CPU ----------------
@@ -80,26 +90,68 @@ module copper (
     reg [31:0] cop2lc;
     reg        cop_busy;
 
-    // ---------------- Internal state ---------------------------------
-    localparam S_IDLE       = 4'd0;
-    localparam S_FETCH_T    = 4'd1;   // fetch instruction word 0 (target)
-    localparam S_FETCH_D    = 4'd2;   // fetch instruction word 1 (data)
-    localparam S_DECODE     = 4'd3;
-    localparam S_WRITE      = 4'd4;   // MOVE: write data to target
-    localparam S_WAIT_RISE  = 4'd5;   // WAIT-BLITTER: blitter must go busy first
-    localparam S_WAIT_FALL  = 4'd6;   // WAIT-BLITTER: ...then idle
-    localparam S_HALT       = 4'd7;
-    localparam S_WAIT_VBEAM = 4'd8;   // WAIT-RASTER: vbeam_i >= data_q[15:0]
+    // Silence Verilator unused-input warning on blt_busy_i.  Canonical
+    // Copper does not consult the blitter (WAIT-BLITTER no longer
+    // exists in this encoding); the port stays for harness symmetry.
+    wire _unused_blt_busy = blt_busy_i;
 
-    reg [3:0]  state;
+    // ---------------- Internal state ---------------------------------
+    localparam S_IDLE       = 3'd0;
+    localparam S_FETCH      = 3'd1;   // single 32-bit fetch -> {IR1, IR2}
+    localparam S_DECODE     = 3'd2;
+    localparam S_WRITE      = 3'd3;   // MOVE: bus write of IR2 to $DFFxxx
+    localparam S_WAIT_RAS   = 3'd4;   // WAIT: stall until raster compare
+    localparam S_HALT       = 3'd5;
+
+    reg [2:0]  state;
     reg [31:0] pc;
-    reg [31:0] target_q;
-    reg [31:0] data_q;
+    reg [15:0] ir1_q;
+    reg [15:0] ir2_q;
 
     // Master-request gating: drop combinationally on ack so the arbiter
     // sees one request per transaction.
     reg mst_req_r;
     assign mst_req = mst_req_r && !mst_ack;
+
+    // ---------------- WAIT / SKIP compare helpers --------------------
+    wire [7:0] vp_target = ir1_q[15:8];
+    wire [6:0] hp_target = ir1_q[7:1];
+    wire [6:0] vp_mask   = ir2_q[14:8];   // [14:8] = 7 bits
+    wire [5:0] hp_mask   = ir2_q[6:1];    // [6:1]  = 6 bits
+    wire       skip_bit  = ir2_q[0];      // 1 = SKIP, 0 = WAIT
+
+    // V-only compare: ((vbeam_v & vp_mask) >= vp_target).  Take vbeam_i's
+    // low 8 bits as the current V (Denise row counter); mask with the
+    // 7-bit vp_mask zero-extended to 8 bits (HRM uses VP=8 bits; high
+    // bit is always enabled in real Agnus comparator, which matches
+    // masking with 0xFF in our simplified model when vp_mask has the
+    // high bit implicitly enabled.  We follow CopperSim and ignore the
+    // mask's high-bit subtlety; using only the 7 low mask bits is fine
+    // for end-of-list ($FF,$FE) and for any V threshold under 128).
+    wire [7:0] vbeam_v = vbeam_i[7:0];
+    wire [7:0] vp_mask_ext = {1'b1, vp_mask};   // top bit always enabled
+    wire       v_match    = ((vbeam_v & vp_mask_ext) >= vp_target);
+    // H comparator stubbed as always satisfied (see header comment).
+    wire       h_match    = 1'b1;
+    // Suppress Verilator unused-bit warning on hp_target / hp_mask:
+    wire _unused_hp = |{hp_target, hp_mask};
+    wire       raster_match = v_match && h_match;
+
+    // ---------------- IR1 decode --------------------------------------
+    wire       is_move = !ir1_q[0];
+    wire [8:0] mv_reg  = {ir1_q[8:1], 1'b0};   // even byte offset 0..$1FE
+
+    // Special-register handling for MOVE.  These reload PC or noop
+    // without issuing any bus master write.
+    wire is_copjmp1 = is_move && (mv_reg == 9'h088);
+    wire is_copjmp2 = is_move && (mv_reg == 9'h08A);
+    wire is_copins  = is_move && (mv_reg == 9'h08C);
+    wire is_copcon  = is_move && (mv_reg == 9'h08E);
+
+    // Silence Verilator unused-input warning on slv_be (legacy port
+    // accepted byte enables but the canonical Copper treats all slave
+    // accesses as long-word).
+    wire _unused_slv_be = |slv_be;
 
     // ---------------- CPU slave reads --------------------------------
     always @* begin
@@ -121,8 +173,8 @@ module copper (
             cop_busy  <= 1'b0;
             state     <= S_IDLE;
             pc        <= 32'd0;
-            target_q  <= 32'd0;
-            data_q    <= 32'd0;
+            ir1_q     <= 16'd0;
+            ir2_q     <= 16'd0;
             mst_req_r <= 1'b0;
             mst_we    <= 1'b0;
             mst_addr  <= 32'd0;
@@ -133,19 +185,19 @@ module copper (
             if (slv_req && slv_we) begin
                 case (slv_addr[4:2])
                     3'd0: cop1lc <= slv_wdata;        // COP1LC
-                    3'd1: begin                        // COPJMP1: strobe-start at COP1LC
+                    3'd1: begin                        // COPJMP1: strobe-start
                         if (!cop_busy) begin
                             pc       <= cop1lc;
                             cop_busy <= 1'b1;
-                            state    <= S_FETCH_T;
+                            state    <= S_FETCH;
                         end
                     end
                     3'd3: cop2lc <= slv_wdata;        // COP2LC
-                    3'd4: begin                        // COPJMP2: strobe-start at COP2LC
+                    3'd4: begin                        // COPJMP2: strobe-start
                         if (!cop_busy) begin
                             pc       <= cop2lc;
                             cop_busy <= 1'b1;
-                            state    <= S_FETCH_T;
+                            state    <= S_FETCH;
                         end
                     end
                     default: ;
@@ -158,79 +210,83 @@ module copper (
                     mst_req_r <= 1'b0;
                 end
 
-                S_FETCH_T: begin
+                S_FETCH: begin
                     mst_req_r <= 1'b1;
                     mst_we    <= 1'b0;
                     mst_addr  <= pc;
                     mst_be    <= 4'b1111;
                     if (mst_ack) begin
                         mst_req_r <= 1'b0;
-                        target_q  <= mst_rdata;
-                        pc        <= pc + 32'd4;
-                        state     <= S_FETCH_D;
-                    end
-                end
-
-                S_FETCH_D: begin
-                    mst_req_r <= 1'b1;
-                    mst_we    <= 1'b0;
-                    mst_addr  <= pc;
-                    mst_be    <= 4'b1111;
-                    if (mst_ack) begin
-                        mst_req_r <= 1'b0;
-                        data_q    <= mst_rdata;
+                        ir1_q     <= mst_rdata[31:16];
+                        ir2_q     <= mst_rdata[15:0];
                         pc        <= pc + 32'd4;
                         state     <= S_DECODE;
                     end
                 end
 
                 S_DECODE: begin
-                    if (target_q == 32'hFFFF_FFFF) begin
+                    if (is_move) begin
+                        if (is_copjmp1) begin
+                            pc    <= cop1lc;
+                            state <= S_FETCH;
+                        end else if (is_copjmp2) begin
+                            pc    <= cop2lc;
+                            state <= S_FETCH;
+                        end else if (is_copins || is_copcon) begin
+                            // Discard silently; advance.
+                            state <= S_FETCH;
+                        end else begin
+                            // Real MOVE: emit canonical $DFFxxx bus write.
+                            state <= S_WRITE;
+                        end
+                    end else if (skip_bit) begin
+                        // SKIP: if raster already past target, skip next
+                        // instruction (4 more bytes).
+                        if (raster_match) pc <= pc + 32'd4;
+                        state <= S_FETCH;
+                    end else if (ir1_q == 16'hFFFF && ir2_q == 16'hFFFE) begin
+                        // Canonical end-of-list sentinel: WAIT vp=$FF.
+                        // The condition can never be satisfied since vbeam
+                        // maxes at FB_H-1 (192 << 255), so on real Agnus
+                        // the Copper stalls here until VBLANK restart.  In
+                        // our test harness we clear cop_busy so the CPU
+                        // polling COPSTAT can proceed.  This is a strict
+                        // superset of real semantics: the dead-end WAIT
+                        // really would block forever anyway.
                         state <= S_HALT;
-                    end else if (target_q == 32'hFFFF_FFFE) begin
-                        state <= S_WAIT_RISE;
-                    end else if (target_q == 32'hFFFF_FFFD) begin
-                        // SKIP-IF-BLITTER-BUSY: if busy, skip next 8 bytes.
-                        if (blt_busy_i) pc <= pc + 32'd8;
-                        state <= S_FETCH_T;
-                    end else if (target_q == 32'hFFFF_FFFC) begin
-                        // WAIT-RASTER: pause until vbeam_i reaches data_q[15:0].
-                        state <= S_WAIT_VBEAM;
-                    end else if (target_q == 32'hFFFF_FFFB) begin
-                        // SKIP-IF-RASTER-PAST-Y: skip next 8 bytes if
-                        // vbeam_i is already at/past the target Y.
-                        if (vbeam_i >= data_q[15:0]) pc <= pc + 32'd8;
-                        state <= S_FETCH_T;
                     end else begin
-                        state <= S_WRITE;
+                        // WAIT
+                        state <= S_WAIT_RAS;
                     end
                 end
 
                 S_WRITE: begin
+                    // Canonical Amiga chipset registers are 16-bit, packed
+                    // 2/long.  $DFFxx0/$DFFxx4/$DFFxx8/$DFFxxC are the high
+                    // halves of their long, $DFFxx2/$DFFxx6/$DFFxxA/$DFFxxE
+                    // the low halves.  Place IR2 in the matching half and
+                    // set BE accordingly so we don't clobber the other 16-
+                    // bit register sharing the same long.
                     mst_req_r <= 1'b1;
                     mst_we    <= 1'b1;
-                    mst_addr  <= target_q;
-                    mst_wdata <= data_q;
-                    mst_be    <= 4'b1111;
+                    mst_addr  <= 32'h00DF_F000 | {23'd0, mv_reg};
+                    if (mv_reg[1]) begin
+                        // Low half of long: $DFFxx2/$DFFxx6/$DFFxxA/$DFFxxE.
+                        mst_wdata <= {16'd0, ir2_q};
+                        mst_be    <= 4'b0011;
+                    end else begin
+                        // High half of long: $DFFxx0/$DFFxx4/$DFFxx8/$DFFxxC.
+                        mst_wdata <= {ir2_q, 16'd0};
+                        mst_be    <= 4'b1100;
+                    end
                     if (mst_ack) begin
                         mst_req_r <= 1'b0;
-                        state     <= S_FETCH_T;
+                        state     <= S_FETCH;
                     end
                 end
 
-                // WAIT semantics: ensure we observe blt_busy going high
-                // (so the previous MOVE-to-BLTSIZE has been latched) and
-                // then going low.
-                S_WAIT_RISE: begin
-                    if (blt_busy_i) state <= S_WAIT_FALL;
-                end
-
-                S_WAIT_FALL: begin
-                    if (!blt_busy_i) state <= S_FETCH_T;
-                end
-
-                S_WAIT_VBEAM: begin
-                    if (vbeam_i >= data_q[15:0]) state <= S_FETCH_T;
+                S_WAIT_RAS: begin
+                    if (raster_match) state <= S_FETCH;
                 end
 
                 S_HALT: begin

@@ -1,11 +1,12 @@
-; Copper chains the blitter: Copper writes all the blitter registers
-; including BLTSIZE, then WAITs for blitter completion, then HALTs.
-; The CPU only sets up the source data, kicks the Copper, and polls
-; COPSTAT.  The Copper handles the whole blit.
+; Copper chains the canonical-Amiga blitter (S41 rewrite).
 ;
-; Source @ $2000: $1234ABCD $DEADBEEF (4 words)
-; Dest   @ $3000
-; After Copper + blit: $3000 should match the source.
+; Copper writes the canonical blitter register file at $DFF040..$DFF066
+; via canonical 16-bit MOVEs, then ends.  Writing BLTSIZE ($DFF058)
+; kicks the blit.  CPU polls Copper-done then blitter-done and
+; verifies the A->D copy.
+;
+; Source @ $2000: $1234ABCD $DEADBEEF.
+; Dest   @ $3000: should match source after the blit.
 
         .org $400
 
@@ -22,37 +23,49 @@ core0:
         move.l #0,         $00003000
         move.l #0,         $00003004
 
-        ; ---- Copper list at $6000: 11 MOVEs + WAIT + HALT = 13 insns = 104 bytes ----
-        ;   Programs the blitter for a simple A->D copy of 4 words,
-        ;   then BLTSIZE write to kick it off, then WAIT-for-blitter, then HALT.
-        move.l #$00FE0000, $00006000    ; target = BLTCON
-        move.l #$F0000009, $00006004    ; data: LF=$F0 (A), USEA|USED
-        move.l #$00FE0004, $00006008    ; target = BLTAFWM
-        move.l #$0000FFFF, $0000600C    ; data
-        move.l #$00FE0008, $00006010    ; target = BLTALWM
-        move.l #$0000FFFF, $00006014    ; data
-        move.l #$00FE000C, $00006018    ; BLTAPT
-        move.l #$00002000, $0000601C    ; = source
-        move.l #$00FE0018, $00006020    ; BLTDPT
-        move.l #$00003000, $00006024    ; = dest
-        move.l #$00FE001C, $00006028    ; BLTAMOD
-        move.l #0,         $0000602C
-        move.l #$00FE0028, $00006030    ; BLTDMOD
-        move.l #0,         $00006034
-        move.l #$00FE0038, $00006038    ; BLTSIZE  (writing this starts the blit)
-        move.l #$00000044, $0000603C    ; height=1 width=4 -> $44
-        move.l #$FFFFFFFE, $00006040    ; WAIT for blitter not-busy
-        move.l #0,         $00006044
-        move.l #$FFFFFFFF, $00006048    ; HALT
-        move.l #0,         $0000604C
+        ; ---- Copper list at $6000 (canonical encoding, 4 bytes / insn).
+        ;   IR1 = high word of each .L = register offset (even); IR1[0]=0
+        ;   means MOVE.  IR2 = low word = 16-bit data.
+        ;     BLTCON0  = $DFF040 <- $09F0   (USEA|USED|LF=A)
+        ;     BLTCON1  = $DFF042 <- $0000
+        ;     BLTAFWM  = $DFF044 <- $FFFF
+        ;     BLTALWM  = $DFF046 <- $FFFF
+        ;     BLTAPTH  = $DFF050 <- $0000
+        ;     BLTAPTL  = $DFF052 <- $2000
+        ;     BLTDPTH  = $DFF054 <- $0000
+        ;     BLTDPTL  = $DFF056 <- $3000
+        ;     BLTAMOD  = $DFF064 <- $0000
+        ;     BLTDMOD  = $DFF066 <- $0000
+        ;     BLTSIZE  = $DFF058 <- $0044   (height=1, width=4 -- starts the blit)
+        ;     end-of-list = WAIT VP=$FF
+        move.l #$004009F0, $00006000      ; BLTCON0
+        move.l #$00420000, $00006004      ; BLTCON1
+        move.l #$0044FFFF, $00006008      ; BLTAFWM
+        move.l #$0046FFFF, $0000600C      ; BLTALWM
+        move.l #$00500000, $00006010      ; BLTAPTH
+        move.l #$00522000, $00006014      ; BLTAPTL
+        move.l #$00540000, $00006018      ; BLTDPTH
+        move.l #$00563000, $0000601C      ; BLTDPTL
+        move.l #$00640000, $00006020      ; BLTAMOD
+        move.l #$00660000, $00006024      ; BLTDMOD
+        move.l #$00580044, $00006028      ; BLTSIZE (kicks blit)
+        move.l #$FFFFFFFE, $0000602C      ; end-of-list
 
         ; ---- start the Copper ----
-        move.l #$00006000, $00FE0040    ; COP1LC
-        move.l #1,         $00FE0044    ; COPJMP1
+        move.l #$00006000, $00FE0040      ; COP1LC
+        move.l #1,         $00FE0044      ; COPJMP1
 
-wait:   move.l $00FE0048, D0
+        ; Wait for the Copper to finish issuing the writes.
+wait_cop:
+        move.l $00FE0048, D0
         andi.l #1, D0
-        bne    wait
+        bne    wait_cop
+
+        ; Now wait for the blit itself to complete (legacy BLTSTAT).
+wait_blt:
+        move.l $00FE003C, D0
+        andi.l #1, D0
+        bne    wait_blt
 
         ; ---- verify ----
         move.l $00003000, D1
