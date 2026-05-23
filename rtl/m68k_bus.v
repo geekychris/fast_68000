@@ -805,40 +805,57 @@ module m68k_bus #(
                 blt_xlat_addr  = 6'h08;
                 blt_xlat_wdata = {16'd0, amiga_wdata_half};
             end
-            5'd4: begin                       // BLTCPTH
+            // For the 32-bit BLT pointers (BLTAPT/BPT/CPT/DPT), a single
+            // MOVE.L #val, $DFFnnn touches the H register address but
+            // carries BOTH halves in wdata (high half at [31:16] = the H
+            // reg, low half at [15:0] = the L reg).  We must commit the
+            // FULL wdata to the slave -- otherwise the L half is lost
+            // and the pointer reads as $XXXX_0000 with the L half zero.
+            // K1.3 boot caught this: blitter clobbered ExecBase at $4
+            // because BLTDPT was effectively $0 after MOVE.L sets, and
+            // the blitter walked from BLTDPT=$0 / $2 / $4 / ...
+            5'd4: begin                       // BLTCPTH (.L writes commit full)
                 blt_xlat_valid = 1'b1;
                 blt_xlat_addr  = 6'h14;
-                blt_xlat_wdata = {amiga_wdata_half, canon_bltcpt[15:0]};
+                blt_xlat_wdata = (is_long[winner] && be[winner] == 4'b1111)
+                                 ? wdata[winner]
+                                 : {amiga_wdata_half, canon_bltcpt[15:0]};
             end
             5'd5: begin                       // BLTCPTL
                 blt_xlat_valid = 1'b1;
                 blt_xlat_addr  = 6'h14;
                 blt_xlat_wdata = {canon_bltcpt[31:16], amiga_wdata_half};
             end
-            5'd6: begin                       // BLTBPTH
+            5'd6: begin                       // BLTBPTH (.L writes commit full)
                 blt_xlat_valid = 1'b1;
                 blt_xlat_addr  = 6'h10;
-                blt_xlat_wdata = {amiga_wdata_half, canon_bltbpt[15:0]};
+                blt_xlat_wdata = (is_long[winner] && be[winner] == 4'b1111)
+                                 ? wdata[winner]
+                                 : {amiga_wdata_half, canon_bltbpt[15:0]};
             end
             5'd7: begin                       // BLTBPTL
                 blt_xlat_valid = 1'b1;
                 blt_xlat_addr  = 6'h10;
                 blt_xlat_wdata = {canon_bltbpt[31:16], amiga_wdata_half};
             end
-            5'd8: begin                       // BLTAPTH
+            5'd8: begin                       // BLTAPTH (.L writes commit full)
                 blt_xlat_valid = 1'b1;
                 blt_xlat_addr  = 6'h0C;
-                blt_xlat_wdata = {amiga_wdata_half, canon_bltapt[15:0]};
+                blt_xlat_wdata = (is_long[winner] && be[winner] == 4'b1111)
+                                 ? wdata[winner]
+                                 : {amiga_wdata_half, canon_bltapt[15:0]};
             end
             5'd9: begin                       // BLTAPTL
                 blt_xlat_valid = 1'b1;
                 blt_xlat_addr  = 6'h0C;
                 blt_xlat_wdata = {canon_bltapt[31:16], amiga_wdata_half};
             end
-            5'd10: begin                      // BLTDPTH
+            5'd10: begin                      // BLTDPTH (.L writes commit full)
                 blt_xlat_valid = 1'b1;
                 blt_xlat_addr  = 6'h18;
-                blt_xlat_wdata = {amiga_wdata_half, canon_bltdpt[15:0]};
+                blt_xlat_wdata = (is_long[winner] && be[winner] == 4'b1111)
+                                 ? wdata[winner]
+                                 : {amiga_wdata_half, canon_bltdpt[15:0]};
             end
             5'd11: begin                      // BLTDPTL
                 blt_xlat_valid = 1'b1;
@@ -902,10 +919,16 @@ module m68k_bus #(
         cop_xlat_wdata = 32'd0;
         cop_xlat_valid = 1'b0;
         case (cop_amiga_reg)
+            // COP1LC/COP2LC are 32-bit pointers; MOVE.L to the H address
+            // carries BOTH halves in wdata.  Without picking up the low
+            // half, the L reg is silently zeroed.  Mirror the BLT pointer
+            // fix at lines 808-855.
             3'd0: begin                       // COP1LCH ($DFF080)
                 cop_xlat_valid = 1'b1;
                 cop_xlat_addr  = 6'h00;
-                cop_xlat_wdata = {amiga_wdata_half, canon_cop1lc[15:0]};
+                cop_xlat_wdata = (is_long[winner] && be[winner] == 4'b1111)
+                                 ? wdata[winner]
+                                 : {amiga_wdata_half, canon_cop1lc[15:0]};
             end
             3'd1: begin                       // COP1LCL ($DFF082)
                 cop_xlat_valid = 1'b1;
@@ -915,7 +938,9 @@ module m68k_bus #(
             3'd2: begin                       // COP2LCH ($DFF084)
                 cop_xlat_valid = 1'b1;
                 cop_xlat_addr  = 6'h0C;
-                cop_xlat_wdata = {amiga_wdata_half, canon_cop2lc[15:0]};
+                cop_xlat_wdata = (is_long[winner] && be[winner] == 4'b1111)
+                                 ? wdata[winner]
+                                 : {amiga_wdata_half, canon_cop2lc[15:0]};
             end
             3'd3: begin                       // COP2LCL ($DFF086)
                 cop_xlat_valid = 1'b1;
@@ -1138,22 +1163,37 @@ module m68k_bus #(
                 case (blt_amiga_reg)
                     5'd0:  canon_bltcon0       <= amiga_wdata_half;
                     5'd1:  canon_bltcon1       <= amiga_wdata_half;
-                    5'd4:  canon_bltcpt[31:16] <= amiga_wdata_half;
+                    // 32-bit pointer writes: when CPU does MOVE.L to the H
+                    // address, capture BOTH halves from wdata so a follow-up
+                    // .W write to the partner half doesn't re-zero the L.
+                    5'd4:  if (is_long[winner] && be[winner] == 4'b1111)
+                                canon_bltcpt <= wdata[winner];
+                           else canon_bltcpt[31:16] <= amiga_wdata_half;
                     5'd5:  canon_bltcpt[15:0]  <= amiga_wdata_half;
-                    5'd6:  canon_bltbpt[31:16] <= amiga_wdata_half;
+                    5'd6:  if (is_long[winner] && be[winner] == 4'b1111)
+                                canon_bltbpt <= wdata[winner];
+                           else canon_bltbpt[31:16] <= amiga_wdata_half;
                     5'd7:  canon_bltbpt[15:0]  <= amiga_wdata_half;
-                    5'd8:  canon_bltapt[31:16] <= amiga_wdata_half;
+                    5'd8:  if (is_long[winner] && be[winner] == 4'b1111)
+                                canon_bltapt <= wdata[winner];
+                           else canon_bltapt[31:16] <= amiga_wdata_half;
                     5'd9:  canon_bltapt[15:0]  <= amiga_wdata_half;
-                    5'd10: canon_bltdpt[31:16] <= amiga_wdata_half;
+                    5'd10: if (is_long[winner] && be[winner] == 4'b1111)
+                                canon_bltdpt <= wdata[winner];
+                           else canon_bltdpt[31:16] <= amiga_wdata_half;
                     5'd11: canon_bltdpt[15:0]  <= amiga_wdata_half;
                     default: ;
                 endcase
             end
             if (winner_valid && we[winner] && is_cop_amiga) begin
                 case (cop_amiga_reg)
-                    3'd0: canon_cop1lc[31:16] <= amiga_wdata_half;
+                    3'd0: if (is_long[winner] && be[winner] == 4'b1111)
+                                canon_cop1lc <= wdata[winner];
+                          else canon_cop1lc[31:16] <= amiga_wdata_half;
                     3'd1: canon_cop1lc[15:0]  <= amiga_wdata_half;
-                    3'd2: canon_cop2lc[31:16] <= amiga_wdata_half;
+                    3'd2: if (is_long[winner] && be[winner] == 4'b1111)
+                                canon_cop2lc <= wdata[winner];
+                          else canon_cop2lc[31:16] <= amiga_wdata_half;
                     3'd3: canon_cop2lc[15:0]  <= amiga_wdata_half;
                     default: ;
                 endcase
