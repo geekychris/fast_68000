@@ -378,6 +378,7 @@ $(MINIMIG_BLT_BUILD)/Vminimig_blt_xcheck_top: \
         $(RTL_DIR)/chipset/blitter.v
 	@mkdir -p $(MINIMIG_BLT_BUILD)
 	$(VERILATOR) -Wno-fatal --cc --exe --build --no-timing \
+	    +define+BLT_DEBUG_FIRST_WR \
 	    --noassert -CFLAGS "-std=c++17 -O1" \
 	    -I$(RTL_DIR) -I$(MINIMIG_DIR)/rtl/minimig \
 	    --top-module minimig_blt_xcheck_top \

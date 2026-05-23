@@ -91,6 +91,30 @@ module minimig_blt_xcheck_top (
     // Translate canonical reg_addr (0..$3E for BLT regs) into our
     // blitter's [5:0] internal layout.  Matches the m68k_bus.v
     // translator.
+    //
+    // BLTCON is one 32-bit register in our blitter, but the Amiga
+    // chipset exposes it as two 16-bit halves (BLTCON0 at $40,
+    // BLTCON1 at $42).  We maintain staging copies of both halves
+    // and ALWAYS push the fully-composed 32-bit value on either
+    // write, so a $42 write does not clobber BLTCON0 fields
+    // (and vice versa).
+    reg [15:0] bltcon0_q;
+    reg [15:0] bltcon1_q;
+    always @(posedge clk) begin
+        if (rst) begin
+            bltcon0_q <= 16'd0;
+            bltcon1_q <= 16'd0;
+        end else if (reg_we) begin
+            if (reg_addr[7:0] == 8'h40) bltcon0_q <= reg_wdata;
+            if (reg_addr[7:0] == 8'h42) bltcon1_q <= reg_wdata;
+        end
+    end
+
+    // "Effective" BLTCON0/1: use the value being written this cycle for
+    // the matching half, and the staged value for the other half.
+    wire [15:0] eff_b0 = (reg_we && reg_addr[7:0] == 8'h40) ? reg_wdata : bltcon0_q;
+    wire [15:0] eff_b1 = (reg_we && reg_addr[7:0] == 8'h42) ? reg_wdata : bltcon1_q;
+
     reg [5:0]  our_slv_addr;
     reg [31:0] our_slv_wdata;
     reg        our_slv_req;
@@ -99,40 +123,21 @@ module minimig_blt_xcheck_top (
         our_slv_addr  = 6'h00;
         our_slv_wdata = 32'd0;
         case (reg_addr[7:0])
-            8'h40: begin // BLTCON0
+            8'h40, 8'h42: begin
+                // Compose full BLTCON from staged + current half.
                 our_slv_addr  = 6'h00;
-                // Pack BLTCON0 high half into our internal 32-bit format
-                // (LF[7:0] -> [31:24], ASH[3:0] -> [23:20], USE -> [3:0]).
-                // BLTCON1 fields stay 0 -- the harness writes both halves
-                // separately; full bltcon emerges after the second write.
                 our_slv_wdata = {
-                    reg_wdata[7:0],     // LF
-                    reg_wdata[15:12],   // ASH
-                    20'd0,
-                    reg_wdata[11:8]     // USEA-D
-                };
-            end
-            8'h42: begin // BLTCON1
-                our_slv_addr  = 6'h00;
-                // Merge BLTCON1 into the already-set BLTCON0 fields.
-                // The blitter's bltcon register is one 32-bit reg, so we
-                // read the prior value, mask, and OR in the new bits.
-                // For simplicity here we send a fresh value with the
-                // EXPECTED prior BLTCON0 reproduced -- the harness writes
-                // BLTCON0 then BLTCON1 in sequence and reads back via the
-                // memory diff, so any bltcon staleness is also exposed.
-                our_slv_wdata = {
-                    8'd0,                       // LF (placeholder, BLTCON0 set this)
-                    4'd0,                       // ASH
-                    reg_wdata[15:12],           // BSH
-                    reg_wdata[1],               // DESC
-                    reg_wdata[3],               // IFE
-                    reg_wdata[4],               // EFE
-                    reg_wdata[2],               // FCI
-                    reg_wdata[0],               // LINE
-                    reg_wdata[3:1],             // oct
-                    4'd0,
-                    4'd0                        // USE (placeholder)
+                    eff_b0[7:0],        // LF       -> [31:24]
+                    eff_b0[15:12],      // ASH      -> [23:20]
+                    eff_b1[15:12],      // BSH      -> [19:16]
+                    eff_b1[1],          // DESC     -> [15]
+                    eff_b1[3],          // IFE      -> [14]
+                    eff_b1[4],          // EFE      -> [13]
+                    eff_b1[2],          // FCI      -> [12]
+                    eff_b1[0],          // LINE     -> [11]
+                    eff_b1[3:1],        // SUD/SUL/AUL -> [10:8]
+                    4'd0,               // reserved -> [7:4]
+                    eff_b0[11:8]        // USEA-D   -> [3:0]
                 };
             end
             8'h44: begin our_slv_addr = 6'h04; our_slv_wdata = {16'd0, reg_wdata}; end // BLTAFWM
@@ -162,10 +167,26 @@ module minimig_blt_xcheck_top (
     wire        our_busy_q;
     assign our_busy = our_busy_q;
 
-    // mst_rdata: drive from our_mem on read requests.
+    // mst_rdata: drive from our_mem on read requests.  The blitter
+    // uses pick_half(word, addr[1]): addr[1]=0 -> high half [31:16],
+    // addr[1]=1 -> low half [15:0].  Place the 16-bit word in the
+    // matching half so the read decode lines up with the real bus.
     reg [31:0] our_mst_rdata;
     always @* begin
-        our_mst_rdata = {16'd0, our_mem[our_mst_addr[15:1]]};
+        if (our_mst_addr[1])
+            our_mst_rdata = {16'd0, our_mem[our_mst_addr[15:1]]};
+        else
+            our_mst_rdata = {our_mem[our_mst_addr[15:1]], 16'd0};
+    end
+
+    // 1-cycle-latency ack to avoid the combinational loop that arises
+    // from feeding our_mst_req directly back as the ack (blitter gates
+    // its mst_req combinationally with !mst_ack).  Functionally this
+    // matches a fast bus arbiter that acknowledges in the next cycle.
+    reg our_mst_ack_q;
+    always @(posedge clk) begin
+        if (rst) our_mst_ack_q <= 1'b0;
+        else     our_mst_ack_q <= our_mst_req;
     end
 
     blitter our_blt (
@@ -182,7 +203,7 @@ module minimig_blt_xcheck_top (
         .mst_addr   (our_mst_addr),
         .mst_wdata  (our_mst_wdata),
         .mst_be     (our_mst_be),
-        .mst_ack    (our_mst_req),       // instant-ack
+        .mst_ack    (our_mst_ack_q),     // 1-cycle latency
         .mst_rdata  (our_mst_rdata),
         .busy_o     (our_busy_q),
         .int_o      ()

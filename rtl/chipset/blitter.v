@@ -500,6 +500,11 @@ module blitter (
                         mst_be    <= half_be(bltdpt[1]);
                         mst_wdata <= put_half(final_w, bltdpt[1]);
                         if (mst_ack) begin
+`ifdef BLT_DEBUG_FIRST_WR
+                            if (cur_row == 16'd0 && cur_word < 16'd4)
+                                $display("[BLT_WRD] bltdpt=%h bltbpt=%h final_w=%h b_cur=%h b_prev=%h cur_word=%0d cur_row=%0d",
+                                    bltdpt, bltbpt, final_w, b_cur_word_q, b_prev_word, cur_word, cur_row);
+`endif
                             mst_req_r <= 1'b0;
                             // Latch previous-word state for next iteration's shift.
                             a_prev_word <= a_cur_word_q;

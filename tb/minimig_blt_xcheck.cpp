@@ -60,22 +60,25 @@ int main(int argc, char** argv) {
     for (int i = 0; i < 8; i++) tick(dut);
 
     // ====================================================================
-    // Test 1: simple shift B by -4 bytes into D (16 words around $1000)
+    // Test 1: simple B->D copy (LF=$CC, USE=B|D, no shift)
+    //   Source : word $1000..$1007 = $1000..$1007
+    //   Dest   : word $2000..$2007 (initially $DEAD)
+    //   Disjoint ranges, so this test actually validates writes happen.
     // ====================================================================
-    printf("=== Test 1: simple BLTCON0=$05CC, 8-word shift ===\n");
+    printf("=== Test 1: simple BLTCON0=$05CC, 8-word B->D copy ===\n");
     for (int i = 0; i < 16; i++)
         init_mem(dut, 0x1000 + i, 0x1000 + i);
     for (int i = 0; i < 16; i++)
-        init_mem(dut, 0x0FFC + i, 0xA5A5);
+        init_mem(dut, 0x2000 + i, 0xDEAD);
 
     reg_w(dut, 0x40, 0x05CC);   // BLTCON0
     reg_w(dut, 0x42, 0x0000);   // BLTCON1
     reg_w(dut, 0x44, 0xFFFF);   // BLTAFWM
     reg_w(dut, 0x46, 0xFFFF);   // BLTALWM
     reg_w(dut, 0x4C, 0x0000);   // BLTBPTH
-    reg_w(dut, 0x4E, 0x2000);   // BLTBPTL
+    reg_w(dut, 0x4E, 0x2000);   // BLTBPTL (word $1000)
     reg_w(dut, 0x54, 0x0000);   // BLTDPTH
-    reg_w(dut, 0x56, 0x1FFC);   // BLTDPTL
+    reg_w(dut, 0x56, 0x4000);   // BLTDPTL (word $2000)
     reg_w(dut, 0x62, 0x0000);   // BLTBMOD
     reg_w(dut, 0x66, 0x0000);   // BLTDMOD
     reg_w(dut, 0x58, 0x0048);   // BLTSIZE (1 row x 8 words)
