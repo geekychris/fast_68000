@@ -908,6 +908,9 @@ module m68k_core #(
     // $display fires once per fresh STOP rather than every clock cycle
     // the CPU sits halted at the same STOP PC.
     reg [31:0] stop_logged_pc;
+    // Edge tracker for [USPTINY]: prevents re-firing while user-mode A7
+    // sits below $200 (e.g. a Forbid/Permit nested loop that keeps SP small).
+    reg        user_a7_was_tiny;
     // CCR snapshot captured at S_LOAD ack for mem-dest RMW kinds where
     // S_RMW_W settle needs the *operation's* flags (not the registered
     // CCR which may have moved on).  Used by K_ALUI mem-dest path.
@@ -2801,12 +2804,28 @@ module m68k_core #(
             halt_code <= 16'd0;
             retired <= 32'd0;
             stop_logged_pc <= 32'hFFFF_FFFF;
+            user_a7_was_tiny <= 1'b0;
         end else begin
             // Count instructions that complete each cycle. STOP doesn't count.
             if (is_settled && ex_kind != K_STOP) retired <= retired + 32'd1;
 `ifdef KICKSTART_BOOT_PC_TRACE
             if (is_settled && ex_kind != K_STOP)
                 $display("[PC] r=%d pc=%h kind=%d", retired, ex_pc, ex_kind);
+`endif
+`ifdef KICKSTART_BOOT_TRACE
+            // Edge-triggered watch for user-mode A7 dipping below $200.
+            // Catches tasks running with a smashed stack pointer.  Kept
+            // after the rc_idx exception-capture bug fix as a guardrail.
+            if (is_settled && !sr_s && ex_kind != K_STOP &&
+                u_rf.regs[15] < 32'h0000_0200 && !user_a7_was_tiny) begin
+                $display("[USPTINY] r=%d pc=%h opcode=%h kind=%d A7=%h",
+                    retired, ex_pc, ex_opcode, ex_kind, u_rf.regs[15]);
+                user_a7_was_tiny <= 1'b1;
+            end
+            if (is_settled && !sr_s && ex_kind != K_STOP &&
+                u_rf.regs[15] >= 32'h0000_0200 && user_a7_was_tiny) begin
+                user_a7_was_tiny <= 1'b0;
+            end
 `endif
 `ifdef KICKSTART_BOOT_TRACE
             // STOP logs once when it first settles -- without the edge
@@ -3515,11 +3534,21 @@ module m68k_core #(
                 S_EXC_PUSH_SR: begin
                     if (dc_ack) begin
                         // Enforce supervisor mode (matches old behavior).
-                        if (ex_exc_was_user) usp_shadow <= rf_rc_data;
+                        // Capture USP (= live A7 when we entered the exception
+                        // from user mode) into usp_shadow.  Read A7 directly
+                        // via the regfile -- rf_rc_data routes through
+                        // id_rc_idx which is decoded from the *preempted*
+                        // instruction and points at its src/dst Xn register
+                        // when that instruction used IDX mode (e.g. MOVE.B
+                        // ..,d8(An,Dn) preempted at $FC6BF6 by a level-3 IRQ
+                        // captured D0=$0 instead of A7=$188A, propagating
+                        // a corrupt USP=$0 into the next dispatch and pulling
+                        // the saved-PC pop into top-of-ROM garbage).
+                        if (ex_exc_was_user) usp_shadow <= u_rf.regs[15];
 `ifdef KICKSTART_BOOT_TRACE
-                        if (ex_exc_was_user && rf_rc_data < 32'h0000_0200)
+                        if (ex_exc_was_user && u_rf.regs[15] < 32'h0000_0200)
                             $display("[USPLOW3] r=%d pc=%h usp_captured=%h (via EXC from user)",
-                                retired, ex_pc, rf_rc_data);
+                                retired, ex_pc, u_rf.regs[15]);
 `endif
                         sr_s <= 1'b1;
                         sr_t <= 1'b0;
