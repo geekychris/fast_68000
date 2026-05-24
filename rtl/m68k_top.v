@@ -384,12 +384,23 @@ module m68k_top #(
             // (PB0 0→1), since trackdisk asserts /STEP low then high.
             if (cia_b_pb_out[0] && !pb0_step_prev && any_drive_selected) begin
                 dskchange_cleared <= 1'b1;
+                // /DIR is active-low.  Amiga HRM: high (PB1=1) = step
+                // OUT toward cyl 0 (lower-numbered cylinders); low
+                // (PB1=0) = step IN toward cyl 79 (higher-numbered
+                // cylinders).  Without this polarity correct, trackdisk's
+                // seek-to-track-80 issued 80 "step OUT" pulses (which
+                // clamped at cyl 0) and never reached the rootblock —
+                // every WB1.3 disk read came back as track 0 data.
                 if (cia_b_pb_out[1]) begin
-                    // /DIR = 1: step in (toward cyl 79).
-                    if (cur_cyl != 7'd79) cur_cyl <= cur_cyl + 7'd1;
-                end else begin
-                    // /DIR = 0: step out (toward cyl 0).
                     if (cur_cyl != 7'd0) cur_cyl <= cur_cyl - 7'd1;
+`ifdef KICKSTART_BOOT_TRACE
+                    $display("[STEP] out cur_cyl=%0d->%0d", cur_cyl, cur_cyl-1);
+`endif
+                end else begin
+                    if (cur_cyl != 7'd79) cur_cyl <= cur_cyl + 7'd1;
+`ifdef KICKSTART_BOOT_TRACE
+                    $display("[STEP] in cur_cyl=%0d->%0d", cur_cyl, cur_cyl+1);
+`endif
                 end
             end
             // /SIDE follows PB2 continuously, INVERTED.  The line is
