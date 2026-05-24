@@ -169,12 +169,19 @@ module m68k_decoder (
             // ----------------------------------------------------------
 
             // ORI #imm, CCR / SR — special destinations
-            16'b0000_0000_0011_1100: begin kind = K_ALUI; alu_op = `ALU_OR;  size = `SZ_B; src_mode = `EA_EXT; src_reg = `EA7_IMM; dst_mode = 3'b110; dst_reg = 3'b000; src_ext_words = 2'd1; end  // ORI to CCR
-            16'b0000_0000_0111_1100: begin kind = K_ALUI; alu_op = `ALU_OR;  size = `SZ_W; src_mode = `EA_EXT; src_reg = `EA7_IMM; dst_mode = 3'b110; dst_reg = 3'b001; src_ext_words = 2'd1; privileged = 1; end  // ORI to SR
-            16'b0000_0010_0011_1100: begin kind = K_ALUI; alu_op = `ALU_AND; size = `SZ_B; src_mode = `EA_EXT; src_reg = `EA7_IMM; dst_mode = 3'b110; dst_reg = 3'b000; src_ext_words = 2'd1; end  // ANDI to CCR
-            16'b0000_0010_0111_1100: begin kind = K_ALUI; alu_op = `ALU_AND; size = `SZ_W; src_mode = `EA_EXT; src_reg = `EA7_IMM; dst_mode = 3'b110; dst_reg = 3'b001; src_ext_words = 2'd1; privileged = 1; end  // ANDI to SR
-            16'b0000_1010_0011_1100: begin kind = K_ALUI; alu_op = `ALU_EOR; size = `SZ_B; src_mode = `EA_EXT; src_reg = `EA7_IMM; dst_mode = 3'b110; dst_reg = 3'b000; src_ext_words = 2'd1; end  // EORI to CCR
-            16'b0000_1010_0111_1100: begin kind = K_ALUI; alu_op = `ALU_EOR; size = `SZ_W; src_mode = `EA_EXT; src_reg = `EA7_IMM; dst_mode = 3'b110; dst_reg = 3'b001; src_ext_words = 2'd1; privileged = 1; end  // EORI to SR
+            // ORI/ANDI/EORI #imm,CCR/SR encoded with dst_mode = EA_EXT and
+            // dst_reg = 3'b110 (CCR) / 3'b111 (SR).  These are unused
+            // mode-7 sub-encodings, so they form a clean sentinel that
+            // does not collide with EA_IDX (which is 3'b110 as a mode).
+            // The earlier encoding (dst_mode=3'b110) overlapped EA_IDX
+            // and silently swallowed CMPI.L #imm,d8(An,Xn) loads — see
+            // tests/t138_cmpi_idx.s and the K1.3 trackdisk preamble check.
+            16'b0000_0000_0011_1100: begin kind = K_ALUI; alu_op = `ALU_OR;  size = `SZ_B; src_mode = `EA_EXT; src_reg = `EA7_IMM; dst_mode = `EA_EXT; dst_reg = 3'b110; src_ext_words = 2'd1; end  // ORI to CCR
+            16'b0000_0000_0111_1100: begin kind = K_ALUI; alu_op = `ALU_OR;  size = `SZ_W; src_mode = `EA_EXT; src_reg = `EA7_IMM; dst_mode = `EA_EXT; dst_reg = 3'b111; src_ext_words = 2'd1; privileged = 1; end  // ORI to SR
+            16'b0000_0010_0011_1100: begin kind = K_ALUI; alu_op = `ALU_AND; size = `SZ_B; src_mode = `EA_EXT; src_reg = `EA7_IMM; dst_mode = `EA_EXT; dst_reg = 3'b110; src_ext_words = 2'd1; end  // ANDI to CCR
+            16'b0000_0010_0111_1100: begin kind = K_ALUI; alu_op = `ALU_AND; size = `SZ_W; src_mode = `EA_EXT; src_reg = `EA7_IMM; dst_mode = `EA_EXT; dst_reg = 3'b111; src_ext_words = 2'd1; privileged = 1; end  // ANDI to SR
+            16'b0000_1010_0011_1100: begin kind = K_ALUI; alu_op = `ALU_EOR; size = `SZ_B; src_mode = `EA_EXT; src_reg = `EA7_IMM; dst_mode = `EA_EXT; dst_reg = 3'b110; src_ext_words = 2'd1; end  // EORI to CCR
+            16'b0000_1010_0111_1100: begin kind = K_ALUI; alu_op = `ALU_EOR; size = `SZ_W; src_mode = `EA_EXT; src_reg = `EA7_IMM; dst_mode = `EA_EXT; dst_reg = 3'b111; src_ext_words = 2'd1; privileged = 1; end  // EORI to SR
 
             // ORI/ANDI/SUBI/ADDI/EORI/CMPI #imm, <ea>
             16'b0000_0000_??_??_????,  // ORI

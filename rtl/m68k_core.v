@@ -1113,8 +1113,15 @@ module m68k_core #(
     // K_ALUI to memory: CMPI reads only (CCR-only side effect); other ALUI
     // ops (ADDI/SUBI/ANDI/ORI/EORI) are full RMW.
     // K_ALUQ to memory (ADDQ / SUBQ to a mem ea) takes the same RMW path.
+    // ANDI/ORI/EORI #imm,CCR/SR variants come out of the decoder with
+    // dst_mode = EA_EXT and dst_reg = 3'b110 (CCR) or 3'b111 (SR) — both
+    // unused mode-7 sub-encodings, used here as sentinels.  Without this
+    // discriminator the SR-write path swallowed legitimate ALUI loads to
+    // EA_IDX (3'b110) — see tests/t138_cmpi_idx.s.
+    wire dst_is_sr_ccr   = (ex_dst_mode == `EA_EXT) &&
+                           (ex_dst_reg == 3'b110 || ex_dst_reg == 3'b111);
     wire alui_mem        = ((ex_kind == K_ALUI) && (ex_dst_mode != `EA_DREG) &&
-                            (ex_dst_mode != 3'b110)) || // 110 = CCR/SR dst
+                            !dst_is_sr_ccr) ||
                            ((ex_kind == K_ALUQ) && (ex_src_mode != `EA_DREG) &&
                             (ex_src_mode != `EA_AREG));
     wire alui_mem_writes = alui_mem && (ex_alu_op != `ALU_CMP);
@@ -1497,8 +1504,10 @@ module m68k_core #(
                     // ----------------------------------------------------
                     K_ALUI: begin
                         // src is immediate (in ex_src_imm32); dst is the EA from
-                        // dst_mode/dst_reg. We support Dn destinations and the
-                        // special "CCR/SR" destination encoded as dst_mode=3'b110.
+                        // dst_mode/dst_reg.  CCR/SR variants of ANDI/ORI/EORI
+                        // come out of the decoder with dst_mode=EA_EXT and
+                        // dst_reg = 3'b110 (CCR) / 3'b111 (SR) — sentinel
+                        // values that do not collide with EA_IDX.
                         if (ex_dst_mode == `EA_DREG) begin
                             alu_op_c = ex_alu_op;
                             alu_a = ex_rb;            // Dn destination value
@@ -1513,16 +1522,16 @@ module m68k_core #(
                                 wb_main_idx_c = {1'b0, ex_dst_reg};
                                 wb_main_data_c = alu_y;
                             end
-                        end else if (ex_dst_mode == 3'b110) begin
-                            // ANDI/ORI/EORI to CCR (dst_reg=0) or SR (dst_reg=1).
-                            // SR variant is privileged.
-                            if (ex_dst_reg == 3'b001 && !sr_s) begin
+                        end else if (dst_is_sr_ccr) begin
+                            // ANDI/ORI/EORI to CCR (dst_reg=3'b110) or SR
+                            // (dst_reg=3'b111).  SR variant is privileged.
+                            if (ex_dst_reg == 3'b111 && !sr_s) begin
                                 exc_launch_c   = 1'b1;
                                 exc_vector_c   = 8'd`VEC_PRIV_VIO;
                                 exc_saved_pc_c = ex_pc;
                             end else begin
                                 sr_we_c = 1'b1;
-                                if (ex_dst_reg == 3'b000) begin
+                                if (ex_dst_reg == 3'b110) begin
                                     // CCR variant: source is 8 bits, only CCR
                                     // byte changes; upper byte of SR untouched.
                                     case (ex_alu_op)
