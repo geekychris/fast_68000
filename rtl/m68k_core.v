@@ -2874,6 +2874,34 @@ module m68k_core #(
             // Error path ($FEAE6C)
             if (is_settled && ex_pc == 32'h00fe_ae6c)
                 $display("[BADSEC] r=%d error path D0=%h D3=%h D6=%h A0=%h", retired, u_rf.regs[0], u_rf.regs[3], u_rf.regs[6], u_rf.regs[8]);
+            // strap.task bootblock-load checks at $FE85A0..$FE85AA.
+            if (is_settled && ex_pc == 32'h00fe_85a0)
+                $display("[STRAP] r=%d post DoIO Read: D0=%h (io_Error)", retired, u_rf.regs[0]);
+            if (is_settled && ex_pc == 32'h00fe_85a4)
+                $display("[STRAP] r=%d about to read (A4): A4=%h", retired, u_rf.regs[12]);
+            if (is_settled && ex_pc == 32'h00fe_85a6)
+                $display("[STRAP] r=%d D0=%h (= first long of bootblock buffer)", retired, u_rf.regs[0]);
+            if (is_settled && ex_pc == 32'h00fe_85aa)
+                $display("[STRAP] r=%d post-CMP magic check (expect DOS\\0=$444F5300)", retired);
+            if (is_settled && ex_pc == 32'h00fe_85ac)
+                $display("[STRAP] r=%d magic check PASSED -- proceed with checksum/JSR", retired);
+            if (is_settled && ex_pc == 32'h00fe_8600)
+                $display("[STRAP] r=%d ERROR path entered (read failed or magic mismatch) D0=%h", retired, u_rf.regs[0]);
+            // BadSecID branches: 3 checks after MFM data decode (format
+            // byte, track byte, sector byte).  Trace each check + the
+            // post-MFM-combine info to see which sector test fails.
+            if (is_settled && ex_pc == 32'h00fe_addc)
+                $display("[SECID] r=%d post-combine info D0=%h A0=%h D4=%h D5=%h A2=%h", retired, u_rf.regs[0], u_rf.regs[8], u_rf.regs[4], u_rf.regs[5], u_rf.regs[10]);
+            if (is_settled && ex_pc == 32'h00fe_ade6)
+                $display("[SECID] r=%d format-check BNE D0=%h D4=%h D5=%h (expect top byte=$FF)", retired, u_rf.regs[0], u_rf.regs[4], u_rf.regs[5]);
+            if (is_settled && ex_pc == 32'h00fe_adee)
+                $display("[SECID] r=%d format OK; track-check D1=%h vs $4B(A3=%h)", retired, u_rf.regs[1], u_rf.regs[11]);
+            if (is_settled && ex_pc == 32'h00fe_adf6)
+                $display("[SECID] r=%d track OK; sector-check D1=%h vs D5=%h", retired, u_rf.regs[1], u_rf.regs[5]);
+            if (is_settled && ex_pc == 32'h00fe_ae00)
+                $display("[SECID] r=%d ALL checks passed (sector data accepted) D5=%h", retired, u_rf.regs[5]);
+            if (is_settled && ex_pc == 32'h00fe_ae74)
+                $display("[SECID] r=%d BadSecID error -- one of format/track/sector checks failed", retired);
             // Trace CPU writes to the local-var slots $5DC8 / $5DCC where the
             // hdr_chk pair is staged before $FEAA0E.  Identifies any code
             // path that scribbles over the local between $FEACB6 and the

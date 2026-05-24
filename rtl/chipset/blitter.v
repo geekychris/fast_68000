@@ -458,6 +458,10 @@ module blitter (
                             b_cur_word_q <= pick_half(mst_rdata, bltbpt[1]);
                             bltbpt <= bltbpt + (desc ? -32'sd2 : 32'sd2);
                             state  <= use_c ? S_RDC : S_WRD;
+`ifdef HDRCHK_WATCH
+                            if (bltbpt >= 32'h0000_64B0 && bltbpt <= 32'h0000_64BB)
+                                $display("[BLT_RDB] bltbpt=%h mst_rdata=%h cur_word=%0d cur_row=%0d", bltbpt, mst_rdata, cur_word, cur_row);
+`endif
                         end
                     end else begin
                         b_cur_word_q <= 16'd0;
@@ -504,6 +508,10 @@ module blitter (
                             if (cur_row == 16'd0 && cur_word < 16'd4)
                                 $display("[BLT_WRD] bltdpt=%h bltbpt=%h final_w=%h b_cur=%h b_prev=%h cur_word=%0d cur_row=%0d",
                                     bltdpt, bltbpt, final_w, b_cur_word_q, b_prev_word, cur_word, cur_row);
+`endif
+`ifdef HDRCHK_WATCH
+                            if (bltdpt >= 32'h0000_64B0 && bltdpt <= 32'h0000_64BB)
+                                $display("[BLT_WR] bltdpt=%h final_w=%h b_cur=%h cur_word=%0d", bltdpt, final_w, b_cur_word_q, cur_word);
 `endif
                             mst_req_r <= 1'b0;
                             // Latch previous-word state for next iteration's shift.

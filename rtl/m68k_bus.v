@@ -1267,7 +1267,7 @@ module m68k_bus #(
                 end else begin
                     mem[blk_cur_dst[AIDX_BITS+1:2]] <= disk[blk_cur_off[DISK_IDX_BITS+1:2]];
 `ifdef HDRCHK_WATCH
-                    if (blk_cur_dst >= 32'h0000_64DC && blk_cur_dst <= 32'h0000_64E7)
+                    if (blk_cur_dst >= 32'h0000_64A8 && blk_cur_dst <= 32'h0000_64E7)
                         $display("[HDRCHK_WR] cyc=%0d DMA dst=%h off=%h data=%h",
                             cyc_count, blk_cur_dst, blk_cur_off, disk[blk_cur_off[DISK_IDX_BITS+1:2]]);
 `endif
@@ -1567,7 +1567,7 @@ module m68k_bus #(
                 // Watch writes that touch \$64DC..\$64E7 (hdr_chk + data_chk
                 // pair in the K1.3 disk-decode buffer).  Helps pin down what
                 // clobbers the buffer between trackdisk validation passes.
-                if (addr[winner] >= 32'h0000_64DC && addr[winner] <= 32'h0000_64E7) begin
+                if (addr[winner] >= 32'h0000_64A8 && addr[winner] <= 32'h0000_64E7) begin
                     $display("[HDRCHK_WR] cyc=%0d port=%0d addr=%h be=%b wdata=%h blk_busy=%b",
                         cyc_count, winner, addr[winner], be[winner], wdata[winner], blk_busy);
                 end
