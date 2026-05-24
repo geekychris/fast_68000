@@ -7,3 +7,5 @@ __pycache__/
 .DS_Store
 kickstart/kick.bin
 kickstart/kick_*.bin
+.claude/
+.idea/
