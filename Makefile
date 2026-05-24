@@ -42,7 +42,7 @@ TESTS := $(filter-out $(TESTS_DIR)/t06_multicore.s $(TESTS_DIR)/t07_coherence.s,
 endif
 BENCHES:= $(wildcard $(BENCH_DIR)/*.s)
 
-.PHONY: all build test test-ovl test-all test-boot-rom test-boot-rom-ext test-blockdev test-floppy test-dma-snoop test-boot-rom-bin test-fake-kickstart test-kickstart-boot bench clean demo demo-fb demo-os demo-blt demo-cop demo-den demo-pau demo-poly demo-spr demo-morph demo-ham demo-coprainbow demo-showcase demo-hires demo-kickstart demo-fashion fetch-musashi musashi crosscheck fetch-fx68k fx68k crosscheck-fx68k crosscheck-all demos-c demos-c-build cc68k-image fetch-minimig minimig crosscheck-minimig
+.PHONY: all build test test-ovl test-all test-boot-rom test-boot-rom-ext test-blockdev test-floppy test-dma-snoop test-boot-rom-bin test-fake-kickstart test-kickstart-boot kickstart-graphics bench clean demo demo-fb demo-os demo-blt demo-cop demo-den demo-pau demo-poly demo-spr demo-morph demo-ham demo-coprainbow demo-showcase demo-hires demo-kickstart demo-fashion fetch-musashi musashi crosscheck fetch-fx68k fx68k crosscheck-fx68k crosscheck-all demos-c demos-c-build cc68k-image fetch-minimig minimig crosscheck-minimig
 
 all: test
 
@@ -614,6 +614,47 @@ test-kickstart-boot:
 	    tail -5 build_kick_boot/run.log; \
 	    exit 1; \
 	fi
+
+# ---------------------------------------------------------------------------
+# kickstart-graphics: same build pipeline as test-kickstart-boot but with
+# WITH_SDL2=1 and FB_W=320 / FB_H=200 so we can see K1.3's screen live.
+# Pass --graphics and RENDER_K13_COP1LC=$$0x2368 to sim_main so the SDL
+# render loop walks K1.3's Copper list each frame instead of sampling the
+# (blank) chunky framebuffer.
+# ---------------------------------------------------------------------------
+kickstart-graphics:
+	@if [ "$(HAVE_SDL2)" != "1" ]; then \
+	    echo "SDL2 not detected (brew install sdl2)."; exit 1; \
+	fi
+	@if [ ! -f "$(ROMFILE)" ]; then \
+	    echo "ROMFILE=$(ROMFILE) does not exist."; exit 1; \
+	fi
+	@mkdir -p build_kick_gfx
+	$(PYTHON) tools/bin2rom.py --mem-words $(ROMSIZE_WORDS) $(ROMFILE) build_kick_gfx/rom.hex
+	@if [ -n "$(ADFFILE)" ]; then \
+	    if [ ! -f "$(ADFFILE)" ]; then echo "ADFFILE=$(ADFFILE) does not exist."; exit 1; fi; \
+	    cp "$(ADFFILE)" build_kick_gfx/boot.adf; \
+	    $(PYTHON) tools/adf2mfm.py --mem-words $(DISK_WORDS_FULL) \
+	        build_kick_gfx/boot.adf build_kick_gfx/disk.hex; \
+	    DISK_WORDS_USED=$(DISK_WORDS_FULL); \
+	else \
+	    $(PYTHON) tools/mkbootblock.py build_kick_gfx/boot.adf; \
+	    $(PYTHON) tools/adf2mfm.py --mem-words 4096 --track 0 \
+	        build_kick_gfx/boot.adf build_kick_gfx/disk.hex; \
+	    DISK_WORDS_USED=4096; \
+	fi; \
+	$(MAKE) --no-print-directory build BUILD=build_kick_gfx N_CORES=1 USE_CACHE=1 \
+	    MEM_WORDS=131072 ROM_WORDS=$(ROMSIZE_WORDS) ROM_HEXFILE=rom.hex OVL_RESET=1 \
+	    DISK_WORDS=$$DISK_WORDS_USED DISK_HEXFILE=disk.hex \
+	    WITH_SDL2=1 FB_W=320 \
+	    VERI_DEFS='+define+KICKSTART_BOOT +define+KICKSTART_FAST_BOOT +define+KICKSTART_BOOT_TRACE $(EXTRA_VERI_DEFS)' \
+	    >build_kick_gfx/_build.log 2>&1
+	$(PYTHON) $(TB_DIR)/asm68k.py tests/t63_boot_rom.s build_kick_gfx/program.hex
+	@echo
+	@echo "Launching Kickstart 1.3 in graphics mode."
+	@echo "  Window shows K1.3's Copper-list-rendered screen (background + sprites)."
+	@echo "  Press ESC or close the window to quit."
+	@(cd build_kick_gfx && RENDER_K13_COP1LC=0x2368 ./Vm68k_top $${ROMCYCLES:-1500000000} --graphics)
 
 # ---------------------------------------------------------------------------
 # Block-device DMA test.  Builds with a tiny disk image (tests/disk_test.hex)

@@ -142,6 +142,149 @@ static uint32_t mem_peek_word(Vm68k_top* top, uint32_t byte_addr) {
     return top->fb_peek_data;
 }
 
+#ifdef HAVE_SDL2
+// ---------------------------------------------------------------------------
+// K1.3 chipram → pixel-buffer renderer.
+//
+// Our Verilog Denise rasterises bitplanes only when BPLEN+DMAEN are on, which
+// K1.3 doesn't enable until Intuition.OpenScreen runs (post-Workbench-load).
+// Until we get that far, the only way to "see" K1.3's screen is to walk the
+// Copper list it staged in chip RAM, extract the palette + sprite pointers +
+// bitplane config, and render directly into the SDL pixel buffer.
+//
+// Mirrors tools/render_k13_screen.py (Python implementation; that one runs as
+// a one-shot post-mortem on a chipram dump.  This one updates the SDL window
+// every frame).
+// ---------------------------------------------------------------------------
+static uint16_t chip_word(Vm68k_top* top, uint32_t addr) {
+    if (addr & 1) {
+        // Unaligned: stitch two adjacent words.
+        uint32_t w_lo = mem_peek_word(top, addr & ~1u);
+        uint32_t w_hi = mem_peek_word(top, (addr + 1) & ~1u);
+        if ((addr & 2) == 0)
+            return uint16_t(((w_lo >> 8) & 0xFF) | ((w_hi & 0xFF000000u) >> 16));
+        return uint16_t(((w_lo >> 16) & 0xFF) | ((w_hi & 0xFF0000u) >> 8));
+    }
+    uint32_t w = mem_peek_word(top, addr & ~3u);
+    uint32_t shift = ((addr & 2) ? 0 : 16);
+    return uint16_t((w >> shift) & 0xFFFFu);
+}
+
+static uint32_t amiga4_to_argb(uint16_t c12) {
+    uint8_t r = (c12 >> 8) & 0xF;
+    uint8_t g = (c12 >> 4) & 0xF;
+    uint8_t b =  c12       & 0xF;
+    return (0xFFu << 24) |
+           uint32_t((r << 4) | r) << 16 |
+           uint32_t((g << 4) | g) << 8  |
+           uint32_t((b << 4) | b);
+}
+
+// Walk the Copper list rooted at cop1lc (chip-RAM byte address); update
+// the regs array (16-bit entries, indexed by chip-reg offset/2 in
+// $000..$1FE).  Stops at end-of-list (WAIT $FFFF) or instruction-budget.
+static void k13_walk_copper(Vm68k_top* top, uint32_t cop1lc,
+                            uint16_t regs[256]) {
+    uint32_t pc = cop1lc & 0xFFFFFu;
+    for (int n = 0; n < 4096; n++) {
+        uint16_t ir1 = chip_word(top, pc);
+        uint16_t ir2 = chip_word(top, pc + 2);
+        if (ir1 == 0 && ir2 == 0) break;
+        pc += 4;
+        if (ir1 & 1) {
+            // WAIT / SKIP.  End-of-list sentinel = WAIT vp=$FF hp=$7F, ir2&1=0.
+            uint8_t vp = (ir1 >> 8) & 0xFF;
+            uint8_t hp = (ir1 >> 1) & 0x7F;
+            if (vp == 0xFF && hp == 0x7F && !(ir2 & 1)) break;
+            // SKIP: at end-of-frame all vp/hp comparisons pass, skip next.
+            if (ir2 & 1) pc += 4;
+        } else {
+            // MOVE: ir1[8:1] = chip-reg offset (low 9 bits, byte address).
+            uint16_t reg = ir1 & 0x1FE;
+            regs[reg >> 1] = ir2;
+            // COPJMP2 reloads PC from COP2LC.
+            if (reg == 0x08A) {
+                uint32_t cop2lc = (uint32_t(regs[0x084 >> 1]) << 16) |
+                                  uint32_t(regs[0x086 >> 1]);
+                pc = cop2lc & 0xFFFFFu;
+            }
+            // COPJMP1 reloads from COP1LC.
+            if (reg == 0x088) {
+                uint32_t cop1 = (uint32_t(regs[0x080 >> 1]) << 16) |
+                                uint32_t(regs[0x082 >> 1]);
+                pc = cop1 & 0xFFFFFu;
+            }
+        }
+    }
+}
+
+// Render an Amiga hardware sprite chain at sprpt onto buf (w*h ARGB).
+// idx = 0..7 (determines which COLOR pair: SPRn uses 17 + n*2 .. 19 + n*2).
+static void k13_render_sprite(Vm68k_top* top, uint32_t sprpt,
+                              const uint16_t regs[256],
+                              uint32_t* buf, int w, int h, int idx) {
+    if (sprpt == 0) return;
+    uint32_t pal[4] = {0};
+    pal[1] = amiga4_to_argb(regs[(0x180 + (17 + idx * 2) * 2) >> 1]);
+    pal[2] = amiga4_to_argb(regs[(0x180 + (18 + idx * 2) * 2) >> 1]);
+    pal[3] = amiga4_to_argb(regs[(0x180 + (19 + idx * 2) * 2) >> 1]);
+    uint32_t p = sprpt;
+    for (int safety = 0; safety < 64; safety++) {
+        uint16_t pos = chip_word(top, p);
+        uint16_t ctl = chip_word(top, p + 2);
+        int vstart = ((pos >> 8) & 0xFF) | ((ctl & 0x4) << 6);
+        int vstop  = ((ctl >> 8) & 0xFF) | ((ctl & 0x2) << 7);
+        int hstart = ((pos & 0xFF) << 1) | (ctl & 0x1);
+        if (vstart == 0 && vstop == 0) return;
+        if (vstop <= vstart) return;
+        int height = vstop - vstart;
+        p += 4;
+        for (int row = 0; row < height; row++) {
+            uint16_t w0 = chip_word(top, p);
+            uint16_t w1 = chip_word(top, p + 2);
+            p += 4;
+            int y = vstart + row;
+            if (y >= h) continue;
+            for (int bit = 0; bit < 16; bit++) {
+                int px = ((w0 & (0x8000 >> bit)) ? 1 : 0) |
+                         ((w1 & (0x8000 >> bit)) ? 2 : 0);
+                if (!px) continue;
+                int x = hstart + bit;
+                if (x >= 0 && x < w && y >= 0 && y < h)
+                    buf[y * w + x] = pal[px];
+            }
+        }
+    }
+}
+
+// Render K1.3's current chipram state into the pixel buffer.  Pixel layout
+// is ARGB8888.  buf must have w*h pixels.  Returns true if a recognisable
+// Copper list was found (so callers can fall back to a blank fill otherwise).
+static bool render_k13_chipram(Vm68k_top* top, uint32_t cop1lc,
+                               uint32_t* buf, int w, int h) {
+    uint16_t regs[256] = {0};
+    k13_walk_copper(top, cop1lc, regs);
+    // Background = COLOR00.
+    uint32_t bg = amiga4_to_argb(regs[0x180 >> 1]);
+    // If COLOR00 register was never touched the regs[] entry is 0 -> black.
+    // K1.3 typically sets $0AAF (the Workbench-blue background).  If still 0,
+    // there's no Copper list to render; signal the caller.
+    if (regs[0x180 >> 1] == 0 && regs[0x182 >> 1] == 0 &&
+        regs[0x100 >> 1] == 0 && regs[0x120 >> 1] == 0) {
+        return false;
+    }
+    for (int i = 0; i < w * h; i++) buf[i] = bg;
+    // Render sprites 0..7.
+    for (int idx = 0; idx < 8; idx++) {
+        uint32_t sprpt = (uint32_t(regs[(0x120 + idx * 4) >> 1]) << 16) |
+                         uint32_t(regs[(0x122 + idx * 4) >> 1]);
+        sprpt &= 0xFFFFFu;
+        if (sprpt) k13_render_sprite(top, sprpt, regs, buf, w, h, idx);
+    }
+    return true;
+}
+#endif  // HAVE_SDL2
+
 static void drain_console(Vm68k_top* top, uint32_t& host_tail) {
     uint32_t head = mem_peek_word(top, CONSOLE_HEAD_ADDR);
     if (host_tail == head) return;
@@ -392,6 +535,14 @@ static int run_graphics(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
 
     auto pixel_buf = new uint32_t[FB_W * FB_H];
 
+    // K1.3 chipram-render mode: when RENDER_K13_COP1LC is set, ignore the
+    // chunky framebuffer and instead walk Kickstart's Copper list each
+    // frame to produce the visible screen.  Used by `make kickstart-graphics`.
+    uint32_t k13_cop1lc = 0;
+    if (const char* s = std::getenv("RENDER_K13_COP1LC")) {
+        k13_cop1lc = uint32_t(std::strtoul(s, nullptr, 0));
+    }
+
     using clk_t = std::chrono::steady_clock;
     auto next_render = clk_t::now();
 
@@ -432,6 +583,22 @@ static int run_graphics(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
         auto now = clk_t::now();
         if (now < next_render) continue;
         next_render = now + std::chrono::milliseconds(WALL_FRAME_MS);
+
+        // K1.3 mode: walk the Copper list each frame; skip chunky-FB sampling.
+        if (k13_cop1lc) {
+            if (!render_k13_chipram(top, k13_cop1lc, pixel_buf, FB_W, FB_H)) {
+                // No Copper list set up yet — fill black so the user sees
+                // something while Kickstart finishes booting.
+                for (int i = 0; i < FB_W * FB_H; i++) pixel_buf[i] = 0xFF000000u;
+            }
+            top->fb_peek_addr = 0;
+            top->eval();
+            SDL_UpdateTexture(tex, nullptr, pixel_buf, FB_W * 4);
+            SDL_RenderClear(ren);
+            SDL_RenderCopy(ren, tex, nullptr, nullptr);
+            SDL_RenderPresent(ren);
+            continue;
+        }
 
         // Sample the chunky 8 bpp framebuffer.
         for (int y = 0; y < FB_H; y++) {
