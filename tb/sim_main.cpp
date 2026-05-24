@@ -98,6 +98,15 @@ int main(int argc, char** argv) {
     top->clk = 0;
     top->rst_n = 0;
     top->fb_peek_addr = 0;
+    // External-input defaults: no mouse motion, no buttons, no kbd.
+    // Without these, the inputs are whatever Verilator initialised them
+    // to (usually 0, which is benign — but be explicit for clarity).
+    top->ext_kbd_wr     = 0;
+    top->ext_kbd_byte   = 0;
+    top->mouse_x_count  = 0;
+    top->mouse_y_count  = 0;
+    top->mouse_btn_l    = 0;
+    top->mouse_btn_r    = 0;
     for (int i = 0; i < 8; i++) {
         top->clk = 0; top->eval();
         top->clk = 1; top->eval();
@@ -439,6 +448,105 @@ static int run_regression(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
 }
 
 #ifdef HAVE_SDL2
+// -------- SDL keycode -> Amiga rawkey lookup --------
+// Amiga A500 raw scancodes (bits [6:0]).  Bit 7 of the byte sent to the
+// keyboard SR sets the key-up flag.  Values from the well-known Commodore
+// "Amiga ROM Kernel Reference Manual -- Devices" rawkey table.
+//
+// We map the most common keys (alphanumerics, punctuation, arrows, function
+// keys, modifiers, space, return, backspace, ESC).  Anything not in the
+// table is silently dropped — sufficient for driving Workbench.
+static uint8_t sdl_keycode_to_amiga_rawkey(SDL_Keycode k) {
+    switch (k) {
+        // Number row
+        case SDLK_BACKQUOTE:   return 0x00;
+        case SDLK_1:           return 0x01;
+        case SDLK_2:           return 0x02;
+        case SDLK_3:           return 0x03;
+        case SDLK_4:           return 0x04;
+        case SDLK_5:           return 0x05;
+        case SDLK_6:           return 0x06;
+        case SDLK_7:           return 0x07;
+        case SDLK_8:           return 0x08;
+        case SDLK_9:           return 0x09;
+        case SDLK_0:           return 0x0A;
+        case SDLK_MINUS:       return 0x0B;
+        case SDLK_EQUALS:      return 0x0C;
+        case SDLK_BACKSLASH:   return 0x0D;
+        // Top alpha row
+        case SDLK_q:           return 0x10;
+        case SDLK_w:           return 0x11;
+        case SDLK_e:           return 0x12;
+        case SDLK_r:           return 0x13;
+        case SDLK_t:           return 0x14;
+        case SDLK_y:           return 0x15;
+        case SDLK_u:           return 0x16;
+        case SDLK_i:           return 0x17;
+        case SDLK_o:           return 0x18;
+        case SDLK_p:           return 0x19;
+        case SDLK_LEFTBRACKET: return 0x1A;
+        case SDLK_RIGHTBRACKET:return 0x1B;
+        // Home row
+        case SDLK_a:           return 0x20;
+        case SDLK_s:           return 0x21;
+        case SDLK_d:           return 0x22;
+        case SDLK_f:           return 0x23;
+        case SDLK_g:           return 0x24;
+        case SDLK_h:           return 0x25;
+        case SDLK_j:           return 0x26;
+        case SDLK_k:           return 0x27;
+        case SDLK_l:           return 0x28;
+        case SDLK_SEMICOLON:   return 0x29;
+        case SDLK_QUOTE:       return 0x2A;
+        // Bottom alpha row
+        case SDLK_z:           return 0x31;
+        case SDLK_x:           return 0x32;
+        case SDLK_c:           return 0x33;
+        case SDLK_v:           return 0x34;
+        case SDLK_b:           return 0x35;
+        case SDLK_n:           return 0x36;
+        case SDLK_m:           return 0x37;
+        case SDLK_COMMA:       return 0x38;
+        case SDLK_PERIOD:      return 0x39;
+        case SDLK_SLASH:       return 0x3A;
+        // Misc
+        case SDLK_SPACE:       return 0x40;
+        case SDLK_BACKSPACE:   return 0x41;
+        case SDLK_TAB:         return 0x42;
+        case SDLK_RETURN:      return 0x44;
+        case SDLK_KP_ENTER:    return 0x43;
+        case SDLK_DELETE:      return 0x46;
+        case SDLK_UP:          return 0x4C;
+        case SDLK_DOWN:        return 0x4D;
+        case SDLK_RIGHT:       return 0x4E;
+        case SDLK_LEFT:        return 0x4F;
+        // Function keys
+        case SDLK_F1:          return 0x50;
+        case SDLK_F2:          return 0x51;
+        case SDLK_F3:          return 0x52;
+        case SDLK_F4:          return 0x53;
+        case SDLK_F5:          return 0x54;
+        case SDLK_F6:          return 0x55;
+        case SDLK_F7:          return 0x56;
+        case SDLK_F8:          return 0x57;
+        case SDLK_F9:          return 0x58;
+        case SDLK_F10:         return 0x59;
+        // Modifiers / qualifiers
+        case SDLK_LSHIFT:      return 0x60;
+        case SDLK_RSHIFT:      return 0x61;
+        case SDLK_CAPSLOCK:    return 0x62;
+        case SDLK_LCTRL:
+        case SDLK_RCTRL:       return 0x63;
+        case SDLK_LALT:        return 0x64;
+        case SDLK_RALT:        return 0x65;
+        // The Mac uses the GUI ("Cmd") key in the position where the
+        // Amiga has the Amiga key — map both to LAMIGA / RAMIGA.
+        case SDLK_LGUI:        return 0x66;
+        case SDLK_RGUI:        return 0x67;
+        default:               return 0xFF;   // sentinel: no mapping
+    }
+}
+
 // Build a 256-entry RGB332 -> ARGB8888 palette.
 static void build_palette(uint32_t* palette) {
     for (int i = 0; i < 256; i++) {
@@ -554,15 +662,68 @@ static int run_graphics(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
     using clk_t = std::chrono::steady_clock;
     auto next_render = clk_t::now();
 
+    // ---- SDL keyboard / mouse plumbing ----
+    // Pending scancode queue (Amiga rawkey bytes, including key-up flag).
+    // We drain at most one byte per CYCLES_PER_BATCH so the CIA SR has a
+    // full real-Amiga delay between scancodes (real KB sends ~10 KHz).
+    static constexpr int   KBD_Q_CAP = 256;
+    uint8_t kbd_q[KBD_Q_CAP] = {0};
+    int     kbd_q_head = 0;       // producer
+    int     kbd_q_tail = 0;       // consumer
+    auto kbd_q_push = [&](uint8_t b) {
+        int next = (kbd_q_head + 1) & (KBD_Q_CAP - 1);
+        if (next == kbd_q_tail) return;       // full -> drop
+        kbd_q[kbd_q_head] = b;
+        kbd_q_head = next;
+    };
+    auto kbd_q_pop = [&](uint8_t* out) {
+        if (kbd_q_head == kbd_q_tail) return false;
+        *out = kbd_q[kbd_q_tail];
+        kbd_q_tail = (kbd_q_tail + 1) & (KBD_Q_CAP - 1);
+        return true;
+    };
+
+    // Mouse state: 8-bit wrap-around quadrature counters, accumulated
+    // from SDL_MOUSEMOTION xrel/yrel.  Workbench reads JOY0DAT every VBL
+    // and subtracts the previous sample to recover the per-frame delta.
+    uint8_t mouse_x_acc = 0;
+    uint8_t mouse_y_acc = 0;
+    bool    mouse_l_down = false;
+    bool    mouse_r_down = false;
+
     uint64_t cycle = 0;
     bool quit = false;
     while (!quit && cycle < max_cycles && !all_halted()) {
+        // Push mouse state every batch.  These are level signals — the bus
+        // samples them whenever JOY0DAT / POTGOR is read.  CIA-A's PRA
+        // input is similarly level-sensitive (Workbench polls it via the
+        // CIA-A interrupt + read sequence).
+        top->mouse_x_count = mouse_x_acc;
+        top->mouse_y_count = mouse_y_acc;
+        top->mouse_btn_l   = mouse_l_down ? 1 : 0;
+        top->mouse_btn_r   = mouse_r_down ? 1 : 0;
+
+        // Drain at most one scancode byte per batch (~one rawkey per
+        // render frame, ~30 Hz).  Real Amiga KB tops out around 100 Hz
+        // raw-key rate so this is the right ballpark.
+        uint8_t scancode_to_send = 0;
+        bool    have_scancode    = kbd_q_pop(&scancode_to_send);
+
         // Step many simulated cycles per wall iteration so the CPU makes
         // visible progress between renders. Tune CYCLES_PER_BATCH to balance
         // smoothness vs. simulator throughput.
         const int CYCLES_PER_BATCH = 2000;
         int audio_cycle_acc = 0;
         for (int b = 0; b < CYCLES_PER_BATCH && cycle < max_cycles && !all_halted(); b++) {
+            // Pulse ext_kbd_wr for exactly one host clock with the
+            // scancode (CIA's posedge clk latches kbd_byte on kbd_wr=1).
+            // First sub-cycle of the batch.
+            if (have_scancode && b == 0) {
+                top->ext_kbd_byte = scancode_to_send;
+                top->ext_kbd_wr   = 1;
+            } else {
+                top->ext_kbd_wr   = 0;
+            }
             top->clk = 0; top->eval();
             top->clk = 1; top->eval();
             cycle++;
@@ -580,11 +741,40 @@ static int run_graphics(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
             }
         }
 
-        // Pump SDL events.
+        // Pump SDL events.  Translate keyboard / mouse activity into
+        // Amiga-shaped inputs (raw keys queued for CIA-A; mouse
+        // accumulators driven into JOY0DAT/POTGOR/CIA-A PRA).
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) quit = true;
-            else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) quit = true;
+            else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE)
+                quit = true;
+            else if (e.type == SDL_KEYDOWN) {
+                if (e.key.repeat) continue;  // don't queue auto-repeat
+                uint8_t rk = sdl_keycode_to_amiga_rawkey(e.key.keysym.sym);
+                if (rk != 0xFF) kbd_q_push(rk);          // bit7=0 -> key-down
+            }
+            else if (e.type == SDL_KEYUP) {
+                uint8_t rk = sdl_keycode_to_amiga_rawkey(e.key.keysym.sym);
+                if (rk != 0xFF) kbd_q_push(rk | 0x80);   // bit7=1 -> key-up
+            }
+            else if (e.type == SDL_MOUSEMOTION) {
+                // SDL gives signed deltas in window pixels.  Real Amiga
+                // mouse advances the quadrature counter by 1 per ~125 µm
+                // of motion; for screen sanity we just feed pixel deltas
+                // 1:1 — Workbench's tracking ratio is configurable in
+                // Preferences anyway.
+                mouse_x_acc = (uint8_t)(mouse_x_acc + (int8_t)e.motion.xrel);
+                mouse_y_acc = (uint8_t)(mouse_y_acc + (int8_t)e.motion.yrel);
+            }
+            else if (e.type == SDL_MOUSEBUTTONDOWN) {
+                if (e.button.button == SDL_BUTTON_LEFT)  mouse_l_down = true;
+                if (e.button.button == SDL_BUTTON_RIGHT) mouse_r_down = true;
+            }
+            else if (e.type == SDL_MOUSEBUTTONUP) {
+                if (e.button.button == SDL_BUTTON_LEFT)  mouse_l_down = false;
+                if (e.button.button == SDL_BUTTON_RIGHT) mouse_r_down = false;
+            }
         }
 
         // Throttle render to ~30 FPS.

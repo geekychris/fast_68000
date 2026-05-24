@@ -28,7 +28,32 @@ module m68k_top #(
 
     // Live Paula audio output for the simulator harness.
     output wire signed [15:0] audio_l,
-    output wire signed [15:0] audio_r
+    output wire signed [15:0] audio_r,
+
+    // External input injection from the harness (SDL keyboard + mouse).
+    // These are sampled by the chipset RTL and emulate a real Amiga
+    // keyboard/mouse plugged into the CIA / Paula ports.
+    //
+    //   ext_kbd_wr     : pulse high for one host clock to deliver a scan
+    //                    code byte to CIA-A (same path as $00FE9000).
+    //   ext_kbd_byte   : 8-bit scancode (Amiga raw key + bit7=key-up).
+    //   mouse_x_count  : 8-bit horizontal quadrature counter (wraps).
+    //                    Exposed as the low byte of JOY0DAT.
+    //   mouse_y_count  : 8-bit vertical quadrature counter.  Exposed as
+    //                    the high byte of JOY0DAT.
+    //   mouse_btn_l    : 1 while the left mouse button is held; drives
+    //                    /FIR0 (CIA-A PRA bit 6) low.
+    //   mouse_btn_r    : 1 while the right button is held; drives the
+    //                    POTGOR right-button bit low.
+    //
+    // All default to "no input" so headless / regression runs are
+    // unaffected (the harness ties them to 0 when no SDL is present).
+    input  wire        ext_kbd_wr,
+    input  wire [7:0]  ext_kbd_byte,
+    input  wire [7:0]  mouse_x_count,
+    input  wire [7:0]  mouse_y_count,
+    input  wire        mouse_btn_l,
+    input  wire        mouse_btn_r
 );
     // Two ports per core (I-cache + D-cache) plus one each for the blitter,
     // Copper, Denise, and Paula masters.
@@ -114,8 +139,14 @@ module m68k_top #(
     wire        ovl_clr = cia_a_pa_oe[0] & ~cia_a_pa_out[0];
     // Keyboard byte injection.  Bus exposes a write port at $00FE9000
     // that pulses cia_a_kbd_wr for one cycle with the written byte.
-    wire        cia_a_kbd_wr;
-    wire [7:0]  cia_a_kbd_byte;
+    // The simulator harness can ALSO inject scancodes via ext_kbd_wr /
+    // ext_kbd_byte (no CPU bus cycle required); both sources OR into the
+    // CIA-A serial-receive path.
+    wire        cia_a_kbd_wr_bus;
+    wire [7:0]  cia_a_kbd_byte_bus;
+    wire        cia_a_kbd_wr   = cia_a_kbd_wr_bus | ext_kbd_wr;
+    wire [7:0]  cia_a_kbd_byte = ext_kbd_wr ? ext_kbd_byte
+                                            : cia_a_kbd_byte_bus;
 
     // Blitter busy signal exposed to the Copper (for WAIT).
     wire        blt_busy;
@@ -212,8 +243,11 @@ module m68k_top #(
         .cia_b_slv_wdata(cia_b_slv_wdata),
         .cia_b_slv_rdata(cia_b_slv_rdata),
         .ovl_clr_i      (ovl_clr),
-        .kbd_inject_wr  (cia_a_kbd_wr),
-        .kbd_inject_byte(cia_a_kbd_byte),
+        .kbd_inject_wr  (cia_a_kbd_wr_bus),
+        .kbd_inject_byte(cia_a_kbd_byte_bus),
+        .mouse_x_in     (mouse_x_count),
+        .mouse_y_in     (mouse_y_count),
+        .mouse_btn_r_in (mouse_btn_r),
         .vblank_pulse_o (vblank_pulse),
         .dskblk_pulse_o (dskblk_pulse),
         .dsksyn_pulse_o (dsksyn_pulse),
@@ -259,12 +293,17 @@ module m68k_top #(
         .kbd_wr   (cia_a_kbd_wr),
         .kbd_byte (cia_a_kbd_byte),
         // PRA input bit composition (active-low signals):
-        //   [7]=FIRE=1, [6]=SEL2=1, [5]=DSKRDY (motor-gated, low when ready),
+        //   [7]=/FIR0  (mouse port 0 button — low while pressed),
+        //   [6]=/FIR1  (mouse port 1 button — low while pressed),
+        //   [5]=DSKRDY (motor-gated, low when ready),
         //   [4]=DSKTRACK0 (low when cur_cyl == 0),
         //   [3]=DSKWRPRO=1 (write-protect inactive),
         //   [2]=DSKCHANGE (cleared after CIA-B drives a step),
         //   [1:0] driven by the CIA, not the peripheral.
-        .pa_in    ({2'b11, !fl_dskrdy_low, fl_track0_low, 1'b1,
+        // mouse_btn_l drives both port-0 and port-1 fire low because we
+        // don't know which port Workbench is configured for; either way
+        // the left button gets observed.
+        .pa_in    ({~mouse_btn_l, ~mouse_btn_l, !fl_dskrdy_low, fl_track0_low, 1'b1,
                     dskchange_cleared, 2'b00}),
         .pb_in    (8'd0),
         .pa_out   (cia_a_pa_out),

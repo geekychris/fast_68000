@@ -136,6 +136,15 @@ module m68k_bus #(
     output reg                            kbd_inject_wr,
     output reg  [7:0]                     kbd_inject_byte,
 
+    // Mouse state from the harness.  mouse_x_in / mouse_y_in are 8-bit
+    // wrap-around quadrature counters; they appear directly as the low /
+    // high bytes of JOY0DAT.  mouse_btn_r_in is 1 while the right mouse
+    // button is held — drives POTGOR bit 10 low (the right-port right-
+    // button source on real Amiga).
+    input  wire [7:0]                     mouse_x_in,
+    input  wire [7:0]                     mouse_y_in,
+    input  wire                           mouse_btn_r_in,
+
     // Vertical-blank pulse from Agnus beam counter (one host clock high
     // per frame, on the cycle (agnus_h, agnus_v) = (LAST_H, LAST_V)).
     // DSKBLK pulse: high for one cycle when the block-DMA engine finishes
@@ -414,10 +423,24 @@ module m68k_bus #(
     // so the Romwack serial poll at $F83B98 doesn't think a byte has
     // arrived.
     localparam [15:0] SERDATR_VAL  = 16'h307F;
+    // POTGOR / JOY0DAT values are now dynamic (depend on mouse_*_in).
+    // The "VAL" parameters below are the no-input defaults; the actual
+    // mux uses live wires further down.
     localparam [15:0] POTGOR_VAL   = 16'hFFFF;
     localparam [15:0] POT_DAT_VAL  = 16'h0000;
     localparam [15:0] JOY_DAT_VAL  = 16'h0000;
     localparam [15:0] ADKCONR_VAL  = 16'h0000;
+    // Live POTGOR view: start from POTGOR_VAL and clear bits 10 and 14
+    // (right buttons of port 1 / port 0) when the harness reports a
+    // right-mouse-button press.
+    wire [15:0] potgor_live = POTGOR_VAL
+                              & ~({1'b0, mouse_btn_r_in, 3'b000,
+                                   mouse_btn_r_in, 10'b00_0000_0000});
+    // Live JOY0DAT view: { vert_count[7:0], horz_count[7:0] }.  Mouse
+    // position is plumbed through as a raw 8-bit quadrature counter
+    // (workbench's intuition.library reads JOY0DAT every VBL and
+    // subtracts to get the delta).
+    wire [15:0] joy0dat_live = {mouse_y_in, mouse_x_in};
 
     // ----- Disk-status read registers (DSKBYTR / DSKDATR / DSKSYNC) ----
     // K1.3's trackdisk.device polls DSKBYTR for DMAON to confirm the
@@ -1828,11 +1851,11 @@ module m68k_bus #(
             granted_is_paula_ro_q  <= winner_valid && !we[winner] && is_paula_ro_reg;
             granted_paula_ro_val_q <=
                 (addr[winner] == SERDATR_ADDR) ? SERDATR_VAL
-              : (addr[winner] == POTGOR_ADDR)  ? POTGOR_VAL
+              : (addr[winner] == POTGOR_ADDR)  ? potgor_live
               : (addr[winner] == ADKCONR_ADDR) ? ADKCONR_VAL
               : (addr[winner] == POT0DAT_ADDR) ? POT_DAT_VAL
               : (addr[winner] == POT1DAT_ADDR) ? POT_DAT_VAL
-              : (addr[winner] == JOY0DAT_ADDR) ? JOY_DAT_VAL
+              : (addr[winner] == JOY0DAT_ADDR) ? joy0dat_live
               : (addr[winner] == JOY1DAT_ADDR) ? JOY_DAT_VAL
               // DSKBYTR: bit 14 = DMAON tracks blk_busy.  Bit 15
               // (DSKBYT = byte ready) we leave 0; K1.3 doesn't poll
