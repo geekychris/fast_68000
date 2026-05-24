@@ -224,10 +224,20 @@ static void k13_render_sprite(Vm68k_top* top, uint32_t sprpt,
                               const uint16_t regs[256],
                               uint32_t* buf, int w, int h, int idx) {
     if (sprpt == 0) return;
-    uint32_t pal[4] = {0};
-    pal[1] = amiga4_to_argb(regs[(0x180 + (17 + idx * 2) * 2) >> 1]);
-    pal[2] = amiga4_to_argb(regs[(0x180 + (18 + idx * 2) * 2) >> 1]);
-    pal[3] = amiga4_to_argb(regs[(0x180 + (19 + idx * 2) * 2) >> 1]);
+    // Sprite palette: K1.3 doesn't set COLOR17-19 in its boot Copper list
+    // (Intuition would, post-OpenScreen).  Fall back to a sensible default
+    // so the mouse cursor renders as the conventional white-body/black-
+    // outline arrow rather than an all-black blob: 1=white, 2=black,
+    // 3=light grey.  Sprites 1..7 are unused by K1.3 in boot state.
+    uint16_t c1 = regs[(0x180 + (17 + idx * 2) * 2) >> 1];
+    uint16_t c2 = regs[(0x180 + (18 + idx * 2) * 2) >> 1];
+    uint16_t c3 = regs[(0x180 + (19 + idx * 2) * 2) >> 1];
+    if (c1 == 0 && c2 == 0 && c3 == 0) {
+        c1 = 0x0FFF;  // white
+        c2 = 0x0000;  // black
+        c3 = 0x0BBB;  // light grey
+    }
+    uint32_t pal[4] = {0, amiga4_to_argb(c1), amiga4_to_argb(c2), amiga4_to_argb(c3)};
     uint32_t p = sprpt;
     for (int safety = 0; safety < 64; safety++) {
         uint16_t pos = chip_word(top, p);
@@ -258,21 +268,18 @@ static void k13_render_sprite(Vm68k_top* top, uint32_t sprpt,
 }
 
 // Render K1.3's current chipram state into the pixel buffer.  Pixel layout
-// is ARGB8888.  buf must have w*h pixels.  Returns true if a recognisable
-// Copper list was found (so callers can fall back to a blank fill otherwise).
-static bool render_k13_chipram(Vm68k_top* top, uint32_t cop1lc,
+// is ARGB8888.  buf must have w*h pixels.
+static void render_k13_chipram(Vm68k_top* top, uint32_t cop1lc,
                                uint32_t* buf, int w, int h) {
     uint16_t regs[256] = {0};
     k13_walk_copper(top, cop1lc, regs);
-    // Background = COLOR00.
-    uint32_t bg = amiga4_to_argb(regs[0x180 >> 1]);
-    // If COLOR00 register was never touched the regs[] entry is 0 -> black.
-    // K1.3 typically sets $0AAF (the Workbench-blue background).  If still 0,
-    // there's no Copper list to render; signal the caller.
-    if (regs[0x180 >> 1] == 0 && regs[0x182 >> 1] == 0 &&
-        regs[0x100 >> 1] == 0 && regs[0x120 >> 1] == 0) {
-        return false;
-    }
+    // Background = COLOR00.  K1.3's boot Copper list doesn't set COLOR00
+    // explicitly (Intuition would, post-OpenScreen); for the boot prompt
+    // state we hard-fill with the canonical Workbench light blue so the
+    // user sees the cursor sprite over the expected background.
+    uint16_t c00 = regs[0x180 >> 1];
+    if (c00 == 0) c00 = 0x0AAF;  // light blue Workbench background
+    uint32_t bg = amiga4_to_argb(c00);
     for (int i = 0; i < w * h; i++) buf[i] = bg;
     // Render sprites 0..7.
     for (int idx = 0; idx < 8; idx++) {
@@ -281,7 +288,6 @@ static bool render_k13_chipram(Vm68k_top* top, uint32_t cop1lc,
         sprpt &= 0xFFFFFu;
         if (sprpt) k13_render_sprite(top, sprpt, regs, buf, w, h, idx);
     }
-    return true;
 }
 #endif  // HAVE_SDL2
 
@@ -586,11 +592,7 @@ static int run_graphics(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
 
         // K1.3 mode: walk the Copper list each frame; skip chunky-FB sampling.
         if (k13_cop1lc) {
-            if (!render_k13_chipram(top, k13_cop1lc, pixel_buf, FB_W, FB_H)) {
-                // No Copper list set up yet — fill black so the user sees
-                // something while Kickstart finishes booting.
-                for (int i = 0; i < FB_W * FB_H; i++) pixel_buf[i] = 0xFF000000u;
-            }
+            render_k13_chipram(top, k13_cop1lc, pixel_buf, FB_W, FB_H);
             top->fb_peek_addr = 0;
             top->eval();
             SDL_UpdateTexture(tex, nullptr, pixel_buf, FB_W * 4);

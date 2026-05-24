@@ -908,6 +908,7 @@ module m68k_core #(
     // $display fires once per fresh STOP rather than every clock cycle
     // the CPU sits halted at the same STOP PC.
     reg [31:0] stop_logged_pc;
+    reg        dos_init_seen;
     // Edge tracker for [USPTINY]: prevents re-firing while user-mode A7
     // sits below $200 (e.g. a Forbid/Permit nested loop that keeps SP small).
     reg        user_a7_was_tiny;
@@ -2823,6 +2824,7 @@ module m68k_core #(
             retired <= 32'd0;
             stop_logged_pc <= 32'hFFFF_FFFF;
             user_a7_was_tiny <= 1'b0;
+            dos_init_seen <= 1'b0;
         end else begin
             // Count instructions that complete each cycle. STOP doesn't count.
             if (is_settled && ex_kind != K_STOP) retired <= retired + 32'd1;
@@ -2896,6 +2898,44 @@ module m68k_core #(
                 $display("[STRAP] r=%d magic check PASSED -- proceed with checksum/JSR", retired);
             if (is_settled && ex_pc == 32'h00fe_8600)
                 $display("[STRAP] r=%d ERROR path entered (read failed or magic mismatch) D0=%h", retired, u_rf.regs[0]);
+            // Trace OpenLibrary's strlen loop ($FC52B4 / $FC52BA): see what
+            // string pointer it was handed.  K1.3's strlen reads from A0.
+            // For WB1.3 bootblock the expected ptr is the "dos.library"
+            // string inside the bootblock buffer (~$55FE).
+            if (is_settled && ex_pc == 32'h00fc_52b4)
+                $display("[STRLEN] r=%d ENTER A0=%h A1=%h D0=%h",
+                    retired, u_rf.regs[8], u_rf.regs[9], u_rf.regs[0]);
+            if (is_settled && ex_pc == 32'h00fc_52c4)
+                $display("[STRLEN] r=%d EXIT D0=%h", retired, u_rf.regs[0]);
+            // strap.task post-bootblock dispatch ($FE85CA = TST.L D0 after
+            // bootblock RTS).  Bootblock returns D0=0 for success (A0 =
+            // dos.library Resident's rt_Init pointer).  $FE85F0 = success
+            // path (JSR $FE8C9C).  $FE85F8 = post-JSR continuation.
+            if (is_settled && ex_pc == 32'h00fe_85ca)
+                $display("[STRAP] r=%d post-JSR bootblock returned D0=%h A0=%h",
+                    retired, u_rf.regs[0], u_rf.regs[8]);
+            if (is_settled && ex_pc == 32'h00fe_85f0)
+                $display("[STRAP] r=%d success branch entered A0=%h",
+                    retired, u_rf.regs[8]);
+            if (is_settled && ex_pc == 32'h00fe_8c9c)
+                $display("[STRAP] r=%d JSR \\$FE8C9C entered A0=%h", retired, u_rf.regs[8]);
+            if (is_settled && ex_pc == 32'h00fe_85f8)
+                $display("[STRAP] r=%d post-JSR-FE8C9C continuation D0=%h A0=%h",
+                    retired, u_rf.regs[0], u_rf.regs[8]);
+            // strap.task's final JMP into dos.library's rt_Init (post-cleanup).
+            // $FE86EC = JMP (A0).  A0 carries the rt_Init from the bootblock.
+            if (is_settled && ex_pc == 32'h00fe_86ec)
+                $display("[STRAP] r=%d JMP into dos.library rt_Init A0=%h",
+                    retired, u_rf.regs[8]);
+            // Reached dos.library rt_Init code at \$FF3E94 (or whatever
+            // rt_Init the bootblock surfaced).  Catch any execution in the
+            // ROM Resident's init region.
+            if (is_settled && ex_pc >= 32'h00ff_3e62 &&
+                ex_pc <= 32'h00ff_3fff && !dos_init_seen) begin
+                $display("[DOSINIT] r=%d ENTER pc=%h A0=%h D0=%h",
+                    retired, ex_pc, u_rf.regs[8], u_rf.regs[0]);
+                dos_init_seen <= 1'b1;
+            end
             // BadSecID branches: 3 checks after MFM data decode (format
             // byte, track byte, sector byte).  Trace each check + the
             // post-MFM-combine info to see which sector test fails.
