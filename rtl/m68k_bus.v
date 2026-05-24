@@ -1275,6 +1275,9 @@ module m68k_bus #(
                     if (blk_cur_dst >= 32'h0000_64A8 && blk_cur_dst <= 32'h0000_64E7)
                         $display("[HDRCHK_WR] cyc=%0d DMA dst=%h off=%h data=%h",
                             cyc_count, blk_cur_dst, blk_cur_off, disk[blk_cur_off[DISK_IDX_BITS+1:2]]);
+                    if (blk_cur_dst >= 32'h0000_68E0 && blk_cur_dst <= 32'h0000_68FB)
+                        $display("[SEC1_WR] cyc=%0d DMA dst=%h off=%h data=%h",
+                            cyc_count, blk_cur_dst, blk_cur_off, disk[blk_cur_off[DISK_IDX_BITS+1:2]]);
 `endif
                     blk_cur_off <= blk_cur_off + 32'd4;
                     blk_cur_dst <= blk_cur_dst + 32'd4;
@@ -1574,6 +1577,10 @@ module m68k_bus #(
                 // clobbers the buffer between trackdisk validation passes.
                 if (addr[winner] >= 32'h0000_64A8 && addr[winner] <= 32'h0000_64E7) begin
                     $display("[HDRCHK_WR] cyc=%0d port=%0d addr=%h be=%b wdata=%h blk_busy=%b",
+                        cyc_count, winner, addr[winner], be[winner], wdata[winner], blk_busy);
+                end
+                if (addr[winner] >= 32'h0000_68E0 && addr[winner] <= 32'h0000_68FB) begin
+                    $display("[SEC1_WR] cyc=%0d port=%0d addr=%h be=%b wdata=%h blk_busy=%b",
                         cyc_count, winner, addr[winner], be[winner], wdata[winner], blk_busy);
                 end
                 // Watch writes to local-var slots $5DC8/$5DCC where the
@@ -1927,4 +1934,11 @@ module m68k_bus #(
             snoop_src_id = granted_port_q;
         end
     end
+`ifdef HDRCHK_WATCH
+    always @(posedge clk) begin
+        if (snoop_valid && snoop_addr >= 32'h0000_68E0 && snoop_addr <= 32'h0000_68FB)
+            $display("[SNOOP_SEC1] cyc=%0d snoop_addr=%h src_id=%0d",
+                cyc_count, snoop_addr, snoop_src_id);
+    end
+`endif
 endmodule

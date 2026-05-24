@@ -2905,8 +2905,16 @@ module m68k_core #(
             // Preamble check: $FEAD9A reads buffer for MFM gap pattern.
             if (is_settled && ex_pc == 32'h00fe_ad9a)
                 $display("[PREAMBLE] r=%d preamble check A2=%h D4=%h (read \$00(A2,D4) for \$AAAA pattern)", retired, u_rf.regs[10], u_rf.regs[4]);
+            // Trace CPU read result for the CMPI.L access to (A2,D4).
+            // Widen range to catch any nearby reads.
+            if (dc_req_r && dc_ack &&
+                dc_addr >= 32'h0000_68E0 && dc_addr <= 32'h0000_68FB)
+                $display("[CPU_RD] r=%d pc=%h we=%b addr=%h dc_rdata=%h", retired, ex_pc, dc_we, dc_addr, dc_rdata);
             if (is_settled && ex_pc == 32'h00fe_adac)
-                $display("[PREAMBLE] r=%d after \$AAAAAAAA check -- if BNE -> BadSecPreamble", retired);
+                $display("[PREAMBLE] r=%d after \$AAAAAAAA check (dc_rdata=%h) -- if BNE -> BadSecPreamble", retired, dc_rdata);
+            // Trace EVERY CMPI.L at \$FEAD9A and \$FEADA4 with the read value.
+            if (is_settled && (ex_pc == 32'h00fe_ada2 || ex_pc == 32'h00fe_adac))
+                $display("[PREAMBLE_RD] r=%d pc=%h dc_addr=%h dc_rdata=%h", retired, ex_pc, dc_addr, dc_rdata);
             if (is_settled && ex_pc == 32'h00fe_adb0)
                 $display("[PREAMBLE] r=%d preamble OK -- checking sync next", retired);
             if (is_settled && ex_pc == 32'h00fe_ae70)

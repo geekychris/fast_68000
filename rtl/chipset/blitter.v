@@ -527,6 +527,9 @@ module blitter (
                             if (bltdpt >= 32'h0000_64B0 && bltdpt <= 32'h0000_64BB)
                                 $display("[BLT_WR] bltdpt=%h bltbpt=%h bltcon=%h final_w=%h b_cur=%h cur_word=%0d cur_row=%0d width=%0d",
                                     bltdpt, bltbpt, bltcon, final_w, b_cur_word_q, cur_word, cur_row, blt_width);
+                            if (bltdpt >= 32'h0000_68E0 && bltdpt <= 32'h0000_68FB)
+                                $display("[BLT_SEC1_WR] bltdpt=%h bltbpt=%h final_w=%h b_cur=%h cur_word=%0d cur_row=%0d",
+                                    bltdpt, bltbpt, final_w, b_cur_word_q, cur_word, cur_row);
 `endif
                             mst_req_r <= 1'b0;
                             // Latch previous-word state for next iteration's shift.
@@ -589,6 +592,9 @@ module blitter (
                 S_DONE: begin
                     blt_busy <= 1'b0;
                     int_o    <= 1'b1;        // one-cycle pulse
+`ifdef HDRCHK_WATCH
+                    $display("[BLT_DONE] bltcon=%h", bltcon);
+`endif
                     state    <= S_IDLE;
                 end
 
