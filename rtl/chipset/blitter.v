@@ -87,6 +87,12 @@ module blitter (
     // Live busy flag for the Copper (or any other consumer) to sample.
     output wire        busy_o,
 
+    // Live BZERO flag: 1 = no non-zero D-word written by the current /
+    // most recent blit.  Cleared as soon as a non-zero word is committed,
+    // and reset to 1 at every BLTSIZE write.  Real Amiga reflects this in
+    // DMACONR bit 13.
+    output wire        bzero_o,
+
     // One-cycle pulse on blit completion (rising edge of !busy_o).
     output reg         int_o
 );
@@ -112,6 +118,7 @@ module blitter (
     reg        blt_busy;
     reg        blt_bzero;       // tracks "no non-zero D-word written yet"
     assign busy_o = blt_busy;
+    assign bzero_o = blt_bzero;
 
     // Decoded BLTCON fields.
     wire [7:0]  lf       = bltcon[31:24];
@@ -377,7 +384,14 @@ module blitter (
                     4'h3: bltapt       <= slv_wdata;
                     4'h4: bltbpt       <= slv_wdata;
                     4'h5: bltcpt       <= slv_wdata;
-                    4'h6: bltdpt       <= slv_wdata;
+                    4'h6: begin
+`ifdef HDRCHK_WATCH
+                        if (blt_busy)
+                            $display("[BLT_REG_WR] BLTDPT mid-blit! old=%h new=%h cur_word=%0d cur_row=%0d",
+                                bltdpt, slv_wdata, cur_word, cur_row);
+`endif
+                        bltdpt       <= slv_wdata;
+                    end
                     4'h7: bltamod      <= slv_wdata;
                     4'h8: bltbmod      <= slv_wdata;
                     4'h9: bltcmod      <= slv_wdata;
@@ -511,7 +525,8 @@ module blitter (
 `endif
 `ifdef HDRCHK_WATCH
                             if (bltdpt >= 32'h0000_64B0 && bltdpt <= 32'h0000_64BB)
-                                $display("[BLT_WR] bltdpt=%h final_w=%h b_cur=%h cur_word=%0d", bltdpt, final_w, b_cur_word_q, cur_word);
+                                $display("[BLT_WR] bltdpt=%h bltbpt=%h bltcon=%h final_w=%h b_cur=%h cur_word=%0d cur_row=%0d width=%0d",
+                                    bltdpt, bltbpt, bltcon, final_w, b_cur_word_q, cur_word, cur_row, blt_width);
 `endif
                             mst_req_r <= 1'b0;
                             // Latch previous-word state for next iteration's shift.

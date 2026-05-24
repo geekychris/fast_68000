@@ -119,6 +119,7 @@ module m68k_top #(
 
     // Blitter busy signal exposed to the Copper (for WAIT).
     wire        blt_busy;
+    wire        blt_bzero;
     // One-cycle pulse on each blit completion.  Not currently routed
     // into an interrupt controller, but exposed so test/demo code or a
     // future Paula-style int controller can observe it.
@@ -158,6 +159,8 @@ module m68k_top #(
         .blt_slv_be  (blt_slv_be),
         .blt_slv_wdata(blt_slv_wdata),
         .blt_slv_rdata(blt_slv_rdata),
+        .blt_busy_i  (blt_busy),
+        .blt_bzero_i (blt_bzero),
         .cop_slv_req (cop_slv_req),
         .cop_slv_we  (cop_slv_we),
         .cop_slv_addr(cop_slv_addr),
@@ -336,6 +339,7 @@ module m68k_top #(
         .mst_ack      (blt_mst_ack),
         .mst_rdata    (blt_mst_rdata),
         .busy_o       (blt_busy),
+        .bzero_o      (blt_bzero),
         .int_o        (blt_int)
     );
 

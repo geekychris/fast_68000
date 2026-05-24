@@ -80,6 +80,11 @@ module m68k_bus #(
     output reg  [31:0]                    blt_slv_wdata,
     input  wire [31:0]                    blt_slv_rdata,
 
+    // Blitter live busy/bzero status.  Real Amiga reflects these in
+    // DMACONR (bit 14 = BBUSY, bit 13 = BZERO).  Used by K1.3 WAITBLIT.
+    input  wire                           blt_busy_i,
+    input  wire                           blt_bzero_i,
+
     // Copper slave interface ($00FE_0040..$00FE_007F).
     output reg                            cop_slv_req,
     output reg                            cop_slv_we,
@@ -1795,7 +1800,15 @@ module m68k_bus #(
                                    // byte only); the loop comparing against
                                    // 256 never exited.
                                    ? {15'd0, agnus_v[8]}           // VPOSR  $DFF004 (addr[1]=0)
-                                   : dmacon;                       // DMACONR $DFF002 (addr[1]=1)
+                                   // DMACONR $DFF002 (addr[1]=1).  Real Amiga
+                                   // semantics: bit 14 = BBUSY (live blitter
+                                   // busy status), bit 13 = BZERO, bits 9..0
+                                   // copy DMACON.  CPU's WAITBLIT polls
+                                   // BBUSY, so we must overlay it on bit 14
+                                   // rather than returning the written
+                                   // BLTPRI value.  Bit 13 = BZERO (set when
+                                   // last blit wrote no non-zero D-words).
+                                   : {dmacon[15], blt_busy_i, blt_bzero_i, dmacon[12:0]};
     // 32-bit accesses at $DFF004 read VPOSR (high word) + VHPOSR (low word)
     // as a single longword.  Kickstart's vbeam wait loop at $F88F7C does
     // `MOVE.L $DFF004, D0 ; ASR.L #8, D0 ; AND.L #$7FF, D0` and needs the
