@@ -131,6 +131,22 @@ module m68k_top #(
     // instantiation that follows.
     wire [7:0]  disk_track_idx;
 
+    // Bitplane shadow + auto-active wires from the bus into Denise.
+    // m68k_bus snoops canonical BPLnPT and BPL1/2MOD chipset writes and
+    // exposes them here for Denise's auto-rasterisation on VBL.
+    wire [31:0] bus_bpl_pt0;
+    wire [31:0] bus_bpl_pt1;
+    wire [31:0] bus_bpl_pt2;
+    wire [31:0] bus_bpl_pt3;
+    wire [31:0] bus_bpl_pt4;
+    wire [31:0] bus_bpl_pt5;
+    wire [15:0] bus_bpl_mod1;
+    wire [15:0] bus_bpl_mod2;
+    wire        bus_den_auto_active;
+    wire [6*32-1:0] den_auto_bpl_pt_flat = {bus_bpl_pt5, bus_bpl_pt4,
+                                            bus_bpl_pt3, bus_bpl_pt2,
+                                            bus_bpl_pt1, bus_bpl_pt0};
+
     m68k_bus #(
         .N_PORTS        (N_PORTS),
         .MEM_WORDS      (MEM_WORDS),
@@ -202,7 +218,16 @@ module m68k_top #(
         .dskblk_pulse_o (dskblk_pulse),
         .dsksyn_pulse_o (dsksyn_pulse),
         .ovl_clear_pulse_o (ovl_clear_pulse),
-        .disk_track_i   (disk_track_idx)
+        .disk_track_i   (disk_track_idx),
+        .bpl_pt0_o      (bus_bpl_pt0),
+        .bpl_pt1_o      (bus_bpl_pt1),
+        .bpl_pt2_o      (bus_bpl_pt2),
+        .bpl_pt3_o      (bus_bpl_pt3),
+        .bpl_pt4_o      (bus_bpl_pt4),
+        .bpl_pt5_o      (bus_bpl_pt5),
+        .bpl_mod1_o     (bus_bpl_mod1),
+        .bpl_mod2_o     (bus_bpl_mod2),
+        .den_auto_active_o (bus_den_auto_active)
     );
 
     // CIA-A and CIA-B.  Tick every bus cycle for now (10x real Amiga rate)
@@ -453,7 +478,12 @@ module m68k_top #(
         .mst_be     (den_mst_be),
         .mst_ack    (den_mst_ack),
         .mst_rdata  (den_mst_rdata),
-        .vbeam_o    (vbeam)
+        .vbeam_o    (vbeam),
+        .auto_kick_i    (vblank_pulse),
+        .auto_active_i  (bus_den_auto_active),
+        .auto_bpl_pt_flat_i(den_auto_bpl_pt_flat),
+        .auto_bpl_mod1_i(bus_bpl_mod1),
+        .auto_bpl_mod2_i(bus_bpl_mod2)
     );
 
     assign p_req  [DEN_PORT]                  = den_mst_req;

@@ -146,6 +146,21 @@ module m68k_bus #(
     // INTREQ bit 5, IPL 3) fires once per frame.
     output wire                           vblank_pulse_o,
     output wire                           dskblk_pulse_o,
+    // Bitplane DMA shadow outputs for Denise auto-rasterisation.
+    // BPLnPT pointers come from the chipset shadow chip_regs[$E0..$F6],
+    // BPL1MOD/BPL2MOD are snooped directly off canonical writes to
+    // $DFF108 / $DFF10A (Denise's slave dropped those silently).  Denise
+    // uses these as the source for `row_bpl_pt` and `bpl_mod` when it
+    // auto-kicks on `vblank_pulse_o`.
+    output wire [31:0]                    bpl_pt0_o,
+    output wire [31:0]                    bpl_pt1_o,
+    output wire [31:0]                    bpl_pt2_o,
+    output wire [31:0]                    bpl_pt3_o,
+    output wire [31:0]                    bpl_pt4_o,
+    output wire [31:0]                    bpl_pt5_o,
+    output wire [15:0]                    bpl_mod1_o,
+    output wire [15:0]                    bpl_mod2_o,
+    output wire                           den_auto_active_o,
     // One-cycle pulse fired at the start of every disk DMA read.  Our DMA
     // is "minimig-style" memcpy and skips the real bit-stream PLL/sync
     // search; this pulse stands in for the DSKSYN event Paula would raise
@@ -575,10 +590,28 @@ module m68k_bus #(
     reg [9:0]  bpl_fetch_tick;
     reg [2:0]  bpl_plane_idx;         // which plane to fetch next (0..5)
     reg [15:0] bplcon0_shadow;        // snooped from writes to $DFF100
+    // BPLnMOD shadows.  Real Denise puts BPLnMOD inside its own register
+    // file but our slave's offset layout differs from canonical Agnus
+    // ($108/$10A); canonical writes get routed to den_slv where they
+    // map to BPLCON2 / unused slots and are dropped.  Mirror them here
+    // so the auto-rasterise path picks up the user's modulo intent.
+    reg [15:0] bpl1mod_shadow;        // snooped from writes to $DFF108
+    reg [15:0] bpl2mod_shadow;        // snooped from writes to $DFF10A
     reg        bpl_was_active;        // last cycle's (BPLEN & DMAEN & BPU>0)
     reg [9:0]  agnus_v_prev;
     wire [2:0] bpu = bplcon0_shadow[14:12];
     wire       bpl_active_now = dmacon[8] && dmacon[9] && (bpu != 3'd0);
+
+    // Bitplane shadow outputs to Denise.
+    assign bpl_pt0_o = {chip_regs[9'h0E0], chip_regs[9'h0E2]};
+    assign bpl_pt1_o = {chip_regs[9'h0E4], chip_regs[9'h0E6]};
+    assign bpl_pt2_o = {chip_regs[9'h0E8], chip_regs[9'h0EA]};
+    assign bpl_pt3_o = {chip_regs[9'h0EC], chip_regs[9'h0EE]};
+    assign bpl_pt4_o = {chip_regs[9'h0F0], chip_regs[9'h0F2]};
+    assign bpl_pt5_o = {chip_regs[9'h0F4], chip_regs[9'h0F6]};
+    assign bpl_mod1_o = bpl1mod_shadow;
+    assign bpl_mod2_o = bpl2mod_shadow;
+    assign den_auto_active_o = bpl_active_now;
 
     // Unflatten inputs.
     wire [31:0] addr  [0:N_PORTS-1];
@@ -1153,6 +1186,8 @@ module m68k_bus #(
             bpl_fetch_tick  <= 10'd0;
             bpl_plane_idx   <= 3'd0;
             bplcon0_shadow  <= 16'd0;
+            bpl1mod_shadow  <= 16'd0;
+            bpl2mod_shadow  <= 16'd0;
             bpl_was_active  <= 1'b0;
             agnus_v_prev    <= 10'd0;
             canon_bltcon0   <= 16'd0;
@@ -1218,6 +1253,23 @@ module m68k_bus #(
                     bplcon0_shadow <= wdata[winner][31:16];
                 else
                     bplcon0_shadow <= wdata[winner][15:0];
+            end
+            // Snoop BPL1MOD ($DFF108, addr[1]==0 -> high half) and
+            // BPL2MOD ($DFF10A, addr[1]==1 -> low half).  Both live in
+            // the same aligned long word at $DFF108.  Long-aligned 32-bit
+            // writes pack BPL1MOD into [31:16] and BPL2MOD into [15:0].
+            if (winner_valid && we[winner] && (addr[winner] == 32'h00DF_F108)) begin
+                if (be[winner][3] | be[winner][2])
+                    bpl1mod_shadow <= wdata[winner][31:16];
+                if (be[winner][1] | be[winner][0])
+                    bpl2mod_shadow <= wdata[winner][15:0];
+            end else if (winner_valid && we[winner] && (addr[winner] == 32'h00DF_F10A)) begin
+                // 16-bit-only write to BPL2MOD; the bus presents it in
+                // the low half of the long word.
+                if (be[winner][1] | be[winner][0])
+                    bpl2mod_shadow <= wdata[winner][15:0];
+                else if (be[winner][3] | be[winner][2])
+                    bpl2mod_shadow <= wdata[winner][31:16];
             end
             // ----- Canonical Blitter/Copper shadow updates ------------
             // The slave-port mux already composed the new 32-bit value

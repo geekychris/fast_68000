@@ -81,7 +81,26 @@ module denise #(
     // Live raster position (the row currently being rasterised).  Held
     // at its last value when idle.  Exported so the Copper can wait on
     // a specific scanline via WAIT-RASTER.
-    output wire [15:0] vbeam_o
+    output wire [15:0] vbeam_o,
+
+    // ---------------- Auto-rasterise port ---------------------------
+    // When `auto_active_i` is high and `auto_kick_i` pulses (typically
+    // VBL), Denise starts a frame render *as if* DENRUN had been
+    // written: row_bpl_pt is loaded from `auto_bpl_pt_i` (chip_regs
+    // shadow of canonical BPLnPT) instead of the slave-port `bpl_pt`,
+    // and `bpl_mod[0/1]` is replaced by the auto BPLnMOD inputs.
+    //
+    // The legacy "write 1 to DENRUN" trigger (slv_addr $40) still
+    // works unconditionally, so the demos and t-suite that drive
+    // Denise via $FE0140 keep their pre-existing behaviour.  When a
+    // legacy trigger arrives during an auto-render the auto kick is
+    // simply ignored (gated on !den_busy).
+    input  wire        auto_kick_i,
+    input  wire        auto_active_i,
+    // Six 32-bit BPLnPT shadows packed { pt5, pt4, pt3, pt2, pt1, pt0 }.
+    input  wire [6*32-1:0] auto_bpl_pt_flat_i,
+    input  wire [15:0] auto_bpl_mod1_i,    // BPL1MOD (odd planes)
+    input  wire [15:0] auto_bpl_mod2_i     // BPL2MOD (even planes)
 );
     // ---------------- Registers programmed by the CPU ----------------
     reg [31:0] bplcon0;
@@ -141,6 +160,12 @@ module denise #(
     // ---------------- mst_req gating --------------------------------
     reg mst_req_r;
     assign mst_req = mst_req_r && !mst_ack;
+
+    // ---------------- Auto-kick edge detector -----------------------
+    // `auto_kick_i` is expected to be a one-cycle pulse from Agnus's
+    // VBL, but we tolerate longer-held strobes by edge-detecting.
+    reg auto_kick_d;
+    wire auto_kick_pulse = auto_kick_i && !auto_kick_d;
 
     // ---------------- Slave reads -----------------------------------
     integer rk;
@@ -428,7 +453,11 @@ module denise #(
             mst_addr <= 32'd0;
             mst_wdata <= 32'd0;
             mst_be <= 4'b0000;
+            auto_kick_d <= 1'b0;
         end else begin
+            // Track auto_kick_i for edge detection.
+            auto_kick_d <= auto_kick_i;
+
             // -------- Slave writes --------
             if (slv_req && slv_we) begin
                 if (slv_addr[8]) begin
@@ -504,6 +533,43 @@ module denise #(
                             colors[{1'b0, slv_addr[6:2]}] <= slv_wdata;
                     end
                 endcase
+            end
+
+            // -------- Auto-trigger from VBL when BPLEN active --------
+            // Mirrors the legacy DENRUN write path but pulls BPL pointers
+            // from the canonical chipset shadow (auto_bpl_pt_i) and
+            // BPLnMOD from auto_bpl_mod{1,2}_i.  Only fires when the
+            // engine is idle, and never on the same cycle a slave DENRUN
+            // write arrives, so it can't race the legacy demos.
+            if (auto_kick_pulse && auto_active_i && !den_busy &&
+                !(slv_req && slv_we && !slv_addr[8] && (slv_addr[7:0] == 8'h40))) begin
+                den_busy <= 1'b1;
+                state    <= S_ROW_INIT;
+                row_idx  <= 16'd0;
+                row_bpl_pt[0] <= auto_bpl_pt_flat_i[ 0 +: 32];
+                row_bpl_pt[1] <= auto_bpl_pt_flat_i[32 +: 32];
+                row_bpl_pt[2] <= auto_bpl_pt_flat_i[64 +: 32];
+                row_bpl_pt[3] <= auto_bpl_pt_flat_i[96 +: 32];
+                row_bpl_pt[4] <= auto_bpl_pt_flat_i[128 +: 32];
+                row_bpl_pt[5] <= auto_bpl_pt_flat_i[160 +: 32];
+                row_bpl_pt[6] <= 32'd0;
+                row_bpl_pt[7] <= 32'd0;
+                // Replace per-frame modulos with the shadowed canonical
+                // values.  Sign-extend the 16-bit BPLnMOD to 32 bits so
+                // negative modulos (Amiga uses 2's complement here for
+                // scroll/dual-buffer) accumulate correctly.
+                bpl_mod[0] <= {{16{auto_bpl_mod1_i[15]}}, auto_bpl_mod1_i};
+                bpl_mod[1] <= {{16{auto_bpl_mod2_i[15]}}, auto_bpl_mod2_i};
+                // Initialise sprite running pointers (same as DENRUN).
+                spr_row_pt[0] <= spr_pt[0];
+                spr_row_pt[1] <= spr_pt[1];
+                spr_row_pt[2] <= spr_pt[2];
+                spr_row_pt[3] <= spr_pt[3];
+                spr_row_pt[4] <= spr_pt[4];
+                spr_row_pt[5] <= spr_pt[5];
+                spr_row_pt[6] <= spr_pt[6];
+                spr_row_pt[7] <= spr_pt[7];
+                fb_write_ptr  <= FB_BASE;
             end
 
             // -------- State machine --------
