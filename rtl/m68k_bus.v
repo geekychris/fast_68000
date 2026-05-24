@@ -155,7 +155,12 @@ module m68k_bus #(
     // One-cycle pulse on OVL 1 -> 0 transition.  Wired to every cache's
     // inval_all input so cached pre-OVL ROM-overlay reads at $00000-$7FFFF
     // are invalidated when low memory switches to RAM.
-    output wire                           ovl_clear_pulse_o
+    output wire                           ovl_clear_pulse_o,
+    // Current floppy ADF track index (cyl*2 + side), 0..159.  Used to
+    // offset the MFM-DMA read source within disk[].  Driven by the step-
+    // pulse-tracking block in m68k_top.v; defaults to 0 so test benches
+    // that don't wire this in still get track 0 (the legacy behaviour).
+    input  wire [7:0]                     disk_track_i
 );
 `ifdef KICKSTART_BOOT
     // Under Kickstart the address-bus mask in `unflat` drops bits 24..31,
@@ -1366,9 +1371,9 @@ module m68k_bus #(
                     end
                 end else if (addr[winner] == DSKLEN_ADDR) begin
 `ifdef KICKSTART_BOOT_TRACE
-                    $display("[DSKLEN] addr=%h be=%b is_long=%b wdata=%h dsk_pt=%h blk_busy=%b",
+                    $display("[DSKLEN] addr=%h be=%b is_long=%b wdata=%h dsk_pt=%h blk_busy=%b track=%0d",
                         addr[winner], be[winner], is_long[winner],
-                        wdata[winner], dsk_pt, blk_busy);
+                        wdata[winner], dsk_pt, blk_busy, disk_track_i);
 `endif
                     // DSKLEN is at the high half of its longword (addr[1]=0).
                     // K1.3 trackdisk's "arm" sequence writes DSKLEN twice
@@ -1383,11 +1388,17 @@ module m68k_bus #(
                         // Aligned MOVE.L Dn, $DFF024 -- DSKLEN in high half
                         // (wdata[31:16]), $DFF026 (DSKDAT) in low half.
                         // Trigger DMA on DMAEN bit set in DSKLEN value.
+                        // disk[] is laid out by adf2mfm.py as concatenated
+                        // MFM tracks, 11984 bytes each (= 11 sectors * 1088
+                        // + 16 inter-track gap).  Offset by the current head
+                        // position so dos.library actually gets the track it
+                        // asked for instead of always seeing track 0.
                         dsk_len <= wdata[winner][31:16];
                         if (wdata[winner][31] && !blk_busy) begin
                             blk_busy    <= 1'b1;
                             blk_byte_mode <= 1'b1;
-                            blk_cur_off <= adkcon_wordsync ? 32'd2 : 32'd0;
+                            blk_cur_off <= (adkcon_wordsync ? 32'd2 : 32'd0)
+                                         + (32'd11984 * disk_track_i);
                             blk_cur_dst <= dsk_pt;
                             blk_dst     <= dsk_pt;
                             blk_count_in_bytes <= {17'd0, wdata[winner][29:16]} << 1;
@@ -1401,7 +1412,8 @@ module m68k_bus #(
                         if (wdata[winner][31] && !blk_busy) begin
                             blk_busy    <= 1'b1;
                             blk_byte_mode <= 1'b1;
-                            blk_cur_off <= adkcon_wordsync ? 32'd2 : 32'd0;
+                            blk_cur_off <= (adkcon_wordsync ? 32'd2 : 32'd0)
+                                         + (32'd11984 * disk_track_i);
                             blk_cur_dst <= dsk_pt;
                             blk_dst     <= dsk_pt;
                             blk_count_in_bytes <= {17'd0, wdata[winner][29:16]} << 1;
@@ -1415,7 +1427,8 @@ module m68k_bus #(
                         if (wdata[winner][15] && !blk_busy) begin
                             blk_busy    <= 1'b1;
                             blk_byte_mode <= 1'b1;
-                            blk_cur_off <= adkcon_wordsync ? 32'd2 : 32'd0;
+                            blk_cur_off <= (adkcon_wordsync ? 32'd2 : 32'd0)
+                                         + (32'd11984 * disk_track_i);
                             blk_cur_dst <= dsk_pt;
                             blk_dst     <= dsk_pt;
                             blk_count_in_bytes <= {17'd0, wdata[winner][13:0]} << 1;

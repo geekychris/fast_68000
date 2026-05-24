@@ -125,6 +125,12 @@ module m68k_top #(
     // future Paula-style int controller can observe it.
     wire        blt_int;
 
+    // Forward-declare floppy-drive state inputs to the bus.  These are
+    // driven by the CIA-B step-pulse-tracking block further down — putting
+    // the wire declarations here lets us use them in the m68k_bus
+    // instantiation that follows.
+    wire [7:0]  disk_track_idx;
+
     m68k_bus #(
         .N_PORTS        (N_PORTS),
         .MEM_WORDS      (MEM_WORDS),
@@ -195,7 +201,8 @@ module m68k_top #(
         .vblank_pulse_o (vblank_pulse),
         .dskblk_pulse_o (dskblk_pulse),
         .dsksyn_pulse_o (dsksyn_pulse),
-        .ovl_clear_pulse_o (ovl_clear_pulse)
+        .ovl_clear_pulse_o (ovl_clear_pulse),
+        .disk_track_i   (disk_track_idx)
     );
 
     // CIA-A and CIA-B.  Tick every bus cycle for now (10x real Amiga rate)
@@ -227,11 +234,12 @@ module m68k_top #(
         .kbd_wr   (cia_a_kbd_wr),
         .kbd_byte (cia_a_kbd_byte),
         // PRA input bit composition (active-low signals):
-        //   [7]=FIRE=1, [6]=SEL2=1, [5]=DSKRDY (motor-gated),
-        //   [4]=DSKTRACK0=0 (always at T0), [3]=DSKWRPRO=1,
+        //   [7]=FIRE=1, [6]=SEL2=1, [5]=DSKRDY (motor-gated, low when ready),
+        //   [4]=DSKTRACK0 (low when cur_cyl == 0),
+        //   [3]=DSKWRPRO=1 (write-protect inactive),
         //   [2]=DSKCHANGE (cleared after CIA-B drives a step),
         //   [1:0] driven by the CIA, not the peripheral.
-        .pa_in    ({2'b11, !fl_dskrdy_low, 1'b0, 1'b1,
+        .pa_in    ({2'b11, !fl_dskrdy_low, fl_track0_low, 1'b1,
                     dskchange_cleared, 2'b00}),
         .pb_in    (8'd0),
         .pa_out   (cia_a_pa_out),
@@ -285,22 +293,46 @@ module m68k_top #(
     reg pb0_step_prev;
     reg dskchange_cleared;
     reg [15:0] motor_on_counter;       // counts cycles since motor cmd on
+    reg [6:0]  cur_cyl;                // 0..79 (current physical cylinder)
+    reg        cur_side;               // 0 or 1 (head select, /SIDE from PB2)
     wire motor_on_now = !cia_b_pb_out[7];                  // /MOTOR active-low
     wire any_drive_selected = !(&cia_b_pb_out[6:3]);       // any /SEL low
     // After 16K cycles of motor-on with a drive selected, declare drive
     // ready.  Threshold picked small for sim throughput; real hw is ~0.5s.
     wire fl_dskrdy_low = (motor_on_counter >= 16'd16384);  // DSKRDY active-low
+    // /DSKTRACK0 is active-low: 0 when head is at cylinder 0, 1 otherwise.
+    wire fl_track0_low = (cur_cyl != 7'd0);
+    // ADF track index: cyl*2 + side.  0..159.  Floppy DMA in the bus uses
+    // this to fetch from the correct MFM-encoded track within disk[].
+    assign disk_track_idx = {1'b0, cur_cyl} + {1'b0, cur_cyl} + {7'd0, cur_side};
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             pb0_step_prev     <= 1'b1;
             dskchange_cleared <= 1'b0;
             motor_on_counter  <= 16'd0;
+            cur_cyl           <= 7'd0;
+            cur_side          <= 1'b0;
         end else begin
             pb0_step_prev <= cia_b_pb_out[0];
-            // /STEP rising edge with a drive selected = head step.
-            // Clear /DSKCHANGE on the first step we observe.
-            if (cia_b_pb_out[0] && !pb0_step_prev && any_drive_selected)
+            // /STEP rising edge with a drive selected = head step.  Real
+            // Amiga: /DIR (PB1) = 1 → step *in* toward higher cyl, 0 → step
+            // *out* toward cyl 0.  Take the step on the rising edge of /STEP
+            // (PB0 0→1), since trackdisk asserts /STEP low then high.
+            if (cia_b_pb_out[0] && !pb0_step_prev && any_drive_selected) begin
                 dskchange_cleared <= 1'b1;
+                if (cia_b_pb_out[1]) begin
+                    // /DIR = 1: step in (toward cyl 79).
+                    if (cur_cyl != 7'd79) cur_cyl <= cur_cyl + 7'd1;
+                end else begin
+                    // /DIR = 0: step out (toward cyl 0).
+                    if (cur_cyl != 7'd0) cur_cyl <= cur_cyl - 7'd1;
+                end
+            end
+            // /SIDE follows PB2 continuously, INVERTED.  The line is
+            // active-low: PB2=1 (default) selects head 0, PB2=0 selects
+            // head 1.  Wired uninverted, K1.3 trackdisk's default PRB
+            // wrote our bootblock read as track 1 instead of track 0.
+            cur_side <= !cia_b_pb_out[2];
             // Motor spin-up counter.
             if (motor_on_now && any_drive_selected) begin
                 if (motor_on_counter != 16'hFFFF)
