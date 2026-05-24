@@ -281,13 +281,15 @@ static void render_k13_chipram(Vm68k_top* top, uint32_t cop1lc,
     if (c00 == 0) c00 = 0x0AAF;  // light blue Workbench background
     uint32_t bg = amiga4_to_argb(c00);
     for (int i = 0; i < w * h; i++) buf[i] = bg;
-    // Render sprites 0..7.
-    for (int idx = 0; idx < 8; idx++) {
-        uint32_t sprpt = (uint32_t(regs[(0x120 + idx * 4) >> 1]) << 16) |
-                         uint32_t(regs[(0x122 + idx * 4) >> 1]);
-        sprpt &= 0xFFFFFu;
-        if (sprpt) k13_render_sprite(top, sprpt, regs, buf, w, h, idx);
-    }
+    // Only render sprite 0 (the boot mouse cursor).  Sprites 1..7 in
+    // K1.3's idle state all share the same dummy pointer at \$23C0, which
+    // is end-of-Copper-list data — interpreting it as sprite POS/CTL
+    // gives a bogus 36-row sprite at (0,0).  The Python reference tool
+    // (tools/render_k13_screen.py) likewise renders SPR0 only.
+    uint32_t sprpt = (uint32_t(regs[0x120 >> 1]) << 16) |
+                     uint32_t(regs[0x122 >> 1]);
+    sprpt &= 0xFFFFFu;
+    if (sprpt) k13_render_sprite(top, sprpt, regs, buf, w, h, 0);
 }
 #endif  // HAVE_SDL2
 
@@ -599,6 +601,28 @@ static int run_graphics(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
             SDL_RenderClear(ren);
             SDL_RenderCopy(ren, tex, nullptr, nullptr);
             SDL_RenderPresent(ren);
+            // Optional: dump the current ARGB framebuffer to PPM each Nth
+            // wall-frame so we can confirm via tooling what's on screen.
+            // FB_DUMP_PPM_LIVE=path enables the dump (every ~30 frames ~= 1s).
+            if (const char* path = std::getenv("FB_DUMP_PPM_LIVE")) {
+                static int frame_n = 0;
+                if (++frame_n >= 30) {
+                    frame_n = 0;
+                    std::FILE* f = std::fopen(path, "wb");
+                    if (f) {
+                        std::fprintf(f, "P6\n%d %d\n255\n", FB_W, FB_H);
+                        for (int i = 0; i < FB_W * FB_H; i++) {
+                            uint32_t p = pixel_buf[i];
+                            uint8_t out[3] = {
+                                (uint8_t)((p >> 16) & 0xFF),
+                                (uint8_t)((p >> 8)  & 0xFF),
+                                (uint8_t)( p        & 0xFF)};
+                            std::fwrite(out, 1, 3, f);
+                        }
+                        std::fclose(f);
+                    }
+                }
+            }
             continue;
         }
 
