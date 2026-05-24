@@ -2826,7 +2826,7 @@ module m68k_core #(
             // validation window.  Open r=2.0M..5.0M after the snoop fix
             // shifted retired counts.
             if (is_settled && ex_kind != K_STOP &&
-                retired >= 32'd2000000 && retired <= 32'd5000000 &&
+                retired >= 32'd2000000 && retired <= 32'd20000000 &&
                 ex_pc >= 32'h00fe_ac00 && ex_pc <= 32'h00fe_b000)
                 $display("[TRKPC] r=%d pc=%h kind=%d", retired, ex_pc, ex_kind);
             // Trace each CMP.L (A1)+,D1 in $FEABCC's pattern-search inner
@@ -2902,6 +2902,15 @@ module m68k_core #(
                 $display("[SECID] r=%d ALL checks passed (sector data accepted) D5=%h", retired, u_rf.regs[5]);
             if (is_settled && ex_pc == 32'h00fe_ae74)
                 $display("[SECID] r=%d BadSecID error -- one of format/track/sector checks failed", retired);
+            // Preamble check: $FEAD9A reads buffer for MFM gap pattern.
+            if (is_settled && ex_pc == 32'h00fe_ad9a)
+                $display("[PREAMBLE] r=%d preamble check A2=%h D4=%h (read \$00(A2,D4) for \$AAAA pattern)", retired, u_rf.regs[10], u_rf.regs[4]);
+            if (is_settled && ex_pc == 32'h00fe_adac)
+                $display("[PREAMBLE] r=%d after \$AAAAAAAA check -- if BNE -> BadSecPreamble", retired);
+            if (is_settled && ex_pc == 32'h00fe_adb0)
+                $display("[PREAMBLE] r=%d preamble OK -- checking sync next", retired);
+            if (is_settled && ex_pc == 32'h00fe_ae70)
+                $display("[PREAMBLE] r=%d BadSecPreamble error path entered", retired);
             // Trace CPU writes to the local-var slots $5DC8 / $5DCC where the
             // hdr_chk pair is staged before $FEAA0E.  Identifies any code
             // path that scribbles over the local between $FEACB6 and the
