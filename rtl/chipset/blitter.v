@@ -504,10 +504,17 @@ module blitter (
                     reg [16:0] filled;          // {new_fill_carry, filled_word}
                     reg [15:0] final_w;
 
+                    // When USEC=0, the C-channel DMA fetch is skipped and
+                    // S_RDC is never entered, so c_cur_word_q would carry a
+                    // stale value (or 0).  Real Amiga / minimig feed BLTCDAT
+                    // into the minterm generator as a constant in that case —
+                    // critical for LFs that consult C (e.g. LF=$D8 with
+                    // BLTCDAT bit-mask in trackdisk's MFM data decoder).
+                    // See tests/t139_blt_usec0_bltcdat.s.
                     combined_w = combine(lf,
                                          shift_a(a_prev_word, a_cur_word_q, ash, desc),
                                          shift_b(b_prev_word, b_cur_word_q, bsh, desc),
-                                         c_cur_word_q);
+                                         use_c ? c_cur_word_q : bltcdat_pre[15:0]);
                     filled  = apply_fill(combined_w, fill_carry, ife, efe, desc);
                     final_w = filled[15:0];
 
