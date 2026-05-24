@@ -316,16 +316,21 @@ crosscheck-fx68k: $(FX68K_BUILD)/Vfx68k_top
 crosscheck-all: crosscheck crosscheck-fx68k
 
 # OVL + ROM region test.  Builds a second simulator binary with OVL_RESET=1
-# and a tiny ROM hex pre-loaded into rom[], then runs tests/t61_ovl.s
-# against it.  Not part of the default `make test` because the OVL=1 reset
-# state would break tests that boot directly at PC=$400 with low-RAM reads.
+# and t61_ovl's program.hex loaded into BOTH RAM (via MEM_HEXFILE) and ROM
+# (merged with the test sentinels from rom_test.hex) — so that under
+# OVL=1, instruction fetches at the reset PC ($400) read the program from
+# ROM (the OVL window), while direct ROM-window reads at $F80000 still
+# return the $DEADBEEF/$CAFEBABE/$12345678 sentinels.  After CIA clears
+# OVL, low reads come from RAM (which holds the same program plus any
+# sentinels the program wrote).
 test-ovl:
 	@mkdir -p build_ovl
-	cp tests/rom_test.hex build_ovl/rom_test.hex
+	$(PYTHON) $(TB_DIR)/asm68k.py --mem-words 1024 tests/t61_ovl.s build_ovl/program.hex
+	$(PYTHON) $(TB_DIR)/merge_rom_program.py tests/rom_test.hex \
+	    build_ovl/program.hex build_ovl/rom_merged.hex
 	@$(MAKE) --no-print-directory build BUILD=build_ovl N_CORES=$(N_CORES) USE_CACHE=1 \
-	    MEM_WORDS=65536 ROM_WORDS=16 ROM_HEXFILE=rom_test.hex OVL_RESET=1 \
+	    MEM_WORDS=65536 ROM_WORDS=1024 ROM_HEXFILE=rom_merged.hex OVL_RESET=1 \
 	    >build_ovl/_build.log 2>&1
-	$(PYTHON) $(TB_DIR)/asm68k.py tests/t61_ovl.s build_ovl/program.hex
 	@(cd build_ovl && ./Vm68k_top 5000000) > build_ovl/t61_ovl.log 2>&1; \
 	rc=$$?; \
 	if [ $$rc -eq 0 ]; then echo "PASS t61_ovl"; \
