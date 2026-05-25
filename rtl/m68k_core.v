@@ -3070,16 +3070,6 @@ module m68k_core #(
                                ex_pc == 32'h00FC_0698))
                 $display("[STK-PC] r=%d pc=%h SP=%h",
                     retired, ex_pc, u_rf.regs[15]);
-            // [TIMER-PC]: per-instruction SP trace through timer.device.Init.
-            // Diagnostic for the CIA-timer-too-fast wall — keep only the
-            // function epilogue + the wait-sub's exit to confirm SP balance.
-            if (is_settled &&
-                (ex_pc == 32'h00FE_8DF4 || ex_pc == 32'h00FE_8F88 ||
-                 ex_pc == 32'h00FE_8F8C || ex_pc == 32'h00FE_8F34 ||
-                 ex_pc == 32'h00FE_8F3E || ex_pc == 32'h00FE_8FB4 ||
-                 ex_pc == 32'h00FE_8FB6))
-                $display("[TIMER-PC] r=%d pc=%h SP=%h kind=%d",
-                    retired, ex_pc, u_rf.regs[15], ex_kind);
             // Trace every Signal() entry to find who passes $80000000 as the
             // signal mask.  Signal is at $FC1E84.  Log A1 (task ptr) and D0 (mask).
             if (is_settled && ex_pc == 32'h00fc_1e84)
