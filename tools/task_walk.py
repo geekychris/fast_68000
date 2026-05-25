@@ -61,9 +61,14 @@ def dump_task(addr):
         pri -= 256
     name_ptr  = read_long(addr + 0x0A)
     state     = chip[addr + 0x0F] if addr + 0x0F < len(chip) else 0
-    sig_wait  = read_long(addr + 0x18)
-    sig_recvd = read_long(addr + 0x1C)
-    sig_alloc = read_long(addr + 0x14)
+    # struct Task offsets per <exec/tasks.h>:
+    #   $12 tc_SigAlloc (L)
+    #   $16 tc_SigWait  (L)
+    #   $1A tc_SigRecvd (L)
+    #   $1E tc_SigExcept(L)
+    sig_alloc = read_long(addr + 0x12)
+    sig_wait  = read_long(addr + 0x16)
+    sig_recvd = read_long(addr + 0x1A)
     name = read_string(name_ptr)
     print(f'  ${addr:08X} pri={pri:>4d} state={STATE_NAMES.get(state, "?"):<8} '
           f'sigWait=${sig_wait:08X} sigRecvd=${sig_recvd:08X} '

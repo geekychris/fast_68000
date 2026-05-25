@@ -3054,6 +3054,17 @@ module m68k_core #(
                 dc_addr >= 32'h0000_1800 && dc_addr <= 32'h0000_1960)
                 $display("[STKW] r=%d pc=%h kind=%d addr=%h be=%b wdata=%h",
                     retired, ex_pc, ex_kind, dc_addr, dc_be, dc_wdata);
+            // [KBD-SP] / [KBD-CMD9]: trace keyboard.device's SP IRQ handler
+            // and its cmd-9 (KBD_READMATRIX) handler.  Used to confirm whether
+            // the queued IO at chipram $4468 (input.device's READMATRIX
+            // request) ever gets processed when a kbd byte arrives.  See
+            // project_wb13_cli_wait.md.
+            if (is_settled && ex_pc == 32'h00FE_5278)
+                $display("[KBD-SP] r=%d entered SP handler",
+                    retired);
+            if (is_settled && ex_pc == 32'h00FE_5120)
+                $display("[KBD-CMD9] r=%d entered KBD_READMATRIX handler A1=%h",
+                    retired, u_rf.regs[9]);
             // Stack-balance probe at timer.device.Init's call to AddDevice.
             // Log SP at:
             //   $FE8F80 — just before JSR $FE50(A6) to AddDevice

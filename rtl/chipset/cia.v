@@ -194,6 +194,10 @@ module cia (
             if (kbd_wr) begin
                 sdr <= kbd_byte;
                 icr_pending[3] <= 1'b1;       // SP interrupt source
+`ifdef KICKSTART_BOOT_TRACE
+                $display("[CIA-KBD] kbd_wr=1 byte=%h icr_mask=%h icr_pending_before=%h",
+                    kbd_byte, icr_mask, icr_pending);
+`endif
             end
             // TOD increment.  Once any external VSYNC tick arrives we
             // switch to "external mode" permanently and ignore the
