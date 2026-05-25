@@ -278,6 +278,28 @@ module m68k_top #(
 
     // CIA-A and CIA-B.  Tick every bus cycle for now (10x real Amiga rate)
     // -- when we split into chip-clock vs CPU-clock domains we'll gate this.
+    // CIA tick prescaler.  Real CIAs (8520) run at phi2 ≈ 0.715 MHz,
+    // 1/10 of the 7.16 MHz CPU clock.  Our host clock approximates Agnus
+    // (3.55 MHz), so the CIA tick should pulse once every ~5 host cycles
+    // (Agnus / 5 ≈ 0.71 MHz).  Without this prescaler, Timer A/B count
+    // 5x too fast: K1.3's timer.device.Init at $FE8F8E loads TBHI=$FF
+    // and busy-waits for CIA-A TODLOW to change while testing TBHI's
+    // sign bit as a timeout.  With Timer B running at host speed, TBHI's
+    // high bit clears in ~33K host cycles — *before* the first VBL
+    // (~71K cycles) gives TODLOW a chance to tick — so the OS takes the
+    // Alert path ($FE8F9E -> JSR Alert -> BRA $FE8F70).  That branch
+    // bypasses the BSR's matching RTS, orphaning the BSR return PC on
+    // the stack -> SP off by 4 -> exit MOVEM at $FE8F88 reads from the
+    // wrong slot -> RTS pops $0 -> CPU executes vector table data ->
+    // exception storm at PC=$BFD100.  See project_wb13_cli_wait.md.
+    reg [2:0] cia_tick_div;
+    wire cia_tick = (cia_tick_div == 3'd4);
+    always @(posedge clk) begin
+        if (!rst_n)            cia_tick_div <= 3'd0;
+        else if (cia_tick_div == 3'd4) cia_tick_div <= 3'd0;
+        else                   cia_tick_div <= cia_tick_div + 3'd1;
+    end
+
     // CIA-A PRA inputs reflect floppy "disk present, ready, at track 0":
     //   bit 7: /FIRE  (joy/mouse button) -- not pressed -> 1
     //   bit 6: /SEL2  (extra select)     -- 1 (unused)
@@ -301,7 +323,7 @@ module m68k_top #(
         .slv_addr (cia_a_slv_addr),
         .slv_wdata(cia_a_slv_wdata),
         .slv_rdata(cia_a_slv_rdata),
-        .tick     (1'b1),
+        .tick     (cia_tick),
         .kbd_wr   (cia_a_kbd_wr),
         .kbd_byte (cia_a_kbd_byte),
         // PRA input bit composition (active-low signals):
@@ -339,7 +361,7 @@ module m68k_top #(
         .slv_addr (cia_b_slv_addr),
         .slv_wdata(cia_b_slv_wdata),
         .slv_rdata(cia_b_slv_rdata),
-        .tick     (1'b1),
+        .tick     (cia_tick),
         .kbd_wr   (1'b0),
         .kbd_byte (8'd0),
         .pa_in    (8'd0),

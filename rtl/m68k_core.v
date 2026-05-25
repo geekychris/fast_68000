@@ -3051,9 +3051,35 @@ module m68k_core #(
             // $1940-$1960 (the post-TOD-fix stack region where the bad
             // return-PC RTS pops $0 at $194C).  See project_wb13_cli_wait.md.
             if (dc_req_r && dc_we && dc_ack &&
-                dc_addr >= 32'h0000_1940 && dc_addr <= 32'h0000_1960)
+                dc_addr >= 32'h0000_1800 && dc_addr <= 32'h0000_1960)
                 $display("[STKW] r=%d pc=%h kind=%d addr=%h be=%b wdata=%h",
                     retired, ex_pc, ex_kind, dc_addr, dc_be, dc_wdata);
+            // Stack-balance probe at timer.device.Init's call to AddDevice.
+            // Log SP at:
+            //   $FE8F80 — just before JSR $FE50(A6) to AddDevice
+            //   $FE8F88 — just after  JSR return (= entry of exit MOVEM)
+            //   $FC0690 — AddDevice entry
+            //   $FC069C — AddDevice exit RTS
+            //   $FC0694 — just before BSR $FC16BE
+            //   $FC0698 — after BSR returns (= before JSR SumLibrary)
+            if (is_settled && (ex_pc == 32'h00FE_8F80 ||
+                               ex_pc == 32'h00FE_8F88 ||
+                               ex_pc == 32'h00FC_0690 ||
+                               ex_pc == 32'h00FC_069C ||
+                               ex_pc == 32'h00FC_0694 ||
+                               ex_pc == 32'h00FC_0698))
+                $display("[STK-PC] r=%d pc=%h SP=%h",
+                    retired, ex_pc, u_rf.regs[15]);
+            // [TIMER-PC]: per-instruction SP trace through timer.device.Init.
+            // Diagnostic for the CIA-timer-too-fast wall — keep only the
+            // function epilogue + the wait-sub's exit to confirm SP balance.
+            if (is_settled &&
+                (ex_pc == 32'h00FE_8DF4 || ex_pc == 32'h00FE_8F88 ||
+                 ex_pc == 32'h00FE_8F8C || ex_pc == 32'h00FE_8F34 ||
+                 ex_pc == 32'h00FE_8F3E || ex_pc == 32'h00FE_8FB4 ||
+                 ex_pc == 32'h00FE_8FB6))
+                $display("[TIMER-PC] r=%d pc=%h SP=%h kind=%d",
+                    retired, ex_pc, u_rf.regs[15], ex_kind);
             // Trace every Signal() entry to find who passes $80000000 as the
             // signal mask.  Signal is at $FC1E84.  Log A1 (task ptr) and D0 (mask).
             if (is_settled && ex_pc == 32'h00fc_1e84)
@@ -3652,9 +3678,9 @@ module m68k_core #(
                             if (movem_predec) movem_addr <= movem_addr - movem_step_bytes;
                             else              movem_addr <= movem_addr + movem_step_bytes;
 `ifdef KICKSTART_BOOT_TRACE
-                            if (ex_pc == 32'h00FE_8F88)
-                                $display("[MOVEM-X] step ack idx=%d mask=%h addr=%h dir=%b",
-                                    movem_idx, movem_mask, movem_addr, movem_dir);
+                            if (ex_pc == 32'h00FE_8F88 || ex_pc == 32'h00FE_8DF4)
+                                $display("[MOVEM-X] r=%d pc=%h step ack idx=%d mask=%h addr=%h dir=%b",
+                                    retired, ex_pc, movem_idx, movem_mask, movem_addr, movem_dir);
 `endif
                         end
                     end else begin
