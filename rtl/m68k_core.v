@@ -3065,6 +3065,26 @@ module m68k_core #(
             if (is_settled && ex_pc == 32'h00FE_5120)
                 $display("[KBD-CMD9] r=%d entered KBD_READMATRIX handler A1=%h",
                     retired, u_rf.regs[9]);
+            // [WAIT-CALL]: trace every entry into Exec's Wait at $FC1F0C
+            // with the wait mask (D0) and the caller's return PC (top of
+            // SSP/USP).  Used to find which Wait call site has D0=$00000010
+            // — the mask input.device.task is parked on.
+            if (is_settled && ex_pc == 32'h00FC_1F0C)
+                $display("[WAIT-CALL] r=%d mask=%h",
+                    retired, u_rf.regs[0]);
+            // [SIGNAL-CALL]: trace every entry into Signal at $FC1E84 with
+            // target task A1 and mask D0.  Used to find who Signals
+            // input.device.task with what bit.  Capture pre-fetched word
+            // at SSP/USP as the caller's likely return PC.
+            if (is_settled && ex_pc == 32'h00FC_1E84)
+                $display("[SIGNAL-CALL] r=%d task=%h mask=%h sp=%h",
+                    retired, u_rf.regs[9], u_rf.regs[0], u_rf.regs[15]);
+            // [SIGWAIT-WR]: any write to input.device.task ($3342) +
+            // $16..$19 (tc_SigWait).  Helps find who's writing $10.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h0000_3358 && dc_addr <= 32'h0000_335B)
+                $display("[SIGWAIT-WR] r=%d pc=%h kind=%d addr=%h be=%b wdata=%h",
+                    retired, ex_pc, ex_kind, dc_addr, dc_be, dc_wdata);
             // Stack-balance probe at timer.device.Init's call to AddDevice.
             // Log SP at:
             //   $FE8F80 — just before JSR $FE50(A6) to AddDevice
