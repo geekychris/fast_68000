@@ -97,6 +97,12 @@ module paula (
                 intena);
         if (dskblk_edge)
             $display("[DSKBLK] paula edge fired (INTREQ[1]): intena=%b", intena);
+        if (cia_a_edge)
+            $display("[CIAA-INT] paula edge fired (INTREQ[3]=PORTS): intena=%b intreq=%b",
+                intena, intreq);
+        if (cia_b_edge)
+            $display("[CIAB-INT] paula edge fired (INTREQ[13]=EXTER): intena=%b intreq=%b",
+                intena, intreq);
     end
 `endif
 
