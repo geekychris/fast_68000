@@ -3085,6 +3085,56 @@ module m68k_core #(
                 dc_addr >= 32'h0000_3358 && dc_addr <= 32'h0000_335B)
                 $display("[SIGWAIT-WR] r=%d pc=%h kind=%d addr=%h be=%b wdata=%h",
                     retired, ex_pc, ex_kind, dc_addr, dc_be, dc_wdata);
+            // [STRAP-BOOT]: strap reached its bootblock-validate path.
+            // At $FE85A4-AA strap checks (A4) == 'DOS\0' (the long-word
+            // expected at $FE841C in ROM).  At $FE85C6 strap calls the
+            // bootblock entry via JSR $0C(A4) — the moment WB1.3's boot
+            // code starts running in chip-RAM.
+            if (is_settled && ex_pc == 32'h00FE_85A4)
+                $display("[STRAP-BOOT] r=%d sec0 magic check ENTERED A4=%h",
+                    retired, u_rf.regs[12]);
+            if (is_settled && ex_pc == 32'h00FE_85AC)
+                $display("[STRAP-BOOT] r=%d sec0 magic OK (DOS), checking sum",
+                    retired);
+            if (is_settled && ex_pc == 32'h00FE_85C2)
+                $display("[STRAP-BOOT] r=%d checksum OK, about to JSR bootblock entry",
+                    retired);
+            if (is_settled && ex_pc == 32'h00FE_85C6)
+                $display("[STRAP-BOOT] r=%d JSR $0C(A4)=%h -- BOOTBLOCK ENTRY",
+                    retired, u_rf.regs[12] + 32'h0C);
+            if (is_settled && ex_pc == 32'h00FE_8600)
+                $display("[STRAP-BOOT] r=%d bootblock validation FAILED, retry counter A2=%h",
+                    retired, u_rf.regs[10]);
+            if (is_settled && ex_pc == 32'h00FE_85CA)
+                $display("[STRAP-BOOT] r=%d bootblock returned, D0=%h A0=%h",
+                    retired, u_rf.regs[0], u_rf.regs[8]);
+            if (is_settled && ex_pc == 32'h00FE_85F0)
+                $display("[STRAP-BOOT] r=%d bootblock SUCCESS path entered, A0=%h",
+                    retired, u_rf.regs[8]);
+            if (is_settled && ex_pc == 32'h00FE_8C9C)
+                $display("[STRAP-BOOT] r=%d entered FE8C9C (boot-after-success) A0=%h",
+                    retired, u_rf.regs[8]);
+            if (is_settled && ex_pc == 32'h00FE_85F8)
+                $display("[STRAP-BOOT] r=%d returned from FE8C9C",
+                    retired);
+            if (is_settled && ex_pc == 32'h00FE_86B4)
+                $display("[STRAP-BOOT] r=%d strap reaching final/cleanup A3=%h",
+                    retired, u_rf.regs[11]);
+            // Trace bootblock entry execution at chipram $55E4
+            if (is_settled && ex_pc == 32'h0000_55E4)
+                $display("[STRAP-BOOT] r=%d ENTERED bootblock entry at $55E4",
+                    retired);
+            if (is_settled && ex_pc >= 32'h0000_5400 && ex_pc <= 32'h0000_5600 && (retired[5:0] == 6'd0))
+                $display("[BB-PC] r=%d pc=%h",
+                    retired, ex_pc);
+            // [DOS-INIT]: trace dos.library rt_Init entry at $FF3E94 (where
+            // strap JMPs after success).  Sample PC every 256 retired through
+            // dos.library's init range so we can see how far it gets.
+            if (is_settled && ex_pc == 32'h00FF_3E94)
+                $display("[DOS-INIT] r=%d ENTERED dos.library rt_Init", retired);
+            if (is_settled && ex_pc >= 32'h00FF_3000 && ex_pc <= 32'h00FF_FFFF && (retired[7:0] == 8'd0))
+                $display("[DOS-PC] r=%d pc=%h",
+                    retired, ex_pc);
             // Stack-balance probe at timer.device.Init's call to AddDevice.
             // Log SP at:
             //   $FE8F80 — just before JSR $FE50(A6) to AddDevice
