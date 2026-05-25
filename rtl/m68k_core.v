@@ -338,6 +338,12 @@ module m68k_core #(
                       redirect_pc <= 32'h00FFFFFF))
                     $display("[BAD-PC] from=%h to=%h retired=%d kind=%d sp=%h",
                         ex_pc, redirect_pc, retired, ex_kind, rf_rc_data);
+                // Also trace any redirect landing in the vector table
+                // ($0-$3FF) — that's "control transferred to data" which
+                // is virtually always wrong outside of exception entry.
+                if (redirect_pc < 32'h0000_0400)
+                    $display("[VEC-EXEC] from=%h to=%h retired=%d kind=%d sp=%h",
+                        ex_pc, redirect_pc, retired, ex_kind, rf_rc_data);
             end
 `endif
             // A speculative fetch may still be in flight to the cache. Mark
@@ -912,6 +918,7 @@ module m68k_core #(
     // Edge tracker for [USPTINY]: prevents re-firing while user-mode A7
     // sits below $200 (e.g. a Forbid/Permit nested loop that keeps SP small).
     reg        user_a7_was_tiny;
+    reg        super_a7_was_tiny;
     // CCR snapshot captured at S_LOAD ack for mem-dest RMW kinds where
     // S_RMW_W settle needs the *operation's* flags (not the registered
     // CCR which may have moved on).  Used by K_ALUI mem-dest path.
@@ -2824,6 +2831,7 @@ module m68k_core #(
             retired <= 32'd0;
             stop_logged_pc <= 32'hFFFF_FFFF;
             user_a7_was_tiny <= 1'b0;
+            super_a7_was_tiny <= 1'b0;
             dos_init_seen <= 1'b0;
         end else begin
             // Count instructions that complete each cycle. STOP doesn't count.
@@ -2997,6 +3005,19 @@ module m68k_core #(
                 u_rf.regs[15] >= 32'h0000_0200 && user_a7_was_tiny) begin
                 user_a7_was_tiny <= 1'b0;
             end
+            // Same for supervisor mode (SSP).  If SSP dips below $200
+            // an exception frame will land on top of the vector table —
+            // that's the post-TOD-fix WB1.3 boot wall.
+            if (is_settled && sr_s && ex_kind != K_STOP &&
+                u_rf.regs[15] < 32'h0000_0200 && !super_a7_was_tiny) begin
+                $display("[SSPTINY] r=%d pc=%h opcode=%h kind=%d SSP=%h",
+                    retired, ex_pc, ex_opcode, ex_kind, u_rf.regs[15]);
+                super_a7_was_tiny <= 1'b1;
+            end
+            if (is_settled && sr_s && ex_kind != K_STOP &&
+                u_rf.regs[15] >= 32'h0000_0200 && super_a7_was_tiny) begin
+                super_a7_was_tiny <= 1'b0;
+            end
 `endif
 `ifdef KICKSTART_BOOT_TRACE
             // STOP logs once when it first settles -- without the edge
@@ -3025,6 +3046,13 @@ module m68k_core #(
             if (dc_req_r && dc_we && dc_ack &&
                 dc_addr >= 32'h0000_1988 && dc_addr <= 32'h0000_198C)
                 $display("[SIGREC] r=%d pc=%h kind=%d addr=%h be=%b wdata=%h",
+                    retired, ex_pc, ex_kind, dc_addr, dc_be, dc_wdata);
+            // WB1.3 boot: SSP corruption — trace any write to chip RAM
+            // $1940-$1960 (the post-TOD-fix stack region where the bad
+            // return-PC RTS pops $0 at $194C).  See project_wb13_cli_wait.md.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h0000_1940 && dc_addr <= 32'h0000_1960)
+                $display("[STKW] r=%d pc=%h kind=%d addr=%h be=%b wdata=%h",
                     retired, ex_pc, ex_kind, dc_addr, dc_be, dc_wdata);
             // Trace every Signal() entry to find who passes $80000000 as the
             // signal mask.  Signal is at $FC1E84.  Log A1 (task ptr) and D0 (mask).
@@ -3623,6 +3651,11 @@ module m68k_core #(
                             // address increases each step.
                             if (movem_predec) movem_addr <= movem_addr - movem_step_bytes;
                             else              movem_addr <= movem_addr + movem_step_bytes;
+`ifdef KICKSTART_BOOT_TRACE
+                            if (ex_pc == 32'h00FE_8F88)
+                                $display("[MOVEM-X] step ack idx=%d mask=%h addr=%h dir=%b",
+                                    movem_idx, movem_mask, movem_addr, movem_dir);
+`endif
                         end
                     end else begin
                         // Scanning for next set bit, or done.
