@@ -92,6 +92,14 @@ module m68k_top #(
     wire [2:0]            irq_level = (bus_irq_level > paula_irq_level)
                                       ? bus_irq_level : paula_irq_level;
 
+    // Per-core "CPU is parked on STOP" hint.  Used by the Agnus beam
+    // counter (and CIA tick prescaler) to fast-forward sim time during
+    // long idle stretches without changing observable CPU behavior —
+    // when all cores are STOPped, the only thing that matters is when
+    // the next IRQ arrives, so we run the beam ahead at N×.
+    wire [N_CORES-1:0]    cpu_in_stop_flat;
+    wire                  all_cores_in_stop = &cpu_in_stop_flat;
+
     // Blitter slave wires.
     wire        blt_slv_req;
     wire        blt_slv_we;
@@ -263,6 +271,7 @@ module m68k_top #(
         .dsksyn_pulse_o (dsksyn_pulse),
         .ovl_clear_pulse_o (ovl_clear_pulse),
         .disk_track_i   (disk_track_idx),
+        .sim_ff_active  (all_cores_in_stop),
         .bpl_pt0_o      (bus_bpl_pt0),
         .bpl_pt1_o      (bus_bpl_pt1),
         .bpl_pt2_o      (bus_bpl_pt2),
@@ -293,11 +302,16 @@ module m68k_top #(
     // wrong slot -> RTS pops $0 -> CPU executes vector table data ->
     // exception storm at PC=$BFD100.  See project_wb13_cli_wait.md.
     reg [2:0] cia_tick_div;
-    wire cia_tick = (cia_tick_div == 3'd4);
+    // During sim fast-forward (all cores STOPped), tick every host clock
+    // instead of every 5th — keeps CIA Timer A/B counting at the same
+    // rate relative to the Agnus beam (which also fast-forwards 64x).
+    // OS-visible timing (TOD-on-VBL, Timer-B-elapsed-vs-VBL) is preserved.
+    wire cia_tick = all_cores_in_stop ? 1'b1 : (cia_tick_div == 3'd4);
     always @(posedge clk) begin
-        if (!rst_n)            cia_tick_div <= 3'd0;
+        if (!rst_n)                    cia_tick_div <= 3'd0;
+        else if (all_cores_in_stop)    cia_tick_div <= 3'd0;
         else if (cia_tick_div == 3'd4) cia_tick_div <= 3'd0;
-        else                   cia_tick_div <= cia_tick_div + 3'd1;
+        else                           cia_tick_div <= cia_tick_div + 3'd1;
     end
 
     // CIA-A PRA inputs reflect floppy "disk present, ready, at track 0":
@@ -817,7 +831,8 @@ module m68k_top #(
                 .dc_rdata   (dc_rdata),
                 .halted     (halted[gi]),
                 .halt_code  (halt_code_flat[16*gi +: 16]),
-                .retired    (retired_flat[32*gi +: 32])
+                .retired    (retired_flat[32*gi +: 32]),
+                .cpu_in_stop(cpu_in_stop_flat[gi])
             );
         end
     endgenerate

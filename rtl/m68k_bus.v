@@ -200,8 +200,20 @@ module m68k_bus #(
     // offset the MFM-DMA read source within disk[].  Driven by the step-
     // pulse-tracking block in m68k_top.v; defaults to 0 so test benches
     // that don't wire this in still get track 0 (the legacy behaviour).
-    input  wire [7:0]                     disk_track_i
+    input  wire [7:0]                     disk_track_i,
+    // High whenever all CPU cores are parked on STOP waiting for IRQs.
+    // When asserted, the Agnus beam counter advances by SIM_FF_STRIDE
+    // cycles per host clock instead of 1, making VBL pulses fire faster
+    // (and via the CIA tick prescaler, CIA Timer A/B count faster too).
+    // The OS doesn't see the speedup: its time base (CIA-A TOD on VBL)
+    // is preserved relative to the OS-visible event rate.  Off by default
+    // when SIM_FF_STRIDE=1.
+    input  wire                           sim_ff_active
 );
+    // How many beam-cycles per host clock when fast-forward is active.
+    // 64 = ~64x faster VBL firing.  Pure sim performance hack; observable
+    // CPU behavior unchanged because the CPU is parked on STOP.
+    localparam [9:0] SIM_FF_STRIDE = 10'd64;
 `ifdef KICKSTART_BOOT
     // Under Kickstart the address-bus mask in `unflat` drops bits 24..31,
     // so $FFFF_FFFC (the test-bench IRQ register slot) folds to
@@ -372,25 +384,38 @@ module m68k_bus #(
     reg [9:0] agnus_v;
     reg [15:0] dmacon;
 
-    // VERTB pulse: high for one cycle each frame, just before agnus_v
-    // wraps to 0.  Paula edge-detects on the rising edge to set INTREQ[5].
-    assign vblank_pulse_o = (agnus_h == AGNUS_H_LAST) && (agnus_v == AGNUS_V_LAST);
+    // VERTB pulse: high for one cycle each frame, when the beam counter
+    // reaches the bottom-right of the display.  With strided advance
+    // (SIM_FF_STRIDE) the counter can skip past the exact (LAST_H,LAST_V)
+    // coordinates without ever landing on them — so detect frame end by
+    // "next advance would wrap the line AND we're on the last line".
+    wire beam_line_wraps_next = (agnus_h + beam_stride > AGNUS_H_LAST);
+    assign vblank_pulse_o = beam_line_wraps_next && (agnus_v == AGNUS_V_LAST);
     // Beam tick.  Increment H every clock; on wrap, increment V; on V wrap,
     // back to 0.  In a real Amiga the H tick is one bus cycle (8 master
     // clocks); here we tick once per system clock so the counter advances
     // visibly under cycle-accurate cross-check.
+    // Effective stride per clock — 1 normally, SIM_FF_STRIDE while all
+    // CPU cores are STOPped (fast-forward through long idle gaps).
+    wire [9:0] beam_stride = sim_ff_active ? SIM_FF_STRIDE : 10'd1;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             agnus_h <= 10'd0;
             agnus_v <= 10'd0;
             dmacon  <= 16'd0;
         end else begin
-            if (agnus_h == AGNUS_H_LAST) begin
+            // Generic advance: agnus_h += stride, wrap at AGNUS_H_LAST,
+            // bump agnus_v on wrap.  Stride is clamped so wrap detection
+            // works even when stride > distance-to-wrap (the next clock
+            // picks up the remainder via the same logic).  Stride is
+            // tuned (64) so a full line wraps in 4 clocks max; an entire
+            // frame is ~1100 clocks instead of ~71K.
+            if (agnus_h + beam_stride > AGNUS_H_LAST) begin
                 agnus_h <= 10'd0;
                 if (agnus_v == AGNUS_V_LAST) agnus_v <= 10'd0;
                 else                          agnus_v <= agnus_v + 10'd1;
             end else begin
-                agnus_h <= agnus_h + 10'd1;
+                agnus_h <= agnus_h + beam_stride;
             end
         end
     end

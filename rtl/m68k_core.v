@@ -59,7 +59,12 @@ module m68k_core #(
 
     output reg         halted,
     output reg  [15:0] halt_code,
-    output reg  [31:0] retired       // instructions retired since reset
+    output reg  [31:0] retired,      // instructions retired since reset
+    // High while CPU is parked on a STOP instruction waiting for an IRQ.
+    // External logic (Agnus beam counter, CIA tick) may use this to
+    // fast-forward sim time during long idle stretches without changing
+    // observable behavior — the CPU only resumes when an IRQ redirects PC.
+    output wire        cpu_in_stop
 );
     assign ic_we    = 1'b0;
     assign ic_lock  = 1'b0;
@@ -1173,6 +1178,18 @@ module m68k_core #(
     // mispredict; for non-Bcc branches (JMP/JSR/RTS) there's no prediction so
     // we always redirect on take. STOP freezes the IF stage at the STOP PC.
     wire stop_now      = ex_valid && (ex_kind == K_STOP) && (ex_state == S_RUN) && !halted;
+    // External fast-forward hint: stays high for as long as the CPU is
+    // parked on a STOP waiting for an IRQ.  Once stop_now fires the EX
+    // pipeline freezes (no further commits) until a redirect / IRQ
+    // arrives.  We approximate "in STOP" as: most recently executed
+    // instruction was STOP, EX is in S_RUN, and the CPU isn't halted.
+    reg cpu_in_stop_r;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)                       cpu_in_stop_r <= 1'b0;
+        else if (stop_now)                cpu_in_stop_r <= 1'b1;
+        else if (redirect_valid)          cpu_in_stop_r <= 1'b0;
+    end
+    assign cpu_in_stop = cpu_in_stop_r;
     wire bcc_mispred   = is_settled && (ex_kind == K_BCC) && (ex_predicted_taken != take_branch_c);
     wire other_branch  = is_settled && (ex_kind != K_BCC) && take_branch_c;
     wire exc_redirect  = is_settled_after_exc || is_settled_after_rte;
