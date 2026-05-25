@@ -26,6 +26,11 @@ module m68k_top #(
     input  wire [31:0] fb_peek_addr,
     output wire [31:0] fb_peek_data,
 
+    // Diagnostic memory-poke port (sim_main writes chip RAM directly).
+    input  wire        mem_poke_strobe,
+    input  wire [31:0] mem_poke_addr,
+    input  wire [31:0] mem_poke_data,
+
     // Live Paula audio output for the simulator harness.
     output wire signed [15:0] audio_l,
     output wire signed [15:0] audio_r,
@@ -174,6 +179,8 @@ module m68k_top #(
     wire [15:0] bus_bpl_mod1;
     wire [15:0] bus_bpl_mod2;
     wire        bus_den_auto_active;
+    wire        bus_cop_auto_active;
+    wire        bus_cop_cdang;
     wire [6*32-1:0] den_auto_bpl_pt_flat = {bus_bpl_pt5, bus_bpl_pt4,
                                             bus_bpl_pt3, bus_bpl_pt2,
                                             bus_bpl_pt1, bus_bpl_pt0};
@@ -205,6 +212,9 @@ module m68k_top #(
         .snoop_src_id(snoop_src_id),
         .irq_level   (bus_irq_level),
         .fb_peek_addr(fb_peek_addr),
+        .mem_poke_strobe(mem_poke_strobe),
+        .mem_poke_addr  (mem_poke_addr),
+        .mem_poke_data  (mem_poke_data),
         .fb_peek_data(fb_peek_data),
         .blt_slv_req (blt_slv_req),
         .blt_slv_we  (blt_slv_we),
@@ -261,7 +271,9 @@ module m68k_top #(
         .bpl_pt5_o      (bus_bpl_pt5),
         .bpl_mod1_o     (bus_bpl_mod1),
         .bpl_mod2_o     (bus_bpl_mod2),
-        .den_auto_active_o (bus_den_auto_active)
+        .den_auto_active_o (bus_den_auto_active),
+        .cop_auto_active_o (bus_cop_auto_active),
+        .cop_cdang_o       (bus_cop_cdang)
     );
 
     // CIA-A and CIA-B.  Tick every bus cycle for now (10x real Amiga rate)
@@ -310,6 +322,7 @@ module m68k_top #(
         .pa_oe    (cia_a_pa_oe),
         .pb_out   (),
         .pb_oe    (),
+        .tod_tick_i (vblank_pulse),
         .int_o    (cia_a_int)
     );
 
@@ -335,6 +348,7 @@ module m68k_top #(
         .pa_oe    (),
         .pb_out   (cia_b_pb_out),
         .pb_oe    (),
+        .tod_tick_i (1'b0),
         .int_o    (cia_b_int)
     );
 
@@ -486,7 +500,10 @@ module m68k_top #(
         .mst_ack    (cop_mst_ack),
         .mst_rdata  (cop_mst_rdata),
         .blt_busy_i (blt_busy),
-        .vbeam_i    (vbeam)
+        .vbeam_i    (vbeam),
+        .auto_kick_i   (vblank_pulse),
+        .auto_active_i (bus_cop_auto_active),
+        .cdang_i       (bus_cop_cdang)
     );
 
     // Wire the Copper master into the arbiter at COP_PORT.

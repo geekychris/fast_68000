@@ -51,6 +51,11 @@ core0:
         move.l #$00580044, $00006028      ; BLTSIZE (kicks blit)
         move.l #$FFFFFFFE, $0000602C      ; end-of-list
 
+        ; ---- enable COPCON.CDANG so the Copper can drive blitter regs
+        ; ($40-$7E).  Default OCS Copper is gated to $80+; we need $40+
+        ; to reach BLTCON0..BLTSIZE.  COPCON lives at $DFF02E.
+        move.w #$0002,     $00DFF02E
+
         ; ---- start the Copper ----
         move.l #$00006000, $00FE0040      ; COP1LC
         move.l #1,         $00FE0044      ; COPJMP1

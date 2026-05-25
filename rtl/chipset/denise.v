@@ -470,6 +470,50 @@ module denise #(
                                 colors[{1'b1, slv_addr[6:2]}] <= slv_wdata;
                         end
                     endcase
+                end else if ((slv_be != 4'b1111) &&
+                             ((slv_addr[7:1] == 7'h00) ||
+                              (slv_addr[7:1] == 7'h01) ||
+                              (slv_addr[7:1] == 7'h02) ||
+                              (slv_addr[7:1] == 7'h04) ||
+                              (slv_addr[7:1] == 7'h05) ||
+                              (slv_addr[7:4] == 4'b0010) ||  // $DFF120..$DFF13E SPRnPT
+                              (slv_addr[7:4] == 4'b0011))) begin
+                    // Word write to one of the canonical Amiga registers
+                    // K1.3 / Intuition program via MOVE.W to $DFF1xx.  Value
+                    // lands in slv_wdata[31:16] for even-aligned writes
+                    // ($DFF100, $DFF104, ...) and in [15:0] for odd-aligned.
+                    //
+                    // Handled here:
+                    //   $DFF100/102/104       BPLCON0/1/2  (low-half normalised)
+                    //   $DFF108/10A           BPL1MOD/2MOD (low-half normalised)
+                    //   $DFF120..$DFF13E      SPRnPTH/L    (16-bit halves of spr_pt[i])
+                    //
+                    // COLOR registers ($DFF180+) are intentionally NOT
+                    // intercepted: the legacy long-write path stores
+                    // slv_wdata as-is, and tests (t23_cop_basic etc.)
+                    // verify storage by long-read and expect "what you
+                    // wrote is what you read back".
+                    case (slv_addr[7:1])
+                        7'h00: bplcon0    <= {16'd0, slv_addr[1] ? slv_wdata[15:0] : slv_wdata[31:16]};
+                        7'h01: bplcon1    <= {16'd0, slv_addr[1] ? slv_wdata[15:0] : slv_wdata[31:16]};
+                        7'h02: bplcon2    <= {16'd0, slv_addr[1] ? slv_wdata[15:0] : slv_wdata[31:16]};
+                        7'h04: bpl_mod[0] <= {16'd0, slv_addr[1] ? slv_wdata[15:0] : slv_wdata[31:16]};
+                        7'h05: bpl_mod[1] <= {16'd0, slv_addr[1] ? slv_wdata[15:0] : slv_wdata[31:16]};
+                        default: begin
+                            // $DFF120..$DFF13E: SPR0PTH..SPR7PTL.
+                            // slv_addr[4:2] selects sprite 0..7, slv_addr[1]
+                            // selects high (0) or low (1) 16-bit half of the
+                            // sprite's 32-bit chip-RAM pointer.
+                            if (slv_addr[1] == 1'b0)
+                                spr_pt[slv_addr[4:2]][31:16] <=
+                                    (slv_be[3] | slv_be[2]) ? slv_wdata[31:16]
+                                                            : slv_wdata[15:0];
+                            else
+                                spr_pt[slv_addr[4:2]][15:0]  <=
+                                    (slv_be[1] | slv_be[0]) ? slv_wdata[15:0]
+                                                            : slv_wdata[31:16];
+                        end
+                    endcase
                 end else
                 case (slv_addr[7:0])
                     8'h00: bplcon0   <= slv_wdata;

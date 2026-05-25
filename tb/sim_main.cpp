@@ -23,6 +23,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <vector>
+#include <utility>
 
 #ifdef HAVE_SDL2
 #include <SDL.h>
@@ -107,6 +109,9 @@ int main(int argc, char** argv) {
     top->mouse_y_count  = 0;
     top->mouse_btn_l    = 0;
     top->mouse_btn_r    = 0;
+    top->mem_poke_strobe = 0;
+    top->mem_poke_addr   = 0;
+    top->mem_poke_data   = 0;
     for (int i = 0; i < 8; i++) {
         top->clk = 0; top->eval();
         top->clk = 1; top->eval();
@@ -337,9 +342,133 @@ static int run_regression(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
         return true;
     };
 
+    // Optional automated keyboard injection.  KBD_AUTO_INJECT contains an
+    // ASCII string; we convert each character to an Amiga rawkey and feed
+    // it (key-down then key-up) into top->ext_kbd_byte with a one-cycle
+    // ext_kbd_wr strobe.  KBD_AUTO_INJECT_START controls how many cycles
+    // to wait before injecting the first key (defaults to half of
+    // max_cycles -- past the typical K1.3 boot settle point).  Keys are
+    // paced at KBD_AUTO_INJECT_PERIOD cycles apart (default 1,000,000
+    // host clocks = ~14 simulated VBL frames).  Used to drive WB1.3's CLI
+    // past its idle WAIT on console input from the test harness, where
+    // there's no SDL window to type into.
+    const char* kbd_inject_str = std::getenv("KBD_AUTO_INJECT");
+    uint64_t    kbd_inject_start  = 0;
+    uint64_t    kbd_inject_period = 1000000;
+    if (kbd_inject_str) {
+        if (const char* s = std::getenv("KBD_AUTO_INJECT_START"))
+            kbd_inject_start = std::strtoull(s, nullptr, 0);
+        else
+            kbd_inject_start = max_cycles / 2;
+        if (const char* s = std::getenv("KBD_AUTO_INJECT_PERIOD"))
+            kbd_inject_period = std::strtoull(s, nullptr, 0);
+        printf("[sim] KBD_AUTO_INJECT='%s' start=%llu period=%llu\n",
+            kbd_inject_str, (unsigned long long)kbd_inject_start,
+            (unsigned long long)kbd_inject_period);
+    }
+    size_t   kbd_idx       = 0;
+    bool     kbd_is_keydown = true;  // alternate down/up per key
+    uint64_t kbd_next_cycle = kbd_inject_start;
+
+    // Optional one-shot memory poke.  Format:
+    //   MEM_POKE="addr=value"          (single 32-bit word write)
+    //   MEM_POKE="addr=value,addr=value,..." (multiple)
+    //   MEM_POKE_CYCLE=N               (defaults to max_cycles/2)
+    //
+    // Used to patch K1.3 task state from outside the OS — e.g. set
+    // input.device's tc_SigWait to include the keyboard-event bit so
+    // a boot stalled in early-init Wait() can advance.  See
+    // project_wb13_cli_wait.md.
+    std::vector<std::pair<uint32_t, uint32_t>> pokes;
+    uint64_t poke_cycle  = max_cycles / 2;
+    uint64_t poke_period = 0;  // 0 = one-shot; >0 = re-fire every N cycles
+    if (const char* s = std::getenv("MEM_POKE")) {
+        const char* p = s;
+        while (*p) {
+            char* end = nullptr;
+            uint32_t addr = (uint32_t)std::strtoul(p, &end, 0);
+            if (!end || *end != '=') break;
+            p = end + 1;
+            uint32_t val = (uint32_t)std::strtoul(p, &end, 0);
+            if (!end) break;
+            pokes.push_back({addr, val});
+            p = end;
+            if (*p == ',') p++;
+        }
+        if (const char* s2 = std::getenv("MEM_POKE_CYCLE"))
+            poke_cycle = std::strtoull(s2, nullptr, 0);
+        if (const char* s2 = std::getenv("MEM_POKE_PERIOD"))
+            poke_period = std::strtoull(s2, nullptr, 0);
+        printf("[sim] MEM_POKE %zu word(s) at cycle %llu (period=%llu)\n",
+               pokes.size(), (unsigned long long)poke_cycle,
+               (unsigned long long)poke_period);
+        for (auto& pp : pokes)
+            printf("[sim]   $%08X <- $%08X\n", pp.first, pp.second);
+    }
+
     uint32_t host_tail = 0;
     uint64_t cycle = 0;
+    size_t   poke_idx = 0;
+    uint64_t poke_next_cycle = poke_cycle;
     while (cycle < max_cycles && !all_halted()) {
+        // Default ext_kbd_wr to 0; the injection block below pulses it
+        // for exactly one cycle when a scancode is due.
+        top->ext_kbd_wr = 0;
+        top->mem_poke_strobe = 0;
+        if (!pokes.empty() && cycle >= poke_next_cycle) {
+            top->mem_poke_addr   = pokes[poke_idx].first;
+            top->mem_poke_data   = pokes[poke_idx].second;
+            top->mem_poke_strobe = 1;
+            poke_idx++;
+            if (poke_idx >= pokes.size()) {
+                poke_idx = 0;
+                if (poke_period > 0) poke_next_cycle += poke_period;
+                else                  poke_next_cycle = ~0ULL;  // no more
+            }
+        }
+        if (kbd_inject_str && cycle >= kbd_next_cycle &&
+            kbd_inject_str[kbd_idx] != 0) {
+            // Translate ASCII -> Amiga rawkey using the SDL helper's
+            // table.  For simplicity we hard-code the common subset
+            // needed for typing commands: a..z, 0..9, space, enter.
+            char ch = kbd_inject_str[kbd_idx];
+            uint8_t rk = 0xFF;
+            if (ch >= 'a' && ch <= 'z') {
+                // Amiga A=$20, B=$35, C=$33, D=$22, E=$12, F=$23,
+                // G=$24, H=$25, I=$17, J=$26, K=$27, L=$28, M=$37,
+                // N=$36, O=$18, P=$19, Q=$10, R=$13, S=$21, T=$14,
+                // U=$16, V=$34, W=$11, X=$32, Y=$15, Z=$31.
+                static const uint8_t map[26] = {
+                    0x20,0x35,0x33,0x22,0x12,0x23,0x24,0x25,0x17,0x26,
+                    0x27,0x28,0x37,0x36,0x18,0x19,0x10,0x13,0x21,0x14,
+                    0x16,0x34,0x11,0x32,0x15,0x31};
+                rk = map[ch - 'a'];
+            } else if (ch == ' ') {
+                rk = 0x40;
+            } else if (ch == '\n') {
+                rk = 0x44;
+            } else if (ch >= '0' && ch <= '9') {
+                static const uint8_t map[10] = {
+                    0x0A,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09};
+                rk = map[ch - '0'];
+            }
+            if (rk != 0xFF) {
+                // Real Amiga keyboard transform: keyboard sends the byte
+                // ROL'd by one bit and inverted (~).  Per minimig's
+                // ciaa.v "sdr_latch <= ~{keydat[6:0], keydat[7]}", the
+                // value that ends up in CIA SDR is ~ROL8(rawkey, 1).
+                // K1.3's keyboard.device handler then applies the inverse
+                // (rawkey = ROR8(~SDR, 1)) to recover the original rawkey.
+                uint8_t up_bit  = kbd_is_keydown ? 0x00 : 0x80;
+                uint8_t rk_full = rk | up_bit;
+                uint8_t rol     = (uint8_t)((rk_full << 1) | (rk_full >> 7));
+                top->ext_kbd_byte = (uint8_t)(~rol);
+                top->ext_kbd_wr   = 1;
+            }
+            if (!kbd_is_keydown) kbd_idx++;
+            kbd_is_keydown = !kbd_is_keydown;
+            kbd_next_cycle = cycle + kbd_inject_period;
+        }
         top->clk = 0; top->eval();
         top->clk = 1; top->eval();
         cycle++;

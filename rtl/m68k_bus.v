@@ -69,6 +69,16 @@ module m68k_bus #(
     input  wire [31:0]                    fb_peek_addr,
     output wire [31:0]                    fb_peek_data,
 
+    // Memory-poke port. Drive mem_poke_strobe high for one host clock
+    // to write mem_poke_data into mem[] at word address
+    // mem_poke_addr[AIDX_BITS+1:2].  Diagnostic-only — the simulator
+    // uses this to patch K1.3 task state (e.g. force input.device's
+    // tc_SigWait to include the keyboard-event bit so a stalled boot
+    // can advance past CLI WAIT).  In synthesis tie strobe low.
+    input  wire                           mem_poke_strobe,
+    input  wire [31:0]                    mem_poke_addr,
+    input  wire [31:0]                    mem_poke_data,
+
     // Blitter slave interface.  Writes/reads from BLT_BASE..BLT_BASE+0x3F
     // are diverted to this port instead of main memory.  The blitter module
     // sits on a separate master port for its own memory R/W; the slave
@@ -170,6 +180,12 @@ module m68k_bus #(
     output wire [15:0]                    bpl_mod1_o,
     output wire [15:0]                    bpl_mod2_o,
     output wire                           den_auto_active_o,
+    output wire                           cop_auto_active_o,
+    // COPCON.CDANG: bit 1 of $DFF02E.  When 0 (default OCS) the Copper
+    // is restricted to chip registers $80+; when 1 the gate opens to
+    // $40+ so Copper-driven blitter setup works.  $00-$3E is always
+    // blocked (disk/serial/INTREQ).
+    output wire                           cop_cdang_o,
     // One-cycle pulse fired at the start of every disk DMA read.  Our DMA
     // is "minimig-style" memcpy and skips the real bit-stream PLL/sync
     // search; this pulse stands in for the DSKSYN event Paula would raise
@@ -259,6 +275,12 @@ module m68k_bus #(
 
     // Framebuffer peek (word index = fb_peek_addr[AIDX_BITS+1:2]).
     assign fb_peek_data = mem[fb_peek_addr[AIDX_BITS+1:2]];
+
+    // Memory-poke port (diagnostic — see comment near port declaration).
+    always @(posedge clk) begin
+        if (mem_poke_strobe)
+            mem[mem_poke_addr[AIDX_BITS+1:2]] <= mem_poke_data;
+    end
     integer mi;
     initial begin
         for (mi = 0; mi < MEM_WORDS; mi = mi + 1) mem[mi] = 32'd0;
@@ -635,6 +657,14 @@ module m68k_bus #(
     assign bpl_mod1_o = bpl1mod_shadow;
     assign bpl_mod2_o = bpl2mod_shadow;
     assign den_auto_active_o = bpl_active_now;
+    assign cop_auto_active_o = dmacon[9] && dmacon[7];
+    // $DFF02E.CDANG lives at bit 1 of the 16-bit COPCON.  Canonical
+    // 16-bit writes land in either chip_regs[$02C] (be=$C, addr[1]=0
+    // -> high half stored in chip_regs[$2C]) or chip_regs[$02E]
+    // (addr[1]=1, low half stored in chip_regs[$2E]).  Real Agnus uses
+    // a single 16-bit register; mirror that by ORing both shadows so
+    // either form lands the bit.
+    assign cop_cdang_o = chip_regs[9'h02C][1] | chip_regs[9'h02E][1];
 
     // Unflatten inputs.
     wire [31:0] addr  [0:N_PORTS-1];

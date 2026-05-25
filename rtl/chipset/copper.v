@@ -83,7 +83,13 @@ module copper (
     // Current Denise raster row.  Carries V only; H is unavailable in
     // this codebase, so WAIT/SKIP treat the H comparator as always
     // satisfied (see header comment).
-    input  wire [15:0] vbeam_i
+    input  wire [15:0] vbeam_i,
+    input  wire        auto_kick_i,
+    input  wire        auto_active_i,
+    // COPCON.CDANG: 0 = Copper restricted to chip regs $80+ (default OCS);
+    // 1 = gate opens to $40+ so Copper-driven blitter setup works.  $00-$3E
+    // is always blocked at the chipset level.
+    input  wire        cdang_i
 );
     // ---------------- Registers programmed by the CPU ----------------
     reg [31:0] cop1lc;
@@ -107,6 +113,7 @@ module copper (
     reg [31:0] pc;
     reg [15:0] ir1_q;
     reg [15:0] ir2_q;
+    reg        auto_kick_d;
 
     // Master-request gating: drop combinationally on ack so the arbiter
     // sees one request per transaction.
@@ -180,7 +187,15 @@ module copper (
             mst_addr  <= 32'd0;
             mst_wdata <= 32'd0;
             mst_be    <= 4'b0000;
+            auto_kick_d <= 1'b0;
         end else begin
+            auto_kick_d <= auto_kick_i;
+            if (auto_kick_i && !auto_kick_d && auto_active_i && !cop_busy) begin
+                pc       <= cop1lc;
+                cop_busy <= 1'b1;
+                state    <= S_FETCH;
+            end
+
             // -------- CPU slave writes --------
             if (slv_req && slv_we) begin
                 case (slv_addr[4:2])
@@ -234,6 +249,26 @@ module copper (
                             state <= S_FETCH;
                         end else if (is_copins || is_copcon) begin
                             // Discard silently; advance.
+                            state <= S_FETCH;
+                        end else if ((mv_reg < 9'h040) ||
+                                     ((mv_reg < 9'h080) && !cdang_i)) begin
+                            // Copper register-access protection.
+                            //   * $00-$3E: always blocked (disk DMA,
+                            //     serial, INTREQ, COPxxx, vector regs).
+                            //   * $40-$7E: blocked when COPCON.CDANG=0
+                            //     (default OCS); allowed when CDANG=1
+                            //     so software can program the blitter
+                            //     from the Copper (t24_cop_chain etc.).
+                            //   * $80+: always allowed (Denise: BPLnPT,
+                            //     BPLCON, SPRnPT/POS/CTL/DATA, COLOR).
+                            //
+                            // Without this gate, a Copper that walks past
+                            // a valid list into chip-RAM code finds opcodes
+                            // like $4EF9 (JMP) and interprets them as MOVEs
+                            // to DSKLEN ($DFF024) / BLTDPTL ($DFF056) /
+                            // etc., clearing DMAEN and corrupting in-
+                            // progress disk reads + blits.  See
+                            // project_copper_autorestart.md.
                             state <= S_FETCH;
                         end else begin
                             // Real MOVE: emit canonical $DFFxxx bus write.

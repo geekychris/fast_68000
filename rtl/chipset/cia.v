@@ -70,8 +70,29 @@ module cia (
     output wire [7:0]  pb_out,
     output wire [7:0]  pb_oe,
 
-    // Combined IRQ output (active high while any pending masked bit set).
-    output wire        int_o
+    // TOD increment trigger.  Real CIA-A's TOD is wired to Agnus VSYNC
+    // (50 Hz PAL / 60 Hz NTSC).  Drive this with the system VBL pulse so
+    // K1.3's timer.device VBL handler sees TOD advance by exactly 1 per
+    // VBL — without it, our previous 1024-cycle prescaler ticked TOD
+    // ~70x faster than VBL and timer.device's request-completion math
+    // never resolved, leaving input.device wedged in WAIT and CLI never
+    // unblocking.  When tod_tick_i is tied off in synth, the legacy
+    // prescaler still ticks TOD as a fallback.
+    input  wire        tod_tick_i,
+
+    // Combined IRQ output: high for one host clock when any enabled
+    // pending bit transitions 0->1 (per-source rising-edge pulse).
+    //
+    // Real CIA's INT pin is level-sensitive while pending bits remain
+    // set, but downstream Paula uses *edge* detection (cia_a_int_i &
+    // ~cia_a_int_last).  With a pure level output a TA underflow would
+    // raise int_o, and a subsequent SP byte arrival (icr_pending[3]
+    // <= 1) wouldn't change int_o because it was already high -- so
+    // Paula never latched a fresh PORTS IRQ and CLI/keyboard.device
+    // never saw the keystroke.  Pulsing per source restores the
+    // expected "new event = new IRQ" semantics regardless of whether
+    // the prior handler read ICR.  See project_wb13_cli_wait.md.
+    output reg         int_o
 );
     // ---------------- Register storage ------------------
     reg [7:0]  pra, prb, ddra, ddrb;
@@ -92,6 +113,7 @@ module cia (
     // for boot-time clock reads without slowing things down.
     reg [23:0] tod;
     reg [9:0]  tod_prescale;
+    reg        tod_tick_seen;
 
     // Derived control bits.
     wire ta_start    = cra[0];
@@ -108,7 +130,19 @@ module cia (
     assign pb_oe  = ddrb;
 
     // Interrupt line: any pending bit that the mask enables.
-    assign int_o = |(icr_pending & icr_mask);
+    // Per-source rising-edge pulse: int_o = 1 for the host clock right
+    // after any masked pending bit transitions 0->1.
+    reg [4:0] icr_pending_d;
+    wire [4:0] pending_new_rising = icr_pending & ~icr_pending_d;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            icr_pending_d <= 5'd0;
+            int_o         <= 1'b0;
+        end else begin
+            icr_pending_d <= icr_pending;
+            int_o <= |(pending_new_rising & icr_mask);
+        end
+    end
 
     // ---------------- Slave reads -----------------------
     always @* begin
@@ -153,6 +187,7 @@ module cia (
             icr_read_clear <= 1'b0;
             tod <= 24'd0;
             tod_prescale <= 10'd0;
+            tod_tick_seen <= 1'b0;
             sdr <= 8'd0;
         end else begin
             // Serial byte arrives from external (keyboard scancode).
@@ -160,12 +195,27 @@ module cia (
                 sdr <= kbd_byte;
                 icr_pending[3] <= 1'b1;       // SP interrupt source
             end
-            // TOD tick (free-running 50 Hz-ish counter).
-            if (tod_prescale == 10'd1023) begin
-                tod_prescale <= 10'd0;
-                tod          <= tod + 24'd1;
-            end else begin
-                tod_prescale <= tod_prescale + 10'd1;
+            // TOD increment.  Once any external VSYNC tick arrives we
+            // switch to "external mode" permanently and ignore the
+            // prescaler (otherwise the prescaler would also overflow
+            // ~70 times per VBL and re-introduce the fast-TOD bug).
+            // Until the first tick, the prescaler ticks TOD as a
+            // fallback so harnesses that don't drive tod_tick_i still
+            // see TOD advance.
+            if (tod_tick_i) begin
+                // First external tick: reset TOD to discard the
+                // prescaler-fallback's pre-VBL ticks so wall-time
+                // measurement is clean.  Subsequent ticks increment.
+                tod                <= tod_tick_seen ? (tod + 24'd1) : 24'd1;
+                tod_prescale       <= 10'd0;
+                tod_tick_seen      <= 1'b1;
+            end else if (!tod_tick_seen) begin
+                if (tod_prescale == 10'd1023) begin
+                    tod_prescale <= 10'd0;
+                    tod          <= tod + 24'd1;
+                end else begin
+                    tod_prescale <= tod_prescale + 10'd1;
+                end
             end
             ta_just_underflowed <= 1'b0;
             tb_just_underflowed <= 1'b0;
