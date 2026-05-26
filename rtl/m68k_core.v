@@ -3117,6 +3117,68 @@ module m68k_core #(
             if (is_settled && ex_pc == 32'h00FC_1BEA)
                 $display("[REPLYMSG] r=%d msg=%h sp=%h",
                     retired, u_rf.regs[9], u_rf.regs[15]);
+            // [DOS-ADDTAIL]: dos.library bypasses exec PutMsg.  It enqueues
+            // packets via two BCPL wrappers that call AddTail directly:
+            //   $FF364C : 2-arg wrapper, A0=list, A1=msg already loaded
+            //   $FF3920 : 4-arg wrapper, A1=msg, A0 from caller, D0/D1=args
+            // Tracing these reveals dos's own packet flow that PUTMSG misses.
+            // The Initial-CLI wait diagnosis depends on knowing whether dos
+            // ever enqueues to port $A264 (Initial CLI's pr_MsgPort).
+            if (is_settled && ex_pc == 32'h00FF_364C)
+                $display("[DOS-ADDTAIL1] r=%d A0=%h A1=%h sp=%h",
+                    retired, u_rf.regs[8], u_rf.regs[9], u_rf.regs[15]);
+            if (is_settled && ex_pc == 32'h00FF_3920)
+                $display("[DOS-ADDTAIL2] r=%d A0=%h A1=%h D0=%h D1=%h sp=%h",
+                    retired, u_rf.regs[8], u_rf.regs[9],
+                    u_rf.regs[0], u_rf.regs[1], u_rf.regs[15]);
+            // [DOS-INIT-PC]: dos.library rt_Init entry + key milestones.
+            // Tracking whether dos init reaches each phase, and what its
+            // GetMsg call at $FF400A receives — if any.  The GetMsg is
+            // the suspected gate where dos awaits the bootblock setup
+            // packet that would tell Initial CLI to run startup-sequence.
+            if (is_settled && ex_pc == 32'h00FF_3E94)
+                $display("[DOS-RT-INIT] r=%d sp=%h", retired, u_rf.regs[15]);
+            if (is_settled && ex_pc == 32'h00FF_3FEC)
+                $display("[DOS-CREATEPROC] r=%d D7=%h sp=%h",
+                    retired, u_rf.regs[7], u_rf.regs[15]);
+            if (is_settled && ex_pc == 32'h00FF_400A)
+                $display("[DOS-GETMSG] r=%d A0=%h sp=%h",
+                    retired, u_rf.regs[8], u_rf.regs[15]);
+            if (is_settled && ex_pc == 32'h00FF_400E)
+                $display("[DOS-GETMSG-RET] r=%d D0=%h sp=%h",
+                    retired, u_rf.regs[0], u_rf.regs[15]);
+            if (is_settled && ex_pc == 32'h00FF_4014)
+                $display("[DOS-ALERT] r=%d D7=%h sp=%h",
+                    retired, u_rf.regs[7], u_rf.regs[15]);
+            // [OBTSEM]: ObtainSemaphore-like primitive at $FC2DF0 — increments
+            // a counter at $2C(A0), AddTails ThisTask onto a wait queue at
+            // $10(A0), then Wait($10).  Input.device is parked in this Wait
+            // post-r=4M.  Capturing A0 reveals which semaphore is held by
+            // whom and blocking the chain.
+            if (is_settled && ex_pc == 32'h00FC_2DF0)
+                $display("[OBTSEM] r=%d A0=%h sp=%h",
+                    retired, u_rf.regs[8], u_rf.regs[15]);
+            // [RELSEM]: matching Release-side primitive at $FC2E40 —
+            // decrements counters, signals next waiter.  Counts of this
+            // tell us if anyone EVER releases the semaphore input.device
+            // is waiting on.
+            if (is_settled && ex_pc == 32'h00FC_2E40)
+                $display("[RELSEM] r=%d A0=%h sp=%h",
+                    retired, u_rf.regs[8], u_rf.regs[15]);
+            // [SEM-WAIT]: trace specifically the Wait($10) call at
+            // $FC2E2A inside ObtainSemaphore (the bit-4 blocking point).
+            if (is_settled && ex_pc == 32'h00FC_2E2A)
+                $display("[SEM-WAIT] r=%d A0=%h sp=%h",
+                    retired, u_rf.regs[8], u_rf.regs[15]);
+            // [CACA-WR]: trace any memory write where the data being written
+            // has high 16 bits = $CACA (the uninitialized-fill marker).
+            // Locates the source of the corrupt A5=$CACACACA value that
+            // causes input.device's ObtainSemaphore deadlock.  Fires both
+            // for full $CACACACA longwords and partial $CACAxxxx writes.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_wdata[31:16] == 16'hCACA)
+                $display("[CACA-WR] r=%d pc=%h addr=%h be=%b wdata=%h",
+                    retired, ex_pc, dc_addr, dc_be, dc_wdata);
             // [SIGWAIT-WR]: any write to input.device.task ($3342) +
             // $16..$19 (tc_SigWait).  Helps find who's writing $10.
             if (dc_req_r && dc_we && dc_ack &&
