@@ -3287,6 +3287,17 @@ module m68k_core #(
                 && u_rf.regs[13] != a5_last_r)
                 $display("[A5-WIN] r=%d pc=%h new_a5=%h old_a5=%h op=%h",
                     retired, ex_pc, u_rf.regs[13], a5_last_r, ex_opcode);
+            // [5D80-WR] watch CPU writes to the MOVEM-source area
+            // $5D80..$5E00 in the 100K-retired window before the
+            // BAD-PC at r=4203012.  The MOVEM.L d16(PC) at $5D82
+            // reads $082800FC from this area into A5; we want to find
+            // who wrote that long there.  If no CPU writes show up,
+            // the data came in via disk DMA (off-CPU-bus) and the
+            // issue is upstream in MFM decode / disk pointer setup.
+            if (dc_req_r && dc_we && dc_ack
+                && dc_addr >= 32'h0000_5D80 && dc_addr <= 32'h0000_5E00)
+                $display("[5D80-WR] r=%d pc=%h addr=%h be=%b wdata=%h",
+                    retired, ex_pc, dc_addr, dc_be, dc_wdata);
             // [SIGWAIT-WR]: any write to input.device.task ($3342) +
             // $16..$19 (tc_SigWait).  Helps find who's writing $10.
             if (dc_req_r && dc_we && dc_ack &&
