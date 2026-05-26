@@ -3182,6 +3182,30 @@ module m68k_core #(
                 dc_wdata[31:16] == 16'hCACA)
                 $display("[CACA-WR] r=%d pc=%h addr=%h be=%b wdata=%h",
                     retired, ex_pc, dc_addr, dc_be, dc_wdata);
+            // [INTU-COPY]: capture A3 (and A2) at the intuition.library
+            // copy site at $FD550E that propagates $CACACACA from A3+$7C
+            // into A2+$10.  A3 reveals what struct holds the uninitialized
+            // field; the upstream emulator-bug is in whatever should
+            // initialize A3+$7C before this point.
+            if (is_settled && ex_pc == 32'h00FD_550E)
+                $display("[INTU-COPY] r=%d A2=%h A3=%h src=%h dst=%h sp=%h",
+                    retired, u_rf.regs[10], u_rf.regs[11],
+                    u_rf.regs[11] + 32'h7C,
+                    u_rf.regs[10] + 32'h10, u_rf.regs[15]);
+            // [INTU-COPY-EARLIER]: also fire on entry to the surrounding
+            // function so we see A3 at the function-entry point, before
+            // any local munging that the disassembler chokes on.
+            if (is_settled && ex_pc == 32'h00FD_5480)
+                $display("[INTU-FN-ENTRY] r=%d A2=%h A3=%h sp=%h",
+                    retired, u_rf.regs[10], u_rf.regs[11], u_rf.regs[15]);
+            // [INTU-STRUCT-WR]: catch ALL writes (any size) to the struct
+            // at $BE80..$BF20 (the intuition object A3 was pointing at).
+            // Especially interested in the field at offset +$7C (= $BEFC)
+            // which holds $CACACACA at boot wall.  Logs PC + addr + wdata.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h0000_BE80 && dc_addr <= 32'h0000_BF20)
+                $display("[INTU-STRUCT-WR] r=%d pc=%h addr=%h be=%b wdata=%h",
+                    retired, ex_pc, dc_addr, dc_be, dc_wdata);
             // [SIGWAIT-WR]: any write to input.device.task ($3342) +
             // $16..$19 (tc_SigWait).  Helps find who's writing $10.
             if (dc_req_r && dc_we && dc_ack &&
