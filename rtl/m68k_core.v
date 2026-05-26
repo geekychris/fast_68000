@@ -3247,6 +3247,18 @@ module m68k_core #(
                 dc_addr >= 32'h0000_C128 && dc_addr <= 32'h0000_C140)
                 $display("[WB-FLAGS-WR] r=%d pc=%h kind=%d addr=%h be=%b wdata=%h",
                     retired, ex_pc, ex_kind, dc_addr, dc_be, dc_wdata);
+            // [INTU-MKGADGET]: log intuition_base (= A6) at the entry
+            // to the gadget-template factory $FDE8E0.  Also log A0 at
+            // $FDE91A right before the 11-long template copy, so we
+            // know the template's source address — that's where the
+            // GadgetType field originates.
+            if (is_settled && ex_pc == 32'h00FD_E8E0)
+                $display("[INTU-MKGADGET] r=%d A6_base=%h sp=%h",
+                    retired, u_rf.regs[14], u_rf.regs[15]);
+            if (is_settled && ex_pc == 32'h00FD_E91A)
+                $display("[INTU-MKGADGET-TPL] r=%d A0_tpl=%h A2_dst=%h D3=%h D4=%h",
+                    retired, u_rf.regs[8], u_rf.regs[10],
+                    u_rf.regs[3], u_rf.regs[4]);
             // [STRAP-BOOT]: strap reached its bootblock-validate path.
             // At $FE85A4-AA strap checks (A4) == 'DOS\0' (the long-word
             // expected at $FE841C in ROM).  At $FE85C6 strap calls the
