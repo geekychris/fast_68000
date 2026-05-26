@@ -3270,6 +3270,23 @@ module m68k_core #(
                 && u_rf.regs[13] != a5_last_r)
                 $display("[A5-CHANGE] r=%d pc=%h new_a5=%h old_a5=%h",
                     retired, ex_pc, u_rf.regs[13], a5_last_r);
+            // [A5-BAD]: fires the first time A5 becomes $082800FC.  Drop
+            // is_settled so we catch the change even when written by an
+            // exception save/restore that doesn't go through a normal
+            // instruction-settle.
+            if (u_rf.regs[13] == 32'h0828_00FC
+                && a5_last_r != 32'h0828_00FC)
+                $display("[A5-BAD] r=%d pc=%h new_a5=%h prev_a5=%h op=%h ra=%h rb=%h",
+                    retired, ex_pc, u_rf.regs[13], a5_last_r,
+                    ex_opcode, ex_ra, ex_rb);
+            // [A5-WIN] log every A5 change in the 100K-retired window
+            // before the BAD-PC at r=4203012.  We need a wider view to
+            // see if A5 came from a long-load, a MOVEM, or an exception
+            // frame restore (RTE).
+            if (retired >= 32'd4100000 && retired <= 32'd4203100
+                && u_rf.regs[13] != a5_last_r)
+                $display("[A5-WIN] r=%d pc=%h new_a5=%h old_a5=%h op=%h",
+                    retired, ex_pc, u_rf.regs[13], a5_last_r, ex_opcode);
             // [SIGWAIT-WR]: any write to input.device.task ($3342) +
             // $16..$19 (tc_SigWait).  Helps find who's writing $10.
             if (dc_req_r && dc_we && dc_ack &&
