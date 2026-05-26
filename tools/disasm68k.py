@@ -263,8 +263,18 @@ def disasm_one(words: list[int], pc: int) -> tuple[str, int]:
         ea, n = decode_ea(mode, reg, "W", fetch)
         return f"MOVE    {ea}, CCR", 1 + n
 
-    # ---- MOVEM ----
-    if (op & 0xFB80) == 0x4880:
+    # ---- SWAP / EXT (must come before MOVEM — they share the high
+    # bits of the MOVEM mask but use EA mode 0 (Dn), which MOVEM does
+    # not allow).
+    if (op & 0xFFF8) == 0x4840:
+        return f"SWAP    D{op & 7}", 1
+    if (op & 0xFFB8) == 0x4880:
+        size = "L" if op & 0x40 else "W"
+        return f"EXT.{size}   D{op & 7}", 1
+
+    # ---- MOVEM (only for EA modes that MOVEM actually supports —
+    # mode 0 / 1 are EXT/SWAP, handled just above).
+    if (op & 0xFB80) == 0x4880 and ((op >> 3) & 7) not in (0, 1):
         dir_ = (op >> 10) & 1     # 0 = reg→mem, 1 = mem→reg
         is_long = (op >> 6) & 1
         size = "L" if is_long else "W"
@@ -286,14 +296,18 @@ def disasm_one(words: list[int], pc: int) -> tuple[str, int]:
         return f"MOVEM.{size} {regs}, {ea}", 2 + n
 
     # ---- ORI / ANDI / SUBI / ADDI / EORI / CMPI ----
-    # 0000_oop_ss_mmmrrr   where oop = which op (000=ORI, 001=, 010=SUBI,
-    # 011=ADDI, 101=EORI, 110=CMPI), and the destination-special form
-    # 0000_oop_0_011_1100 is "to CCR" (0000_oop_0_111_1100 = "to SR").
-    if (op & 0xF900) == 0x0000:
+    # 0000_oop_ss_mmmrrr   where oop = which op (000=ORI, 001=ANDI,
+    # 010=SUBI, 011=ADDI, 101=EORI, 110=CMPI; 100 is the static-bit-op
+    # family BTST/BCHG/BCLR/BSET handled below).  The destination-
+    # special form 0000_oop_0_011_1100 is "to CCR" (0000_oop_0_111_1100
+    # = "to SR").
+    # Mask 0xF100 keeps op_field (bits 11-9) free so CMPI / EORI
+    # (op_field 5 and 6, both of which have bit 11 set) also match.
+    if (op & 0xF100) == 0x0000:
         op_field = (op >> 9) & 7
-        names = {0: "ORI", 1: "BTST", 2: "SUBI", 3: "ADDI",
+        names = {0: "ORI", 1: "ANDI", 2: "SUBI", 3: "ADDI",
                  5: "EORI", 6: "CMPI"}
-        if op_field in (0, 2, 3, 5, 6):
+        if op_field in (0, 1, 2, 3, 5, 6):
             size_field = (op >> 6) & 3
             size = SIZES.get(size_field, "?")
             # immediate first
@@ -317,6 +331,32 @@ def disasm_one(words: list[int], pc: int) -> tuple[str, int]:
             ea, n = decode_ea(mode, reg, size,
                               lambda i: words[i + 1 + ns])
             return f"{names[op_field]}.{size} {imm_text}, {ea}", 1 + ns + n
+        if op_field == 4:
+            # Static bit-op (BTST/BCHG/BCLR/BSET #imm, <ea>).
+            #   0000_100_oo_mmm_rrr  where oo selects the operation; the
+            #   bit number is the low byte of the next word.  Size is
+            #   .L if EA is Dn, else .B.
+            bit_op = (op >> 6) & 3
+            mnem = ["BTST", "BCHG", "BCLR", "BSET"][bit_op]
+            mode = (op >> 3) & 7
+            reg = op & 7
+            bit_num = fetch(0) & 0xFF
+            size = "L" if mode == 0 else "B"
+            ea, n = decode_ea(mode, reg, size, lambda i: words[i + 2])
+            return f"{mnem}.{size}  #{bit_num}, {ea}", 2 + n
+
+    # ---- Dynamic bit-op: BTST/BCHG/BCLR/BSET Dn, <ea> -------------------
+    # 0000_DDD_1_oo_mmm_rrr.  bit 8 = 1 distinguishes this from the
+    # immediate-source ALU family above.
+    if (op & 0xF100) == 0x0100:
+        src = (op >> 9) & 7
+        bit_op = (op >> 6) & 3
+        mnem = ["BTST", "BCHG", "BCLR", "BSET"][bit_op]
+        mode = (op >> 3) & 7
+        reg = op & 7
+        size = "L" if mode == 0 else "B"
+        ea, n = decode_ea(mode, reg, size, fetch)
+        return f"{mnem}.{size}  D{src}, {ea}", 1 + n
 
     # ---- ALU register form: ADD/SUB/AND/OR/EOR/CMP with Dn ----
     # 1xxx_rrr_ooo_mmm_RRR : opcode bits 14-12 select ADD/SUB/AND/OR/EOR/CMP.
@@ -396,13 +436,6 @@ def disasm_one(words: list[int], pc: int) -> tuple[str, int]:
         reg = op & 7
         ea, n = decode_ea(mode, reg, size, fetch)
         return f"CLR.{size}   {ea}", 1 + n
-
-    # ---- SWAP / EXT ----
-    if (op & 0xFFF8) == 0x4840:
-        return f"SWAP    D{op & 7}", 1
-    if (op & 0xFFB8) == 0x4880:
-        size = "L" if op & 0x40 else "W"
-        return f"EXT.{size}   D{op & 7}", 1
 
     # ---- Fallback ----
     return f"DC.W    ${op:04X}", 1
