@@ -3295,7 +3295,7 @@ module m68k_core #(
             // the data came in via disk DMA (off-CPU-bus) and the
             // issue is upstream in MFM decode / disk pointer setup.
             if (dc_req_r && dc_we && dc_ack
-                && dc_addr >= 32'h0000_5D80 && dc_addr <= 32'h0000_5E00)
+                && dc_addr >= 32'h0000_5D00 && dc_addr <= 32'h0000_5E00)
                 $display("[5D80-WR] r=%d pc=%h addr=%h be=%b wdata=%h",
                     retired, ex_pc, dc_addr, dc_be, dc_wdata);
             // [SIGWAIT-WR]: any write to input.device.task ($3342) +
