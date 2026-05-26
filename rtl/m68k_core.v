@@ -3202,9 +3202,20 @@ module m68k_core #(
             // [INTU-COPY-EARLIER]: also fire on entry to the surrounding
             // function so we see A3 at the function-entry point, before
             // any local munging that the disassembler chokes on.
+            // $FD5480 is reached via fall-through from $FD547E in the
+            // function starting at $FD5416 (the intuition cleanup that
+            // tests bit-12 of D3 to decide minterms-copy vs JSR
+            // $FD4A6A pointer-resolve).  We log D3 to confirm bit-12
+            // state at the decision point.
             if (is_settled && ex_pc == 32'h00FD_5480)
-                $display("[INTU-FN-ENTRY] r=%d A2=%h A3=%h sp=%h",
-                    retired, u_rf.regs[10], u_rf.regs[11], u_rf.regs[15]);
+                $display("[INTU-FN-ENTRY] r=%d A2=%h A3=%h D3=%h sp=%h",
+                    retired, u_rf.regs[10], u_rf.regs[11],
+                    u_rf.regs[3], u_rf.regs[15]);
+            // [INTU-D1] log A1 at $FD5446 so we can see the struct
+            // pointer whose +$10 field selects the path.
+            if (is_settled && ex_pc == 32'h00FD_5446)
+                $display("[INTU-D1] r=%d A1=%h D3=%h sp=%h",
+                    retired, u_rf.regs[9], u_rf.regs[3], u_rf.regs[15]);
             // [INTU-STRUCT-WR]: catch ALL writes (any size) to the struct
             // at $BE80..$BF20 (the intuition object A3 was pointing at).
             // Especially interested in the field at offset +$7C (= $BEFC)
