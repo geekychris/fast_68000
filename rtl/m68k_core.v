@@ -3259,6 +3259,32 @@ module m68k_core #(
                 $display("[INTU-MKGADGET-TPL] r=%d A0_tpl=%h A2_dst=%h D3=%h D4=%h",
                     retired, u_rf.regs[8], u_rf.regs[10],
                     u_rf.regs[3], u_rf.regs[4]);
+            // [INTU-TPL-COPY] inside helper $FD643A at the MOVE.L (A1)+,(A0)+
+            // copy loop ($FD64AC).  Logs A1 (source) and A0 (dest) so we
+            // can verify A1 points to ROM template data ($FD6062 +
+            // computed offset).  If A1 points wrong → MULU bug.  If A1
+            // is right but chipram dest has zeros → MOVE.L-postinc bug.
+            if (is_settled && ex_pc == 32'h00FD_64AC)
+                $display("[INTU-TPL-COPY] r=%d A0=%h A1=%h D0=%h",
+                    retired, u_rf.regs[8], u_rf.regs[9], u_rf.regs[0]);
+            // Bisect the A1=$00006062-instead-of-$00FD6062 bug.
+            // $FD644A loads A3 = #$00FD6062 via MOVEA.L #imm.L.
+            // $FD649A copies A3 to A0 via MOVEA.L A3,A0.
+            // $FD64A4 copies A0 to A1 via MOVEA.L A0,A1.
+            // $FD64A6 adds D0.W to A1 via ADDA.W.
+            // Log A-reg values at each of these PCs.
+            if (is_settled && ex_pc == 32'h00FD_644A)
+                $display("[BISECT-A3-LOAD] r=%d A3_before=%h", retired, u_rf.regs[11]);
+            if (is_settled && ex_pc == 32'h00FD_6450)
+                $display("[BISECT-A3-AFTER] r=%d A3_after=%h", retired, u_rf.regs[11]);
+            if (is_settled && ex_pc == 32'h00FD_649A)
+                $display("[BISECT-A3-USE] r=%d A3=%h A0_before=%h", retired, u_rf.regs[11], u_rf.regs[8]);
+            if (is_settled && ex_pc == 32'h00FD_64A4)
+                $display("[BISECT-A0] r=%d A0=%h A1_before=%h", retired, u_rf.regs[8], u_rf.regs[9]);
+            if (is_settled && ex_pc == 32'h00FD_64A6)
+                $display("[BISECT-A1] r=%d A1=%h D0=%h", retired, u_rf.regs[9], u_rf.regs[0]);
+            if (is_settled && ex_pc == 32'h00FD_64A8)
+                $display("[BISECT-A1-FINAL] r=%d A1=%h", retired, u_rf.regs[9]);
             // [STRAP-BOOT]: strap reached its bootblock-validate path.
             // At $FE85A4-AA strap checks (A4) == 'DOS\0' (the long-word
             // expected at $FE841C in ROM).  At $FE85C6 strap calls the
