@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <vector>
 #include <utility>
+#include <string>
 
 #ifdef HAVE_SDL2
 #include <SDL.h>
@@ -410,6 +411,58 @@ static int run_regression(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
     uint64_t cycle = 0;
     size_t   poke_idx = 0;
     uint64_t poke_next_cycle = poke_cycle;
+
+    // CHIPRAM_SNAP_PCS - PC-triggered chip-RAM snapshot list.
+    //
+    // Env var format: comma-separated entries `pc[:label]`, where pc is
+    // a 24-bit hex value (with or without 0x/$) and label is an optional
+    // tag used in the dump filename.  When core 0's EX-stage PC enters
+    // one of these values, the simulator writes the full 512 KB of chip
+    // RAM to `<CHIPRAM_SNAP_DIR>/snap_<retired>_<label-or-pc>.bin` (the
+    // directory defaults to the working directory).  Each PC fires
+    // multiple times if execution re-enters it — useful for diffing
+    // memory across iterations.
+    //
+    // Example: catch the bad MOVEM source at PC=$5D82, every fire:
+    //   CHIPRAM_SNAP_PCS=5D82:movem-src \
+    //   CHIPRAM_SNAP_DIR=/tmp/snaps     ./Vm68k_top 30000000
+    //
+    // The PC compare uses the 24-bit address mask (68000 ignores upper
+    // 8 bits) so $00FD5482 and $FFFD5482 both match a configured "fd5482".
+    struct SnapTrigger {
+        uint32_t pc24;     // 24-bit masked PC value
+        std::string label; // filename tag
+    };
+    std::vector<SnapTrigger> snap_triggers;
+    std::string snap_dir = ".";
+    if (const char* d = std::getenv("CHIPRAM_SNAP_DIR")) snap_dir = d;
+    if (const char* s = std::getenv("CHIPRAM_SNAP_PCS")) {
+        const char* p = s;
+        while (*p) {
+            const char* end = p;
+            while (*end && *end != ',') end++;
+            std::string ent(p, end);
+            size_t colon = ent.find(':');
+            std::string pc_str = ent.substr(0, colon);
+            std::string label  = (colon == std::string::npos) ? std::string()
+                                                              : ent.substr(colon + 1);
+            // Accept 0x, $, or bare hex.
+            if (!pc_str.empty() && pc_str[0] == '$') pc_str = pc_str.substr(1);
+            uint32_t pc = (uint32_t)std::strtoul(pc_str.c_str(), nullptr, 16);
+            if (label.empty()) {
+                char buf[16]; std::snprintf(buf, sizeof(buf), "pc%06X", pc & 0xFFFFFF);
+                label = buf;
+            }
+            snap_triggers.push_back({pc & 0xFFFFFFu, label});
+            printf("[sim] CHIPRAM_SNAP_PCS pc=$%06X label=%s (dir=%s)\n",
+                   pc & 0xFFFFFFu, label.c_str(), snap_dir.c_str());
+            p = end;
+            if (*p == ',') p++;
+        }
+    }
+    uint32_t last_core0_pc = 0xFFFFFFFFu;  // sentinel: never matches a real PC
+    int snap_seq = 0;
+
     while (cycle < max_cycles && !all_halted()) {
         // Default ext_kbd_wr to 0; the injection block below pulses it
         // for exactly one cycle when a scancode is due.
@@ -472,6 +525,44 @@ static int run_regression(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
         top->clk = 0; top->eval();
         top->clk = 1; top->eval();
         cycle++;
+
+        // CHIPRAM_SNAP: check core 0's EX-stage PC each cycle.  Fire on
+        // the rising edge (PC transitions INTO a configured value) so a
+        // long STOP at a snap PC doesn't fire thousands of times.
+        if (!snap_triggers.empty()) {
+            const uint32_t* pc_arr = reinterpret_cast<const uint32_t*>(&top->core_pc_flat);
+            uint32_t cur_pc = pc_arr[0] & 0xFFFFFFu;
+            if (cur_pc != last_core0_pc) {
+                for (const auto& t : snap_triggers) {
+                    if (t.pc24 == cur_pc) {
+                        const uint32_t* r_arr =
+                            reinterpret_cast<const uint32_t*>(&top->retired_flat);
+                        char path[1024];
+                        std::snprintf(path, sizeof(path),
+                            "%s/snap_%d_%s_r%u.bin",
+                            snap_dir.c_str(), snap_seq++,
+                            t.label.c_str(), r_arr[0]);
+                        std::FILE* f = std::fopen(path, "wb");
+                        if (f) {
+                            for (uint32_t addr = 0; addr < 0x80000; addr += 4) {
+                                uint32_t w = mem_peek_word(top, addr);
+                                uint8_t b[4] = {
+                                    (uint8_t)(w >> 24), (uint8_t)(w >> 16),
+                                    (uint8_t)(w >> 8),  (uint8_t)w};
+                                std::fwrite(b, 1, 4, f);
+                            }
+                            std::fclose(f);
+                            printf("[sim] CHIPRAM_SNAP %s "
+                                   "(pc=$%06X retired=%u cycle=%llu)\n",
+                                   path, cur_pc, r_arr[0],
+                                   (unsigned long long)cycle);
+                        }
+                    }
+                }
+            }
+            last_core0_pc = cur_pc;
+        }
+
         if ((cycle & (CONSOLE_POLL - 1)) == 0) drain_console(top, host_tail);
     }
     drain_console(top, host_tail);

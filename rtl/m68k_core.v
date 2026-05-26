@@ -64,7 +64,11 @@ module m68k_core #(
     // External logic (Agnus beam counter, CIA tick) may use this to
     // fast-forward sim time during long idle stretches without changing
     // observable behavior — the CPU only resumes when an IRQ redirects PC.
-    output wire        cpu_in_stop
+    output wire        cpu_in_stop,
+    // Current EX-stage PC, exposed so the simulator harness can trigger
+    // chipram snapshots at specific instructions.  Pure observation -
+    // no functional impact.  See DIAGNOSTICS.md "CHIPRAM_SNAP_PCS".
+    output wire [31:0] cur_pc
 );
     assign ic_we    = 1'b0;
     assign ic_lock  = 1'b0;
@@ -1194,6 +1198,7 @@ module m68k_core #(
         else if (redirect_valid)          cpu_in_stop_r <= 1'b0;
     end
     assign cpu_in_stop = cpu_in_stop_r;
+    assign cur_pc      = ex_pc;
     wire bcc_mispred   = is_settled && (ex_kind == K_BCC) && (ex_predicted_taken != take_branch_c);
     wire other_branch  = is_settled && (ex_kind != K_BCC) && take_branch_c;
     wire exc_redirect  = is_settled_after_exc || is_settled_after_rte;
