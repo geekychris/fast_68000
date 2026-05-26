@@ -341,8 +341,9 @@ module m68k_core #(
                     !(redirect_pc[31:19] == 13'b1111_1000_0000_1) && // 0xF90000-0xF97FFF
                     !(redirect_pc >= 32'h00F80000 &&
                       redirect_pc <= 32'h00FFFFFF))
-                    $display("[BAD-PC] from=%h to=%h retired=%d kind=%d sp=%h",
-                        ex_pc, redirect_pc, retired, ex_kind, rf_rc_data);
+                    $display("[BAD-PC] from=%h to=%h retired=%d kind=%d sp=%h op=%h ra=%h rb=%h",
+                        ex_pc, redirect_pc, retired, ex_kind, rf_rc_data,
+                        ex_opcode, ex_ra, ex_rb);
                 // Also trace any redirect landing in the vector table
                 // ($0-$3FF) — that's "control transferred to data" which
                 // is virtually always wrong outside of exception entry.
