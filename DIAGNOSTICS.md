@@ -211,7 +211,93 @@ was pinned to a single instruction at `$FD64A6`:
 [BISECT-A1-FINAL]  A1=$00006062   ; ADDA.W D0,A1 — WRONG
 ```
 
-## 3. Working with the ROM + ADF images
+## 3. PC-triggered chip-RAM snapshots — `CHIPRAM_SNAP_PCS`
+
+`CHIPRAM_DUMP=path` captures chip-RAM only at end of sim, which
+is often too late — by the time you see the failure, the relevant
+state has been overwritten.  `CHIPRAM_SNAP_PCS` lets you snapshot
+**mid-simulation** whenever core 0's EX-stage PC enters one of a
+list of configured values.
+
+Each snapshot is a separate 512 KB binary, named
+`<DIR>/snap_<seq>_<label>_r<retired>.bin`, so you can diff across
+multiple iterations of the same PC.
+
+### Usage
+
+```sh
+CHIPRAM_SNAP_PCS=5D82:movem-src,5D90:bad-jsr \
+CHIPRAM_SNAP_DIR=/tmp/snaps                  \
+./build_kick_boot/Vm68k_top 30000000
+```
+
+Env vars:
+* `CHIPRAM_SNAP_PCS` — comma-separated entries `pc[:label]`.  `pc`
+  is hex (with or without `$`/`0x` prefix), masked to 24 bits to
+  match 68000's external address bus.  `label` is an optional
+  filename tag; defaults to `pcXXXXXX`.
+* `CHIPRAM_SNAP_DIR` — output directory.  Defaults to current dir.
+
+On each fire the sim prints:
+
+```
+[sim] CHIPRAM_SNAP /tmp/snaps/snap_3_movem-src_r4203008.bin
+      (pc=$005D82 retired=4203008 cycle=16812345)
+```
+
+so you can correlate with the `retired=` values shown in trace
+markers.
+
+### How it fires (and what to know)
+
+`cur_pc` is exposed at the m68k_core's output and routed through
+`m68k_top.core_pc_flat`.  Detection is **edge-triggered** — fires
+on the cycle PC transitions INTO a trigger value, then waits for
+PC to leave and come back before firing again.
+
+* A long STOP at the trigger PC fires exactly once.
+* A multi-cycle instruction at the trigger PC fires exactly once
+  (the cycle ex_pc is updated to the trigger value).
+* If the only path to the trigger PC is from within the trigger
+  itself (a tight self-loop), only the first entry fires.
+
+### Inspecting snapshots
+
+Same Python walkers work on snapshots as on `CHIPRAM_DUMP` outputs
+— each snap is a full 512 KB chip RAM image starting at byte 0.
+
+```sh
+python3 tools/screen_walk.py /tmp/snaps/snap_3_movem-src_r4203008.bin
+python3 tools/task_walk.py   /tmp/snaps/snap_3_movem-src_r4203008.bin
+```
+
+For ad-hoc inspection:
+
+```sh
+python3 -c "
+with open('/tmp/snaps/snap_3_movem-src_r4203008.bin','rb') as f:
+    data = f.read()
+for addr in (0x5D4A, 0x5D4E, 0x5D52):
+    v = int.from_bytes(data[addr:addr+4], 'big')
+    print(f'\${addr:08X}: \${v:08X}')
+"
+```
+
+### When to reach for it
+
+* You have a register that takes a bad value at a specific PC and
+  you need to know what's in memory at the moment that instruction
+  executes.
+* You want to confirm whether a write that "should be there" is in
+  chip RAM or only in cache.
+* You want to diff chip RAM across two iterations of the same loop
+  (snap twice on the same PC, diff with `cmp` or a Python loop).
+
+The feature has no runtime cost when no PCs are configured; with
+PCs configured it costs one extra check per cycle (negligible) and
+~50 ms per snap fire (the 512 KB read).
+
+## 4. Working with the ROM + ADF images
 
 ### Searching ROM/ADF for a literal value
 
@@ -239,6 +325,28 @@ Run our RTL against an independent reference (Musashi, MiniMig, or
 FX68K).  See `COSIM.md` for the full guide.  Use these when you've
 narrowed a bug to a specific CPU instruction or chipset register
 behaviour — the cosim will tell you which side is correct.
+
+## 5. The 24-bit address-bus quirk
+
+The 68000 has a 24-bit external bus (A1..A23).  PCs and effective
+addresses are computed internally as 32-bit values but only the low
+24 bits go onto the bus.  Our redirect-mask logic (`m68k_top.v`
+around line 364) enforces this:
+
+```
+if_pc <= {8'd0, redirect_pc[23:0]};
+```
+
+K1.3 stores function pointers with garbage in the top byte — e.g.
+the boot vector at `$08` may contain `$7800090E` and yet correctly
+fetch at `$90E`.  So a `BAD-PC from=X to=Y` trace where Y has high
+bits set is normal-on-real-Amiga; our sim just shows the unmasked
+value for clarity.
+
+If you see a register that is supposed to be a chip-RAM pointer
+but has high bits set (like `A5=$082800FC`), that points to a
+relocation / pointer-load bug *upstream* of the address bus —
+not a bus-masking issue.
 
 ## A worked example — the ADDA.W bug
 
