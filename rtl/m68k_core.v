@@ -920,6 +920,9 @@ module m68k_core #(
     // the CPU sits halted at the same STOP PC.
     reg [31:0] stop_logged_pc;
     reg        dos_init_seen;
+    // Previous value of A5 register, for the [A5-CHANGE] edge trace
+    // (used in the WB1.3 corrupt-semaphore investigation).
+    reg [31:0] a5_last_r;
     // Edge tracker for [USPTINY]: prevents re-firing while user-mode A7
     // sits below $200 (e.g. a Forbid/Permit nested loop that keeps SP small).
     reg        user_a7_was_tiny;
@@ -2847,6 +2850,7 @@ module m68k_core #(
             halt_code <= 16'd0;
             retired <= 32'd0;
             stop_logged_pc <= 32'hFFFF_FFFF;
+            a5_last_r <= 32'd0;
             user_a7_was_tiny <= 1'b0;
             super_a7_was_tiny <= 1'b0;
             dos_init_seen <= 1'b0;
@@ -3048,6 +3052,9 @@ module m68k_core #(
                     retired, ex_pc, ex_src_imm32[15:0]);
                 stop_logged_pc <= ex_pc;
             end
+            // Sample A5 each cycle so the [A5-CHANGE] edge trace below
+            // sees the previous value.
+            a5_last_r <= u_rf.regs[13];
             // Trace CPU writes to Copper-list-pointer regs (COP1LC / COP2LC).
             // Useful to see when (if) Intuition.OpenScreen installs a new
             // screen Copper list, which on a successful boot screen would
@@ -3206,6 +3213,14 @@ module m68k_core #(
                 dc_addr >= 32'h0000_BE80 && dc_addr <= 32'h0000_BF20)
                 $display("[INTU-STRUCT-WR] r=%d pc=%h addr=%h be=%b wdata=%h",
                     retired, ex_pc, dc_addr, dc_be, dc_wdata);
+            // [A5-CHANGE]: track every change to A5 (= u_rf.regs[13]) during
+            // the deadlock window r=4057000..4060000.  CON's BCPL code in
+            // this window loads A5 with $CACACACA somewhere, then computes
+            // A5+$48 → corrupt semaphore.  Pin down the exact instruction.
+            if (is_settled && retired >= 32'd4057000 && retired <= 32'd4060000
+                && u_rf.regs[13] != a5_last_r)
+                $display("[A5-CHANGE] r=%d pc=%h new_a5=%h old_a5=%h",
+                    retired, ex_pc, u_rf.regs[13], a5_last_r);
             // [SIGWAIT-WR]: any write to input.device.task ($3342) +
             // $16..$19 (tc_SigWait).  Helps find who's writing $10.
             if (dc_req_r && dc_we && dc_ack &&
