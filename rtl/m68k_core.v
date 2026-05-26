@@ -3096,6 +3096,27 @@ module m68k_core #(
             if (is_settled && ex_pc == 32'h00FC_1E84)
                 $display("[SIGNAL-CALL] r=%d task=%h mask=%h sp=%h",
                     retired, u_rf.regs[9], u_rf.regs[0], u_rf.regs[15]);
+            // [TD-BEGIO]: trace every entry into trackdisk.device.BeginIO
+            // at $FE9C3E with the IORequest pointer (A1).  Used to find
+            // out whether the chip-RAM FileHandler task is actually
+            // submitting fresh TD_READ requests or just pinging
+            // trackdisk with no new work.  After cd83a77, post-strap
+            // WB1.3 boot enters a trackdisk<->FS signal loop that does
+            // NOT produce new DSKLEN writes -- this trace tells us why.
+            if (is_settled && ex_pc == 32'h00FE_9C3E)
+                $display("[TD-BEGIO] r=%d A1=%h sp=%h",
+                    retired, u_rf.regs[9], u_rf.regs[15]);
+            // [PUTMSG]: trace every entry into PutMsg (LVO -$16E body
+            // at $FC1B70).  A0 = port, A1 = message.  Confirms whether
+            // the FileHandler-task signal storm includes real packet
+            // submissions or just spurious Signal calls.
+            if (is_settled && ex_pc == 32'h00FC_1B70)
+                $display("[PUTMSG] r=%d port=%h msg=%h sp=%h",
+                    retired, u_rf.regs[8], u_rf.regs[9], u_rf.regs[15]);
+            // [REPLYMSG]: LVO -$174, body at $FC1BEA.  A1 = message.
+            if (is_settled && ex_pc == 32'h00FC_1BEA)
+                $display("[REPLYMSG] r=%d msg=%h sp=%h",
+                    retired, u_rf.regs[9], u_rf.regs[15]);
             // [SIGWAIT-WR]: any write to input.device.task ($3342) +
             // $16..$19 (tc_SigWait).  Helps find who's writing $10.
             if (dc_req_r && dc_we && dc_ack &&
