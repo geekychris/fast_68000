@@ -3304,6 +3304,16 @@ module m68k_core #(
             if (is_settled && ex_pc == 32'h00FD_64AC)
                 $display("[INTU-TPL-COPY] r=%d A0=%h A1=%h D0=%h",
                     retired, u_rf.regs[8], u_rf.regs[9], u_rf.regs[0]);
+            // [VEC-WR] any CPU write to chip-RAM vector \$10-\$13 (the
+            // ILLEGAL trap address).  Post-ADDA.W fix, WB1.3 boot hits
+            // an ILLEGAL-loop at r=4.2M because vector \$10 ends up
+            // pointing at \$FC00B6 (exec's Resident matchword \$4AFC,
+            // which is itself an ILLEGAL opcode).  We need to find what
+            // wrote that bad value.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h0000_0010 && dc_addr <= 32'h0000_0013)
+                $display("[VEC-WR] r=%d pc=%h addr=%h be=%b wdata=%h",
+                    retired, ex_pc, dc_addr, dc_be, dc_wdata);
             // Bisect the A1=$00006062-instead-of-$00FD6062 bug.
             // $FD644A loads A3 = #$00FD6062 via MOVEA.L #imm.L.
             // $FD649A copies A3 to A0 via MOVEA.L A3,A0.
