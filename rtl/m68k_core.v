@@ -3238,6 +3238,15 @@ module m68k_core #(
                 dc_addr >= 32'h0000_3358 && dc_addr <= 32'h0000_335B)
                 $display("[SIGWAIT-WR] r=%d pc=%h kind=%d addr=%h be=%b wdata=%h",
                     retired, ex_pc, ex_kind, dc_addr, dc_be, dc_wdata);
+            // [WB-FLAGS-WR]: any write to the struct at $C128 (the one
+            // whose +$10 word selects intuition's cleanup path).  Field
+            // at +$10 lives at $C138..$C13B; we widen the watch slightly
+            // to catch the Flags long-write at $C136 (since +$0E is a UL
+            // Flags field if this is a Window struct).
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h0000_C128 && dc_addr <= 32'h0000_C140)
+                $display("[WB-FLAGS-WR] r=%d pc=%h kind=%d addr=%h be=%b wdata=%h",
+                    retired, ex_pc, ex_kind, dc_addr, dc_be, dc_wdata);
             // [STRAP-BOOT]: strap reached its bootblock-validate path.
             // At $FE85A4-AA strap checks (A4) == 'DOS\0' (the long-word
             // expected at $FE841C in ROM).  At $FE85C6 strap calls the
