@@ -3170,11 +3170,14 @@ module m68k_core #(
             if (is_settled && ex_pc == 32'h00FC_2E2A)
                 $display("[SEM-WAIT] r=%d A0=%h sp=%h",
                     retired, u_rf.regs[8], u_rf.regs[15]);
-            // [CACA-WR]: trace any memory write where the data being written
-            // has high 16 bits = $CACA (the uninitialized-fill marker).
-            // Locates the source of the corrupt A5=$CACACACA value that
-            // causes input.device's ObtainSemaphore deadlock.  Fires both
-            // for full $CACACACA longwords and partial $CACAxxxx writes.
+            // [CACA-WR]: trace memory writes carrying $CACA in the high half
+            // of wdata — catches the K1.3 table-copy routine at $FC6BE0 that
+            // copies $CA-bytes into chip-RAM (intentionally; the table at
+            // $FC6BB2 has $CA at offsets +$0B and +$0F).  These writes
+            // deposit $CACACACA into chip-RAM struct fields that are then
+            // misread by intuition.library at $FD550E and cause the
+            // ObtainSemaphore deadlock.  Narrow filter so the trace is
+            // signal not noise.
             if (dc_req_r && dc_we && dc_ack &&
                 dc_wdata[31:16] == 16'hCACA)
                 $display("[CACA-WR] r=%d pc=%h addr=%h be=%b wdata=%h",

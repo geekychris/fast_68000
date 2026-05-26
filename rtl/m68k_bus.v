@@ -1414,6 +1414,18 @@ module m68k_bus #(
                         $display("[SEC1_WR] cyc=%0d DMA dst=%h off=%h data=%h",
                             cyc_count, blk_cur_dst, blk_cur_off, disk[blk_cur_off[DISK_IDX_BITS+1:2]]);
 `endif
+`ifdef KICKSTART_BOOT_TRACE
+                    // [CACA-WR-DMA]: counterpart to the CPU CACA-WR trace
+                    // in m68k_core.v.  Disk DMA writes bypass the CPU's
+                    // dc_we path, so $CACA fills coming from MFM-decoded
+                    // disk data wouldn't otherwise show up.  Catch any
+                    // longword OR either half containing $CACA.
+                    if (disk[blk_cur_off[DISK_IDX_BITS+1:2]][31:16] == 16'hCACA ||
+                        disk[blk_cur_off[DISK_IDX_BITS+1:2]][15:0]  == 16'hCACA)
+                        $display("[CACA-WR-DMA] dst=%h off=%h data=%h",
+                            blk_cur_dst, blk_cur_off,
+                            disk[blk_cur_off[DISK_IDX_BITS+1:2]]);
+`endif
                     blk_cur_off <= blk_cur_off + 32'd4;
                     blk_cur_dst <= blk_cur_dst + 32'd4;
                 end
