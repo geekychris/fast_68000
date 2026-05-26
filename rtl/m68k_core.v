@@ -1370,6 +1370,34 @@ module m68k_core #(
                             // cosim at K1.3 boot $FC01D2 (SUBA.W #$FD8A, A6)
                             // -- our core was clobbering N/Z/C and the
                             // very next instruction took the wrong branch.
+                            //
+                            // ADDA/SUBA semantics (per the 68k spec): the
+                            // operation is ALWAYS 32-bit on the destination
+                            // An.  For ADDA.W / SUBA.W, the *source* is
+                            // sign-extended from word to long; the *full*
+                            // 32-bit An is then added/subtracted.  Our
+                            // size-aware ALU masks BOTH operands to the
+                            // op size, which zeroes A1's high byte on
+                            // e.g. `ADDA.W D0, A1` with A1 = $00FD6062 and
+                            // D0 = 0 -- result wrongly becomes $00006062.
+                            // Fix: when An is the destination of ADD/SUB,
+                            // force alu_size_c = SZ_L and sign-extend the
+                            // source from W to L (if size was .W).  Surfaced
+                            // by the WB1.3 deadlock at r=4058118: intuition
+                            // template-init helper ($FD643A) uses ADDA.W
+                            // D0,A1 to add an offset to a ROM ptr; high
+                            // byte was being silently dropped, so the
+                            // 11-long template copy ran from chip-RAM
+                            // garbage instead of from ROM at $FD6062.
+                            if (ex_reg_idx_full[3] &&
+                                (ex_alu_op == `ALU_ADD ||
+                                 ex_alu_op == `ALU_SUB)) begin
+                                alu_size_c = `SZ_L;
+                                alu_b = (ex_size == `SZ_W)
+                                        ? {{16{src_operand[15]}},
+                                           src_operand[15:0]}
+                                        : src_operand;
+                            end
                             if (!(ex_reg_idx_full[3] &&
                                   (ex_alu_op == `ALU_ADD ||
                                    ex_alu_op == `ALU_SUB))) begin
@@ -1395,6 +1423,15 @@ module m68k_core #(
                                                 ? {1'b0, ex_src_reg}
                                                 : ex_reg_idx_full;
                                 wb_main_data_c = alu_y;
+                                // ADDA/SUBA always write the full 32-bit
+                                // An -- override the per-instruction size
+                                // so the wb size matches the ALU size we
+                                // just forced to SZ_L.
+                                if (ex_reg_idx_full[3] &&
+                                    (ex_alu_op == `ALU_ADD ||
+                                     ex_alu_op == `ALU_SUB)) begin
+                                    wb_main_size_c = `SZ_L;
+                                end
                             end
                         end
                     end
