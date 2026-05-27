@@ -297,7 +297,57 @@ The feature has no runtime cost when no PCs are configured; with
 PCs configured it costs one extra check per cycle (negligible) and
 ~50 ms per snap fire (the 512 KB read).
 
-## 4. Working with the ROM + ADF images
+## 4. PC histogram — `PC_HISTOGRAM`
+
+The flip side of `CHIPRAM_SNAP_PCS`: when you don't know which PC
+to snap at, the histogram tells you where the CPU is spending its
+time.
+
+```sh
+cd build_kick_boot
+PC_HISTOGRAM=1                       \
+PC_HISTOGRAM_BUCKET_BITS=4           \
+PC_HISTOGRAM_TOP=20                  \
+./Vm68k_top 200000000
+```
+
+Env vars:
+* `PC_HISTOGRAM=1` — enable (default off, zero overhead when off).
+* `PC_HISTOGRAM_INTERVAL=N` — sample every N host cycles
+  (default `1024`).
+* `PC_HISTOGRAM_TOP=K` — show top K buckets (default `30`).
+* `PC_HISTOGRAM_BUCKET_BITS=B` — lop off low B bits to group nearby
+  PCs (default `0` = exact PC; `4` = per-16-byte region; `8` =
+  per-256-byte region).
+
+Output at sim end:
+
+```
+[sim] PC_HISTOGRAM total_samples=195312 buckets=1035, showing top 20:
+  $FC2250       76644 samples ( 39.24%)
+  $FC2240       76643 samples ( 39.24%)
+  $FC2260       15332 samples (  7.85%)
+  $FC3130        7042 samples (  3.61%)
+  ...
+```
+
+### When to reach for it
+
+* The boot reaches some state then stops emitting traces — you need
+  to know what loop it entered.  (E.g. WB1.3 post-MOVEM-fix went
+  silent post-r=4.9M; the histogram revealed 78% of time in K1.3's
+  serial-port poll loop.)
+* You're working on performance and want to confirm the hot loop
+  isn't where you expect.
+* You want to verify a fix actually removed a tight loop (compare
+  pre/post histograms).
+
+The bucket-bits setting is useful for "what region of code is hot"
+vs. "exact instruction is hot."  Set it to 4 to merge adjacent
+instructions of a tight loop into one bucket; the count then
+roughly reflects time-in-the-function rather than time-at-one-PC.
+
+## 5. Working with the ROM + ADF images
 
 ### Searching ROM/ADF for a literal value
 
@@ -326,7 +376,7 @@ FX68K).  See `COSIM.md` for the full guide.  Use these when you've
 narrowed a bug to a specific CPU instruction or chipset register
 behaviour — the cosim will tell you which side is correct.
 
-## 5. The 24-bit address-bus quirk
+## 6. The 24-bit address-bus quirk
 
 The 68000 has a 24-bit external bus (A1..A23).  PCs and effective
 addresses are computed internally as 32-bit values but only the low
