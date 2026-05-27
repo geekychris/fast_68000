@@ -3302,6 +3302,27 @@ module m68k_core #(
                     u_rf.regs[0], u_rf.regs[1], u_rf.regs[2],
                     u_rf.regs[8], u_rf.regs[9],
                     u_rf.regs[12], u_rf.regs[13], u_rf.regs[14]);
+            // [GURU-PC10E4]: the WB1.3 Guru saved-PC is $000010E4 (= File
+            // System MsgPort area, not code).  Catch any redirect to that
+            // address (which BAD-PC misses since it's in chip-RAM range).
+            // Logs the FROM PC + the instruction op so we can identify
+            // the bad RTS/JSR/JMP.
+            if (redirect_valid && redirect_pc == 32'h0000_10E4 &&
+                redirect_pc != ex_pc)
+                $display("[GURU-PC10E4] from=%h to=%h retired=%d kind=%d sp=%h op=%h ra=%h rb=%h",
+                    ex_pc, redirect_pc, retired, ex_kind, rf_rc_data,
+                    ex_opcode, ex_ra, ex_rb);
+            // Also: trace any CHIP-RAM redirect below the standard 64KB
+            // code region ($0..$FFFF) -- those are likely jumps into
+            // vector tables, struct fields, MsgPorts, etc.  Excludes
+            // legitimate exception vectors (= jumping to vec-handler
+            // address in ROM-range, not low chip RAM).
+            if (redirect_valid && redirect_pc < 32'h0000_8000 &&
+                redirect_pc >= 32'h0000_0400 &&
+                redirect_pc != ex_pc)
+                $display("[CHIPRAM-LOW-PC] from=%h to=%h retired=%d kind=%d sp=%h op=%h",
+                    ex_pc, redirect_pc, retired, ex_kind, rf_rc_data,
+                    ex_opcode);
             // [5D80-WR] watch CPU writes to the MOVEM-source area
             // $5D80..$5E00 in the 100K-retired window before the
             // BAD-PC at r=4203012.  The MOVEM.L d16(PC) at $5D82
