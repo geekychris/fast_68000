@@ -1726,6 +1726,15 @@ module m68k_bus #(
                     if (be[winner][1]) mem[mem_idx][15:8]  <= wdata[winner][15:8];
                     if (be[winner][0]) mem[mem_idx][7:0]   <= wdata[winner][7:0];
                 end
+                // [C2CC-BUS-WR] -- catch ALL writers (CPU, blitter, disk DMA,
+                // etc.) to chip-RAM \$C2AC..\$C2D0 (the 32-byte slot around
+                // the bad-RTS return PC at \$FCF104).  The CPU-only [C2CC-WR]
+                // trace in m68k_core.v misses some writes -- this fires at
+                // the actual mem[] commit, regardless of source.
+                if (addr[winner] >= 32'h0000_C2AC &&
+                    addr[winner] <= 32'h0000_C2D0)
+                    $display("[C2CC-BUS-WR] t=%0t port=%0d addr=%h be=%b wdata=%h",
+                        $time, winner, addr[winner], be[winner], wdata[winner]);
 `ifdef HDRCHK_WATCH
                 // Watch writes that touch \$64DC..\$64E7 (hdr_chk + data_chk
                 // pair in the K1.3 disk-decode buffer).  Helps pin down what
