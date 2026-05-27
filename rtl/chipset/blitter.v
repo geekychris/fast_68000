@@ -403,8 +403,9 @@ module blitter (
                         // Start a blit.  BLTSIZE write only triggers if not busy.
                         if (!blt_busy) begin
 `ifdef KICKSTART_BOOT_TRACE
-                            $display("[BLT_START] bltcon=%h bltapt=%h bltbpt=%h bltcpt=%h bltdpt=%h bltsize=%h",
-                                bltcon, bltapt, bltbpt, bltcpt, bltdpt, slv_wdata[15:0]);
+                            $display("[BLT_START] bltcon=%h bltapt=%h bltbpt=%h bltcpt=%h bltdpt=%h bltsize=%h bltamod=%h bltbmod=%h bltcmod=%h bltdmod=%h",
+                                bltcon, bltapt, bltbpt, bltcpt, bltdpt, slv_wdata[15:0],
+                                bltamod, bltbmod, bltcmod, bltdmod);
 `endif
                             blt_height <= slv_wdata[21:6];
                             // width 0 (= 64) is a real-Amiga quirk; we treat 0 as 64.
