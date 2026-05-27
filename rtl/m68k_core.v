@@ -3292,6 +3292,16 @@ module m68k_core #(
                 && u_rf.regs[13] != a5_last_r)
                 $display("[A5-WIN] r=%d pc=%h new_a5=%h old_a5=%h op=%h",
                     retired, ex_pc, u_rf.regs[13], a5_last_r, ex_opcode);
+            // [ROMWACK]: fires when K1.3 enters the ROMWack serial-debug
+            // monitor command loop at \$FC2440.  Logs all D/A registers
+            // and SP so we can see what triggered it (Alert code in
+            // some register, return PC on stack, etc.).
+            if (is_settled && ex_pc == 32'h00FC_2440)
+                $display("[ROMWACK] r=%d sp=%h d0=%h d1=%h d2=%h a0=%h a1=%h a4=%h a5=%h a6=%h",
+                    retired, u_rf.regs[15],
+                    u_rf.regs[0], u_rf.regs[1], u_rf.regs[2],
+                    u_rf.regs[8], u_rf.regs[9],
+                    u_rf.regs[12], u_rf.regs[13], u_rf.regs[14]);
             // [5D80-WR] watch CPU writes to the MOVEM-source area
             // $5D80..$5E00 in the 100K-retired window before the
             // BAD-PC at r=4203012.  The MOVEM.L d16(PC) at $5D82
