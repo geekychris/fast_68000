@@ -44,17 +44,38 @@ def amiga_color_to_rgb(c12):
     return ((r << 4) | r, (g << 4) | g, (b << 4) | b)
 
 
+_SLOW_BASE = 0x00C00000
+_SLOW_SIZE = 0x00080000
+
+
+def _addr_to_buf(chip, addr):
+    """Return (buf, offset) for a given byte address, picking chip vs slow.
+
+    If `chip` is a bytes-like object: legacy mode, only chip ram available
+    (address must be < 0x80000).  If `chip` is a tuple (chip_bytes,
+    slow_bytes), slow RAM is also accessible at $C00000-$C7FFFF.
+    """
+    if isinstance(chip, tuple):
+        c, s = chip
+        if _SLOW_BASE <= addr < _SLOW_BASE + _SLOW_SIZE:
+            return s, addr - _SLOW_BASE
+        return c, addr
+    return chip, addr
+
+
 def fetch_word(chip, addr):
-    if addr + 1 >= len(chip):
+    buf, off = _addr_to_buf(chip, addr)
+    if off + 1 >= len(buf):
         return 0
-    return (chip[addr] << 8) | chip[addr + 1]
+    return (buf[off] << 8) | buf[off + 1]
 
 
 def fetch_long(chip, addr):
-    if addr + 3 >= len(chip):
+    buf, off = _addr_to_buf(chip, addr)
+    if off + 3 >= len(buf):
         return 0
-    return ((chip[addr] << 24) | (chip[addr + 1] << 16) |
-            (chip[addr + 2] << 8) | chip[addr + 3])
+    return ((buf[off] << 24) | (buf[off + 1] << 16) |
+            (buf[off + 2] << 8) | buf[off + 3])
 
 
 # Amiga chipset register name table for diagnostic dump.
@@ -83,12 +104,22 @@ def reg_name(off):
     return REG_NAMES.get(off, f"?${off:03X}")
 
 
+def _pc_mask(addr):
+    # If pointing into slow RAM, keep the full 24-bit address; otherwise
+    # mask to 19-bit chip range so legacy callers still work.
+    if _SLOW_BASE <= addr < _SLOW_BASE + _SLOW_SIZE:
+        return addr & 0xFFFFFF
+    return addr & 0xFFFFF
+
+
 class CopperSim:
     """Walk Kickstart's Copper list to find final Agnus/Denise state."""
 
     def __init__(self, chip, cop1lc):
+        # chip can be raw chip-RAM bytes (legacy) or a (chip, slow) tuple
+        # exposing both regions for the new slow-RAM-backed boot path.
         self.chip = chip
-        self.pc = cop1lc & 0xFFFFF  # chip-RAM mask (512 KB)
+        self.pc = _pc_mask(cop1lc)
         self.regs = {}              # offset (0..0x1FE) -> 16-bit value
         self.log = []
         # Simulate to a target raster position: end of frame, both VP=ff HP=7f.
@@ -97,8 +128,7 @@ class CopperSim:
 
     def step(self):
         """Decode one instruction, return False if we should stop."""
-        if self.pc + 4 > len(self.chip):
-            return False
+        # Bounds-check fetch_word handles slow vs chip routing.
         target = fetch_word(self.chip, self.pc)
         data   = fetch_word(self.chip, self.pc + 2)
         if target == 0 and data == 0 and len(self.log) > 1:
@@ -137,7 +167,7 @@ class CopperSim:
             if reg == 0x08A:
                 next_pc = ((self.regs.get(0x084, 0) << 16) |
                            self.regs.get(0x086, 0))
-                self.pc = next_pc & 0xFFFFF
+                self.pc = _pc_mask(next_pc)
             return True
 
     def run(self, limit=10000):
@@ -148,12 +178,12 @@ class CopperSim:
     def bpl_pt(self, plane_idx):
         h = self.regs.get(0xE0 + plane_idx * 4, 0)
         l = self.regs.get(0xE2 + plane_idx * 4, 0)
-        return ((h << 16) | l) & 0xFFFFF
+        return ((h << 16) | l) & 0xFFFFFF
 
     def spr_pt(self, idx):
         h = self.regs.get(0x120 + idx * 4, 0)
         l = self.regs.get(0x122 + idx * 4, 0)
-        return ((h << 16) | l) & 0xFFFFF
+        return ((h << 16) | l) & 0xFFFFFF
 
     def palette(self):
         pal = list(DEFAULT_PAL_4) + [(0, 0, 0)] * 28
@@ -194,35 +224,24 @@ def render(chip, cop1lc, width=320, height=200, out='k13_screen.png',
     bpr = width // 8
     img = Image.new('RGB', (width, height), pal[0])
     pixels = img.load()
-    planes = []
-    for p in range(bpu):
-        pt = sim.bpl_pt(p)
-        if pt == 0:
-            planes.append(None)
-        else:
-            planes.append(chip[pt:pt + bpr * height])
+    def read_bpl_byte(pt, plane_idx, y, byte_idx):
+        addr = pt + y * bpr + byte_idx
+        buf, off = _addr_to_buf(chip, addr)
+        if off < 0 or off >= len(buf):
+            return 0
+        return buf[off]
+
+    plane_pt = [sim.bpl_pt(p) for p in range(bpu)]
     for y in range(height):
         for byte_idx in range(bpr):
-            color = 0
-            for p, plane in enumerate(planes):
-                if plane is None:
-                    continue
-                if y * bpr + byte_idx >= len(plane):
-                    continue
-                b = plane[y * bpr + byte_idx]
-                for bit in range(8):
-                    if b & (0x80 >> bit):
-                        x = byte_idx * 8 + bit
-                        pixels[x, y] = pal[(1 << p) | 0]  # placeholder
             for bit in range(8):
                 x = byte_idx * 8 + bit
                 idx = 0
-                for p, plane in enumerate(planes):
-                    if plane is None:
+                for p, pt in enumerate(plane_pt):
+                    if pt == 0:
                         continue
-                    if y * bpr + byte_idx >= len(plane):
-                        continue
-                    if plane[y * bpr + byte_idx] & (0x80 >> bit):
+                    b = read_bpl_byte(pt, p, y, byte_idx)
+                    if b & (0x80 >> bit):
                         idx |= (1 << p)
                 pixels[x, y] = pal[idx]
 
@@ -247,8 +266,6 @@ def try_render_sprite(img, chip, sprpt, sim, idx, palette):
     p = sprpt
     safety = 64
     while safety > 0:
-        if p + 4 > len(chip):
-            return
         pos = fetch_word(chip, p)
         ctl = fetch_word(chip, p + 2)
         vstart = ((pos >> 8) & 0xFF) | ((ctl & 0x4) << 6)
@@ -289,9 +306,15 @@ def try_render_sprite(img, chip, sprpt, sim, idx, palette):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--chipram', default='build_kick_boot/chipram.bin')
+    ap.add_argument('--slowram', default=None,
+                    help='Optional Agnus slow-RAM dump (\$C00000-\$C7FFFF). '
+                         'When set, the Copper list and bitplanes can live in '
+                         'slow RAM (the post-26f2f86 K1.3 boot layout).')
     ap.add_argument('--out',     default='build_kick_boot/k13_render.png')
     ap.add_argument('--cop1lc',  default='0x2368',
-                    help='Address of K1.3 Copper list (default: $2368)')
+                    help='Address of K1.3 Copper list. Defaults to \$2368 '
+                         '(chip-RAM layout); with --slowram set, try '
+                         '\$00C00276 for the slow-RAM boot copper list.')
     ap.add_argument('--cop2lc',  default='0x23bc')
     ap.add_argument('--width',   type=int, default=320)
     ap.add_argument('--height',  type=int, default=200)
@@ -299,11 +322,18 @@ def main():
 
     with open(args.chipram, 'rb') as f:
         chip = f.read()
+    if args.slowram:
+        with open(args.slowram, 'rb') as f:
+            slow = f.read()
+        mem = (chip, slow)
+    else:
+        mem = chip
 
     cop1lc = int(args.cop1lc, 0)
     cop2lc = int(args.cop2lc, 0)
-    print(f"Rendering K1.3 screen: chipram={args.chipram} cop1lc=${cop1lc:X}")
-    render(chip, cop1lc, args.width, args.height, args.out, cop2lc=cop2lc)
+    print(f"Rendering K1.3 screen: chipram={args.chipram} "
+          f"slowram={args.slowram} cop1lc=${cop1lc:X}")
+    render(mem, cop1lc, args.width, args.height, args.out, cop2lc=cop2lc)
 
 
 if __name__ == '__main__':
