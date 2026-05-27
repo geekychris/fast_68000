@@ -3379,6 +3379,27 @@ module m68k_core #(
                 dc_addr >= 32'h0000_0010 && dc_addr <= 32'h0000_0013)
                 $display("[VEC-WR] r=%d pc=%h addr=%h be=%b wdata=%h",
                     retired, ex_pc, dc_addr, dc_be, dc_wdata);
+            // [C2CC-WR] any CPU write to supervisor-stack slot \$C2CC..\$C2CF.
+            // This is the slot the bad RTS at \$FCF104 pops a NULL from
+            // (VEC-EXEC kind=2 sp=\$C2CC to=\$0 at r=4.2M, vec=4 ILLEGAL).
+            // We want to find the JSR/BSR that pushed onto this slot --
+            // if no writes fire, the slot was NEVER written (= caller
+            // pushed garbage from uninit SP).  If writes fire with PC=0,
+            // the caller computed/pushed NULL.  Otherwise, something
+            // corrupted it later.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h0000_C2CC && dc_addr <= 32'h0000_C2CF)
+                $display("[C2CC-WR] r=%d pc=%h addr=%h be=%b wdata=%h sp=%h",
+                    retired, ex_pc, dc_addr, dc_be, dc_wdata, u_rf.regs[15]);
+            // [FCF104-PEEK] log register state at the bad RTS *before* it
+            // fires.  Confirms what mem[SP] reads.  Note: u_rf.regs[15]
+            // is the live A7 register file value at this cycle.
+            if (is_settled && ex_pc == 32'h00FC_F104)
+                $display("[FCF104-PEEK] r=%d sp=%h d0=%h d1=%h a0=%h a1=%h a2=%h a6=%h",
+                    retired, u_rf.regs[15],
+                    u_rf.regs[0], u_rf.regs[1],
+                    u_rf.regs[8], u_rf.regs[9], u_rf.regs[10],
+                    u_rf.regs[14]);
             // Bisect the A1=$00006062-instead-of-$00FD6062 bug.
             // $FD644A loads A3 = #$00FD6062 via MOVEA.L #imm.L.
             // $FD649A copies A3 to A0 via MOVEA.L A3,A0.
