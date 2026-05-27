@@ -26,6 +26,8 @@
 #include <vector>
 #include <utility>
 #include <string>
+#include <unordered_map>
+#include <algorithm>
 
 #ifdef HAVE_SDL2
 #include <SDL.h>
@@ -463,6 +465,46 @@ static int run_regression(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
     uint32_t last_core0_pc = 0xFFFFFFFFu;  // sentinel: never matches a real PC
     int snap_seq = 0;
 
+    // PC_HISTOGRAM - sample core 0's EX-stage PC every N cycles and
+    // bucket the counts.  At sim end, print the top hottest buckets.
+    //
+    // Useful when the boot is technically running but tracing is silent --
+    // tells you WHERE the CPU is spending its time when no [MARKER]
+    // traces are firing.  Common pattern: a STOP-wait-for-IRQ loop will
+    // have one dominant PC; a tight chip-RAM dispatcher loop will have a
+    // small cluster of PCs.
+    //
+    //   PC_HISTOGRAM=1               -- enable (default off)
+    //   PC_HISTOGRAM_INTERVAL=N      -- sample every N host cycles
+    //                                   (default 1024 -- ~25K samples per
+    //                                   second of sim, low overhead)
+    //   PC_HISTOGRAM_TOP=K           -- show top K buckets (default 30)
+    //   PC_HISTOGRAM_BUCKET_BITS=B   -- group PCs by lopping off the low B
+    //                                   bits (default 0 = exact PC).  Set
+    //                                   to 4 to bucket per-16-byte region.
+    //
+    // The histogram is keyed on the 24-bit PC (high byte ignored, matching
+    // 68000's external bus).  Output goes to stdout after the regular
+    // [sim] summary line at TIMEOUT/halt.
+    bool pc_histogram_enabled = false;
+    uint64_t pc_histogram_interval = 1024;
+    int pc_histogram_top = 30;
+    int pc_histogram_bucket_bits = 0;
+    if (const char* s = std::getenv("PC_HISTOGRAM"))
+        pc_histogram_enabled = std::atoi(s) != 0;
+    if (const char* s = std::getenv("PC_HISTOGRAM_INTERVAL"))
+        pc_histogram_interval = std::strtoull(s, nullptr, 0);
+    if (const char* s = std::getenv("PC_HISTOGRAM_TOP"))
+        pc_histogram_top = std::atoi(s);
+    if (const char* s = std::getenv("PC_HISTOGRAM_BUCKET_BITS"))
+        pc_histogram_bucket_bits = std::atoi(s);
+    std::unordered_map<uint32_t, uint64_t> pc_histogram;
+    if (pc_histogram_enabled)
+        printf("[sim] PC_HISTOGRAM enabled (interval=%llu cycles, "
+               "top=%d, bucket_bits=%d)\n",
+               (unsigned long long)pc_histogram_interval,
+               pc_histogram_top, pc_histogram_bucket_bits);
+
     while (cycle < max_cycles && !all_halted()) {
         // Default ext_kbd_wr to 0; the injection block below pulses it
         // for exactly one cycle when a scancode is due.
@@ -563,6 +605,17 @@ static int run_regression(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
             last_core0_pc = cur_pc;
         }
 
+        // PC_HISTOGRAM sample.  Tap core 0's EX-stage PC at the requested
+        // cadence and bucket it.  Skips cycle 0 (PC may still be reset).
+        if (pc_histogram_enabled && cycle > 0 &&
+            (cycle % pc_histogram_interval) == 0) {
+            const uint32_t* pc_arr =
+                reinterpret_cast<const uint32_t*>(&top->core_pc_flat);
+            uint32_t pc24 = pc_arr[0] & 0xFFFFFFu;
+            uint32_t bucket = pc24 & (0xFFFFFFu << pc_histogram_bucket_bits);
+            pc_histogram[bucket]++;
+        }
+
         if ((cycle & (CONSOLE_POLL - 1)) == 0) drain_console(top, host_tail);
     }
     drain_console(top, host_tail);
@@ -597,6 +650,30 @@ static int run_regression(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
     if (!halted_all) {
         printf("[sim] TIMEOUT after %llu cycles\n", (unsigned long long)cycle);
         if (rc == 0) rc = 0xFFFE;
+    }
+
+    // PC_HISTOGRAM dump.  Sort buckets by hit count, print top N.
+    if (pc_histogram_enabled && !pc_histogram.empty()) {
+        std::vector<std::pair<uint32_t,uint64_t>> sorted(
+            pc_histogram.begin(), pc_histogram.end());
+        std::sort(sorted.begin(), sorted.end(),
+                  [](const std::pair<uint32_t,uint64_t>& a,
+                     const std::pair<uint32_t,uint64_t>& b){
+                      return a.second > b.second;
+                  });
+        uint64_t total = 0;
+        for (auto& kv : sorted) total += kv.second;
+        int show = pc_histogram_top;
+        if ((int)sorted.size() < show) show = (int)sorted.size();
+        printf("[sim] PC_HISTOGRAM total_samples=%llu buckets=%zu, "
+               "showing top %d:\n",
+               (unsigned long long)total, sorted.size(), show);
+        for (int i = 0; i < show; i++) {
+            double pct = (100.0 * sorted[i].second) / (double)total;
+            printf("  $%06X  %10llu samples (%6.2f%%)\n",
+                   sorted[i].first,
+                   (unsigned long long)sorted[i].second, pct);
+        }
     }
 
     // Optional chip-RAM dump (binary, byte-addressed).  Useful for
