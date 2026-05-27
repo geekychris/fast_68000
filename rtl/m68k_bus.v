@@ -285,8 +285,15 @@ module m68k_bus #(
     reg [31:0] rom [0:ROM_WORDS-1];
     localparam ROM_IDX_BITS = $clog2(ROM_WORDS > 1 ? ROM_WORDS : 2);
 
-    // Framebuffer peek (word index = fb_peek_addr[AIDX_BITS+1:2]).
-    assign fb_peek_data = mem[fb_peek_addr[AIDX_BITS+1:2]];
+    // Framebuffer / chipram peek.  Routes to slow-RAM array when the
+    // peek address lands in Agnus trapdoor range $C00000-$C7FFFF, so
+    // sim-side chipram dumps and tools can also see slow-RAM contents
+    // (Exec structures live there once K1.3 prefers slow RAM for non-
+    // chip allocations).
+    assign fb_peek_data =
+        (fb_peek_addr >= 32'h00C0_0000 && fb_peek_addr < 32'h00C8_0000)
+            ? slowmem[(fb_peek_addr - 32'h00C0_0000) >> 2]
+            : mem[fb_peek_addr[AIDX_BITS+1:2]];
 
     // Memory-poke port (diagnostic — see comment near port declaration).
     always @(posedge clk) begin

@@ -693,6 +693,27 @@ static int run_regression(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
             std::fclose(f);
             printf("[sim] dumped chip RAM to %s (512 KB)\n", path);
         }
+    }
+    // Optional slow-RAM dump (Agnus trapdoor at $C00000-$C7FFFF).  Same
+    // format as CHIPRAM_DUMP -- 512 KB of byte-addressed RAM.  K1.3
+    // moves ExecBase + task structs into slow RAM when the chip-RAM
+    // allocator's pri=-10 loses to slow-RAM's pri=0, so chip-RAM dumps
+    // alone aren't enough to inspect the running OS state.
+    if (const char* path = std::getenv("SLOWRAM_DUMP")) {
+        std::FILE* f = std::fopen(path, "wb");
+        if (f) {
+            for (uint32_t addr = 0x00C00000u; addr < 0x00C80000u; addr += 4) {
+                uint32_t w = mem_peek_word(top, addr);
+                uint8_t b[4] = {
+                    (uint8_t)(w >> 24), (uint8_t)(w >> 16),
+                    (uint8_t)(w >> 8),  (uint8_t)w};
+                std::fwrite(b, 1, 4, f);
+            }
+            std::fclose(f);
+            printf("[sim] dumped slow RAM to %s (512 KB)\n", path);
+        }
+    }
+    if (std::getenv("CHIPRAM_DUMP")) {
         // Also dump the Agnus bitplane fetch counter and the last
         // bitplane data, so we can tell whether bitplane DMA actually
         // ran and where it ended up.
