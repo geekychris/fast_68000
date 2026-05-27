@@ -3797,18 +3797,34 @@ module m68k_core #(
                                     + (ex_src_imm32[11] ? ex_sp
                                         : {{16{ex_sp[15]}}, ex_sp[15:0]})
                                     + {{24{ex_src_imm32[7]}}, ex_src_imm32[7:0]};
-                            `EA_EXT:
+                            `EA_EXT: begin
                                 // ABSW: low 16 of ex_src_imm32, sign-ext.
-                                // ABSL/PCDISP/PCIDX/IMM untouched (the
-                                // EA8_ABSL case in particular needs the
-                                // third ext word which doesn't survive
-                                // into ex_src_imm32 -- a known limitation;
-                                // K1.3 only uses abs.W MOVEM).
+                                // PCDISP: ex_pc + 4 + sign-ext(d16).  The +4
+                                //   accounts for MOVEM's two extension words
+                                //   (mask at opcode+2, d16 at opcode+4); the
+                                //   68k convention is that d16(PC) is relative
+                                //   to the address of the d16 word itself.
+                                //   Surfaced by the WB1.3 boot wall at
+                                //   chip-RAM $5D82: `MOVEM.L $FFC4(PC), A2/A5/A6`
+                                //   used to fall into the `else movem_addr <=
+                                //   ex_ra` branch, dropping A2/A5/A6 to a
+                                //   random source ($26 area = trap-vector
+                                //   table) instead of the intended $5D4A.
+                                //   A5 then held $082800FC and the next JSR (A5)
+                                //   started the BAD-PC cascade.
+                                // ABSL/PCIDX still untouched (the ABSL case
+                                //   needs the third ext word that doesn't
+                                //   survive into ex_src_imm32 -- known
+                                //   limitation; K1.3 doesn't use ABSL MOVEM).
                                 if (ex_src_reg == `EA7_ABSW)
                                     movem_addr <=
                                         {{16{ex_src_imm32[15]}}, ex_src_imm32[15:0]};
+                                else if (ex_src_reg == `EA7_PCDISP)
+                                    movem_addr <= ex_pc + 32'd4 +
+                                        {{16{ex_src_imm32[15]}}, ex_src_imm32[15:0]};
                                 else
                                     movem_addr <= ex_ra;
+                            end
                             default:
                                 movem_addr <= ex_ra;
                         endcase
