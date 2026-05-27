@@ -586,6 +586,13 @@ module blitter (
                     if (use_b) bltbpt <= bltbpt + (desc ? -bltbmod : bltbmod);
                     if (use_c) bltcpt <= bltcpt + (desc ? -bltcmod : bltcmod);
                     if (use_d) bltdpt <= bltdpt + (desc ? -bltdmod : bltdmod);
+                    // [BLT-ROW] log all four pointers at row-end if any
+                    // of them is in the C2CC corruption zone.  Helps
+                    // explain the row-to-row drift in WB1.3 boot.
+                    if (bltdpt >= 32'h0000_C200 && bltdpt <= 32'h0000_C400)
+                        $display("[BLT-ROW] row=%0d bltapt=%h bltbpt=%h bltcpt=%h bltdpt=%h desc=%b amod=%h bmod=%h cmod=%h dmod=%h",
+                            cur_row, bltapt, bltbpt, bltcpt, bltdpt, desc,
+                            bltamod, bltbmod, bltcmod, bltdmod);
                     // Reset the fill carry for the next row.
                     fill_carry <= fci;
                     if (cur_row == (blt_height - 16'd1)) begin
