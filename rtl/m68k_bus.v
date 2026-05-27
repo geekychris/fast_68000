@@ -612,6 +612,38 @@ module m68k_bus #(
     reg [7:0]  autoconfig_base_hi;
     reg [7:0]  autoconfig_base_lo;
 
+    // ----- Agnus trapdoor SLOW RAM at $00C00000-$00C7FFFF -----------
+    // A500/A2000 ECS-Agnus exposes 512 KB of "slow RAM" (trapdoor or
+    // side expansion) at this range.  It's DMA-capable through Agnus
+    // (same arbitration as chip RAM, just slower), so blitter, disk,
+    // and bitplane DMA must also see it.  K1.3 detects it via its
+    // memory probe and AddMemList's it as MEMF_CHIP|MEMF_PUBLIC.  The
+    // first-fit allocator then has more options when placing task
+    // stacks vs screen buffers, removing the K1.3 boot CON stack vs
+    // Workbench BitMap overlap that causes the WB1.3 ROMWACK at r=4.9M.
+    localparam SLOW_WORDS = 131072;            // 512 KB / 4 = 128 K longs
+    localparam [31:0] SLOW_BASE = 32'h00C0_0000;
+    localparam [31:0] SLOW_END  = SLOW_BASE + (SLOW_WORDS << 2); // $00C8_0000
+    reg [31:0] slowmem [0:SLOW_WORDS-1];
+    integer msl;
+    initial begin
+        for (msl = 0; msl < SLOW_WORDS; msl = msl + 1) slowmem[msl] = 32'd0;
+    end
+    // is_slow used for bus arbiter (CPU + chipset master) reads/writes.
+    wire is_slow = (addr[winner] >= SLOW_BASE) && (addr[winner] < SLOW_END);
+    wire [16:0] slow_idx = (addr[winner] - SLOW_BASE) >> 2;
+    // Helper for DMA paths that index by raw byte address (disk, BPL,
+    // sprite, copper).  These bypass the arbiter and write/read mem[]
+    // directly, so they must do their own slow-vs-chip selection.
+    function [16:0] slow_idx_of;
+        input [31:0] a;
+        slow_idx_of = (a - SLOW_BASE) >> 2;
+    endfunction
+    function is_slow_addr;
+        input [31:0] a;
+        is_slow_addr = (a >= SLOW_BASE) && (a < SLOW_END);
+    endfunction
+
     // ----- Keyboard byte injection register -------------------------
     // CPU writes a scan-code byte to $00FE_9000.  Pulses kbd_inject_wr
     // for one cycle with the byte; CIA-A latches it into SDR and fires
@@ -786,6 +818,8 @@ module m68k_bus #(
     reg [1:0]           granted_ciab_lane_q;
     reg                 granted_is_rom_q;
     reg [31:0]          granted_rom_data_q;
+    reg                 granted_is_slow_q;
+    reg [16:0]          granted_slow_idx_q;
 
     // OVL low-memory remap: when active, reads at $0-$7FFFF land in ROM
     // instead of main memory.  Computed on the raw access address so we can
@@ -1235,6 +1269,8 @@ module m68k_bus #(
             granted_ciab_lane_q <= 2'd0;
             granted_is_rom_q <= 1'b0;
             granted_rom_data_q <= 32'd0;
+            granted_is_slow_q  <= 1'b0;
+            granted_slow_idx_q <= 17'd0;
             ovl_active <= OVL_RESET;
             ovl_just_cleared <= 1'b0;
             irq_level <= 3'd0;
@@ -1303,8 +1339,15 @@ module m68k_bus #(
             end else if (bpl_active_now) begin
                 if (bpl_fetch_tick == BPL_FETCH_DIV - 1) begin
                     bpl_fetch_tick <= 10'd0;
-                    // Fetch one half-word for the current plane.
-                    if (bpl_pt[bpl_plane_idx][1] == 1'b0) begin
+                    // Fetch one half-word for the current plane.  Sources
+                    // from chip RAM or Agnus slow-RAM mirror depending on
+                    // where bpl_pt points.
+                    if (is_slow_addr(bpl_pt[bpl_plane_idx])) begin
+                        bpl_dat[bpl_plane_idx] <=
+                            bpl_pt[bpl_plane_idx][1] == 1'b0
+                                ? slowmem[slow_idx_of(bpl_pt[bpl_plane_idx])][31:16]
+                                : slowmem[slow_idx_of(bpl_pt[bpl_plane_idx])][15:0];
+                    end else if (bpl_pt[bpl_plane_idx][1] == 1'b0) begin
                         bpl_dat[bpl_plane_idx] <=
                             mem[bpl_pt[bpl_plane_idx][AIDX_BITS+1:2]][31:16];
                     end else begin
@@ -1404,6 +1447,9 @@ module m68k_bus #(
                     (!blk_byte_mode && blk_cur_dst >= blk_dst + (blk_cnt << 9))) begin
                     blk_busy <= 1'b0;
                     blk_byte_mode <= 1'b0;
+                end else if (is_slow_addr(blk_cur_dst)) begin
+                    // Disk DMA into Agnus trapdoor slow RAM range.
+                    slowmem[slow_idx_of(blk_cur_dst)] <= disk[blk_cur_off[DISK_IDX_BITS+1:2]];
                 end else begin
                     mem[blk_cur_dst[AIDX_BITS+1:2]] <= disk[blk_cur_off[DISK_IDX_BITS+1:2]];
 `ifdef HDRCHK_WATCH
@@ -1684,6 +1730,32 @@ module m68k_bus #(
                 // ROM region is read-only; silently drop the write.
             end else if (winner_valid && we[winner] && is_disk_read) begin
                 // Disk image is read-only; silently drop the write.
+            end else if (winner_valid && we[winner] && is_slow) begin
+                // Slow RAM write -- bus arbiter path.  Mirror chip-RAM's
+                // unaligned-.L handling: addr[1:0]==10 with be=1111 spans
+                // two longword slots (the 68000 issues two consecutive
+                // word writes for a misaligned .L).  Without this the
+                // .L write packs all 4 bytes into a single slot, which
+                // corrupts both halves of the actual destination range.
+                if (be[winner] == 4'b1111 && addr[winner][1:0] == 2'b10) begin
+                    slowmem[slow_idx][15:8]      <= wdata[winner][31:24];
+                    slowmem[slow_idx][7:0]       <= wdata[winner][23:16];
+                    slowmem[slow_idx + 1][31:24] <= wdata[winner][15:8];
+                    slowmem[slow_idx + 1][23:16] <= wdata[winner][7:0];
+                end else begin
+                    if (be[winner][3]) slowmem[slow_idx][31:24] <= wdata[winner][31:24];
+                    if (be[winner][2]) slowmem[slow_idx][23:16] <= wdata[winner][23:16];
+                    if (be[winner][1]) slowmem[slow_idx][15:8]  <= wdata[winner][15:8];
+                    if (be[winner][0]) slowmem[slow_idx][7:0]   <= wdata[winner][7:0];
+                end
+`ifdef KICKSTART_BOOT_TRACE
+                // Diagnostic: log slow-RAM writes near $C001EC where the
+                // WB1.3 boot is hitting BAD-PC via JSR -$8A(A6).  Helps
+                // verify K1.3 actually writes the expected JMP trampoline.
+                if (addr[winner] >= 32'h00C0_01E0 && addr[winner] <= 32'h00C0_01F0)
+                    $display("[SLOW-WR] addr=%h be=%b wdata=%h port=%0d",
+                        addr[winner], be[winner], wdata[winner], winner);
+`endif
 `ifdef KICKSTART_BOOT
             end else if (winner_valid && we[winner] &&
                         (addr[winner] >= (MEM_WORDS << 2))) begin
@@ -1695,7 +1767,8 @@ module m68k_bus #(
                 // holding $038F_0305, so every address-error trap landed in
                 // garbage).  Bench tests deliberately use high addresses as
                 // "fake RAM" via the alias, so the guard is gated on
-                // KICKSTART_BOOT only.
+                // KICKSTART_BOOT only.  Slow RAM at $C00000 falls through
+                // to the is_slow clause above and never reaches this drop.
 `endif
             end else if (winner_valid && we[winner]) begin
 `ifdef KICKSTART_BOOT_TRACE
@@ -1793,6 +1866,8 @@ module m68k_bus #(
             if (winner_valid && is_ciab_reg && !we[winner])
                 granted_ciab_rdata_q <= cia_b_slv_rdata;
             granted_is_rom_q <= winner_valid && !we[winner] && is_rom_access;
+            granted_is_slow_q  <= winner_valid && !we[winner] && is_slow;
+            granted_slow_idx_q <= slow_idx;
             if (winner_valid && !we[winner] && is_rom_access) begin
                 // Unaligned .L read at addr[1:0]=10 spans two rom[] entries;
                 // assemble the same way the RAM path does (low half of
@@ -2036,12 +2111,22 @@ module m68k_bus #(
                    : granted_is_ciaa_q  ? ciaa_resp_w
                    : granted_is_ciab_q  ? ciab_resp_w
                    : granted_is_rom_q   ? granted_rom_data_q
+                   // Slow RAM: assemble unaligned .L from two slots
+                   // exactly like the chip-RAM path below, otherwise
+                   // K1.3's MOVE.L immediate at odd-aligned trampoline
+                   // addresses returns only the head longword.
+                   : granted_is_slow_q  ?
+                       ((granted_is_long_q && granted_addr_q[1:0] == 2'b10)
+                            ? {slowmem[granted_slow_idx_q][15:0],
+                               slowmem[granted_slow_idx_q + 1][31:16]}
+                            : slowmem[granted_slow_idx_q])
 `ifdef KICKSTART_BOOT
                    // Under Kickstart, drop reads of unmapped addresses (above
                    // the populated mem[] window) to $0 so Kickstart's chip-
                    // RAM probe sees consistent "no memory here" (matching the
                    // write-side drop) rather than aliased mem[] data.  Real
-                   // hardware would float here.
+                   // hardware would float here.  Slow RAM at $C00000 is
+                   // captured by granted_is_slow_q above.
                    : (granted_addr_q >= (MEM_WORDS << 2)) ? 32'h0000_0000
 `endif
                    // Unaligned .L read: caller signals genuine .L via

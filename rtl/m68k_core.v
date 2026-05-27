@@ -337,14 +337,17 @@ module m68k_core #(
             if_drain <= 1'b0;
         end else if (redirect_valid) begin
 `ifdef KICKSTART_BOOT_TRACE
-            // Trace any redirect to an address outside RAM ($00000-$1FFFFF)
-            // and ROM ($F80000-$FFFFFF).
+            // Trace any redirect to an address outside RAM ($00000-$1FFFFF),
+            // ROM ($F80000-$FFFFFF), or Agnus trapdoor slow RAM
+            // ($C00000-$C7FFFF).
             if (redirect_pc != ex_pc) begin
                 if (!(redirect_pc[31:21] == 11'b0) &&            // not 0x000000-0x1FFFFF
                     !(redirect_pc[31:20] == 12'hF80) &&          // not 0xF80000-0xF8FFFF
                     !(redirect_pc[31:19] == 13'b1111_1000_0000_1) && // 0xF90000-0xF97FFF
                     !(redirect_pc >= 32'h00F80000 &&
-                      redirect_pc <= 32'h00FFFFFF))
+                      redirect_pc <= 32'h00FFFFFF) &&
+                    !(redirect_pc >= 32'h00C00000 &&
+                      redirect_pc <  32'h00C80000))
                     $display("[BAD-PC] from=%h to=%h retired=%d kind=%d sp=%h op=%h ra=%h rb=%h",
                         ex_pc, redirect_pc, retired, ex_kind, rf_rc_data,
                         ex_opcode, ex_ra, ex_rb);
