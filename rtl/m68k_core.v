@@ -3223,6 +3223,23 @@ module m68k_core #(
                 dc_addr >= 32'h0000_100C8 && dc_addr <= 32'h0000_103C8)
                 $display("[CPRLIST-WR] r=%d pc=%h kind=%d addr=%h be=%b wdata=%h",
                     retired, ex_pc, ex_kind, dc_addr, dc_be, dc_wdata);
+            // Watch writes to the BOOT Copper list at chip-RAM $420..$470.
+            // Whoever assembles this is the V33 Copper-list assembler;
+            // the same routine should re-assemble after OpenScreen but
+            // doesn't (resulting in BPLCON0=0 / no Workbench display).
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h0000_0420 && dc_addr <= 32'h0000_0470)
+                $display("[BOOTCOP-WR] r=%d pc=%h kind=%d addr=%h be=%b wdata=%h",
+                    retired, ex_pc, ex_kind, dc_addr, dc_be, dc_wdata);
+            // Watch writes to slow-RAM $C05C40..$C05E40 (Workbench
+            // Screen ViewPort.DspIns Copper list).  Whoever writes
+            // here IS the V33 Copper-list assembler for new ViewPorts.
+            // The same routine should also write to the COMBINED View
+            // list at $100C8 — find out why it doesn't.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h00C0_5C40 && dc_addr <= 32'h00C0_5E40)
+                $display("[WBCOP-WR] r=%d pc=%h kind=%d addr=%h be=%b wdata=%h",
+                    retired, ex_pc, ex_kind, dc_addr, dc_be, dc_wdata);
             // Watch writes to GfxBase+$30..$37 (slow RAM $C01E4E..$C01E55).
             // $32(GfxBase) = LOFCprList — the View Copper list pointer
             // that the VBL handler ($FC6D6C) reads to write COP1LC.
