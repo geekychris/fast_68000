@@ -2445,6 +2445,15 @@ module m68k_core #(
                                 cc_z_c = (dc_rdata == 32'd0);
                             end
                         endcase
+                        // Commit predec/postinc An update at settle.  Without
+                        // this, TST.B (A0)+ never advances A0 — K1.3's strlen
+                        // helper at $FE4AD0 loops 65535 times until D0.w wraps,
+                        // stalling FS task's packet handling for ~275K cycles.
+                        if (src_an_update) begin
+                            wb_aux_we_c = 1'b1;
+                            wb_aux_idx_c = {1'b1, ex_src_reg};
+                            wb_aux_data_c = src_an_next;
+                        end
                     end
                     K_NEG, K_NOT: begin
                         // Memory NEG/NOT — drive ALU with rdata; sequential
@@ -3101,6 +3110,20 @@ module m68k_core #(
             // Sample A5 each cycle so the [A5-CHANGE] edge trace below
             // sees the previous value.
             a5_last_r <= u_rf.regs[13];
+            // [STRSCAN]: trace $FE4ADC strlen helper used by WB1.3 FS task.
+            // After CLI's PUTMSG to FS port at \$C00ADC, FS dequeues the
+            // packet and ends up scanning a string for >275K cycles before
+            // PutMsg'ing to ciaa.resource (which is NOT a port).  Capture A0
+            // at $FE4AD0 entry to find what string is being scanned, and
+            // D0 at exit to count chars consumed.
+            if (is_settled && ex_pc == 32'h00fe_4adc)
+                $display("[STRSCAN-IN] r=%d sp=%h",
+                    retired, u_rf.regs[15]);
+            if (is_settled && ex_pc == 32'h00fe_4ad0)
+                $display("[STRSCAN-AD0] r=%d A0=%h",
+                    retired, u_rf.regs[8]);
+            if (is_settled && ex_pc == 32'h00fe_4ada)
+                $display("[STRSCAN-OUT] r=%d D0=%h", retired, u_rf.regs[0]);
             // Trace CPU writes to Copper-list-pointer regs (COP1LC / COP2LC).
             // Useful to see when (if) Intuition.OpenScreen installs a new
             // screen Copper list, which on a successful boot screen would
