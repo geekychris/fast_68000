@@ -3136,6 +3136,15 @@ module m68k_core #(
             // MrgCop's actual body (LVO wrapper at $FC5B4C calls $FCD3CC).
             if (is_settled && ex_pc == 32'h00fc_d3cc)
                 $display("[GFX-MRGCOP-BODY] r=%d sp=%h", retired, u_rf.regs[15]);
+            // MrgCop call sites (none in Intuition OpenScreen body).
+            if (is_settled && ex_pc == 32'h00fe_8898)
+                $display("[MRGCOP-CS] r=%d at $FE8898", retired);
+            if (is_settled && ex_pc == 32'h00fe_8976)
+                $display("[MRGCOP-CS] r=%d at $FE8976", retired);
+            if (is_settled && ex_pc == 32'h00ff_355e)
+                $display("[MRGCOP-CS] r=%d at $FF355E", retired);
+            if (is_settled && ex_pc == 32'h00ff_3c1e)
+                $display("[MRGCOP-CS] r=%d at $FF3C1E", retired);
             if (is_settled && ex_pc == 32'h00fc_637c)
                 $display("[GFX-LOADVIEW] r=%d a1=%h a6=%h",
                     retired, u_rf.regs[9], u_rf.regs[14]);
@@ -3204,6 +3213,23 @@ module m68k_core #(
             if (dc_req_r && dc_we && dc_ack &&
                 dc_addr >= 32'h0000_6000 && dc_addr <= 32'h0000_7FFF)
                 $display("[STK6058] r=%d pc=%h kind=%d addr=%h be=%b wdata=%h",
+                    retired, ex_pc, ex_kind, dc_addr, dc_be, dc_wdata);
+            // Watch writes to the Copper list buffer at chip-RAM $100C8.
+            // GfxBase+$32 = $000100C8 (LOFCprList).  Workbench should
+            // assemble a valid Copper list there but our dump shows
+            // garbage ($FFFFFFFF entries).  If no writes fire to this
+            // region, MakeView/MrgCop never runs.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h0000_100C8 && dc_addr <= 32'h0000_103C8)
+                $display("[CPRLIST-WR] r=%d pc=%h kind=%d addr=%h be=%b wdata=%h",
+                    retired, ex_pc, ex_kind, dc_addr, dc_be, dc_wdata);
+            // Watch writes to GfxBase+$30..$37 (slow RAM $C01E4E..$C01E55).
+            // $32(GfxBase) = LOFCprList — the View Copper list pointer
+            // that the VBL handler ($FC6D6C) reads to write COP1LC.
+            // Find what stores $000100C8 there.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h00C0_1E4E && dc_addr <= 32'h00C0_1E60)
+                $display("[GFX-VBL-WR] r=%d pc=%h kind=%d addr=%h be=%b wdata=%h",
                     retired, ex_pc, ex_kind, dc_addr, dc_be, dc_wdata);
             // [FE0A52]: log every entry into the RTS at $FE0A52 with all
             // registers.  PC trail before this tells us who set SP=$71E0.
