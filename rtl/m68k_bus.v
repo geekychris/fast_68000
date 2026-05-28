@@ -1154,9 +1154,23 @@ module m68k_bus #(
             3'd2: begin                       // COP2LCH ($DFF084)
                 cop_xlat_valid = 1'b1;
                 cop_xlat_addr  = 6'h0C;
+`ifdef HACK_COP1LC_TO_WBSCREEN
+                // Diagnostic hack: K1.3 VBL handler at $FC6D6C writes
+                // COP2LC=$000100C8 every frame, but the buffer at
+                // $100C8 was never assembled with valid Copper
+                // instructions (MrgCop never runs).  Substitute
+                // $00C05C40 — the Workbench Screen's VP_DspIns Copper
+                // list which DOES have valid BPL/BPLCON0 setup.
+                cop_xlat_wdata = (is_long[winner] && be[winner] == 4'b1111)
+                                 ? (wdata[winner] == 32'h0001_00C8
+                                    ? 32'h00C0_5C40
+                                    : wdata[winner])
+                                 : {amiga_wdata_half, canon_cop2lc[15:0]};
+`else
                 cop_xlat_wdata = (is_long[winner] && be[winner] == 4'b1111)
                                  ? wdata[winner]
                                  : {amiga_wdata_half, canon_cop2lc[15:0]};
+`endif
             end
             3'd3: begin                       // COP2LCL ($DFF086)
                 cop_xlat_valid = 1'b1;
