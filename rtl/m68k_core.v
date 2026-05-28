@@ -3118,6 +3118,49 @@ module m68k_core #(
             // Sample A5 each cycle so the [A5-CHANGE] edge trace below
             // sees the previous value.
             a5_last_r <= u_rf.regs[13];
+            // [OPENSCREEN]: trace entry to intuition.library OpenScreen.
+            // LVO entry at $FDFCE8 (JT target from $C03D24 - 198).  Body
+            // at $FDC91A.  WB1.3 boot reaches r=4.4M idle with BPLCON0=0
+            // — if this trace never fires, no task requested a screen.
+            // If it fires but BPLCON0 stays 0, OpenScreen is failing
+            // internally (AllocBitMap returning NULL? bitmap dst in bad
+            // region?).
+            if (is_settled && ex_pc == 32'h00fd_fce8)
+                $display("[OPENSCREEN-LVO] r=%d entry sp=%h a0=%h a6=%h",
+                    retired, u_rf.regs[15], u_rf.regs[8], u_rf.regs[14]);
+            // graphics.library functions (correct LVO entry points).
+            if (is_settled && ex_pc == 32'h00fc_5b40)
+                $display("[GFX-MAKEVPORT] r=%d a0=%h a1=%h", retired, u_rf.regs[8], u_rf.regs[9]);
+            if (is_settled && ex_pc == 32'h00fc_5b4c)
+                $display("[GFX-MRGCOP] r=%d a1=%h a6=%h", retired, u_rf.regs[9], u_rf.regs[14]);
+            // MrgCop's actual body (LVO wrapper at $FC5B4C calls $FCD3CC).
+            if (is_settled && ex_pc == 32'h00fc_d3cc)
+                $display("[GFX-MRGCOP-BODY] r=%d sp=%h", retired, u_rf.regs[15]);
+            if (is_settled && ex_pc == 32'h00fc_637c)
+                $display("[GFX-LOADVIEW] r=%d a1=%h a6=%h",
+                    retired, u_rf.regs[9], u_rf.regs[14]);
+            if (is_settled && ex_pc == 32'h00fc_65ec)
+                $display("[GFX-INITVIEW] r=%d a1=%h", retired, u_rf.regs[9]);
+            // After LoadView assembles + writes COP1LC, the next COP1LC
+            // write should reflect View.LOFCprList. Trace the value just
+            // before COP1LC write.
+            if (is_settled && ex_pc == 32'h00fd_c91a)
+                $display("[OPENSCREEN-BODY] r=%d entry sp=%h a0=%h",
+                    retired, u_rf.regs[15], u_rf.regs[8]);
+            // OpenScreen body's RTS at $FDCDB8 — capture return value (D0).
+            if (is_settled && ex_pc == 32'h00fd_cdb8)
+                $display("[OPENSCREEN-EXIT] r=%d D0=%h a0=%h",
+                    retired, u_rf.regs[0], u_rf.regs[8]);
+            // Also trace the various other exits inside OpenScreen body to
+            // see if any error-exit path fires before the main RTS.
+            if (is_settled && ex_pc == 32'h00fd_cda0)
+                $display("[OPENSCREEN-EXIT-PATH] r=%d at $FDCDA0", retired);
+            // [OPENSCREEN-RETURN]: trace return into the LVO wrapper at
+            // $FDFCF0 (after the JSR $FDC91A returns).  If RTS at $FDCDB8
+            // fired with D0=0 (failure), $FDFCF0 also gets D0=0.
+            if (is_settled && ex_pc == 32'h00fd_fcf0)
+                $display("[OPENSCREEN-LVO-RET] r=%d D0=%h",
+                    retired, u_rf.regs[0]);
             // [STRSCAN]: trace $FE4ADC strlen helper used by WB1.3 FS task.
             // After CLI's PUTMSG to FS port at \$C00ADC, FS dequeues the
             // packet and ends up scanning a string for >275K cycles before
