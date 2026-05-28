@@ -1500,7 +1500,15 @@ module m68k_core #(
                         alu_op_c = ex_alu_op;
                         alu_a = src_operand;
                         alu_b = ex_imm_raw;
-                        alu_size_c = ex_size;
+                        // 68k spec: ADDQ/SUBQ to An is ALWAYS a longword
+                        // operation, regardless of the encoded size.  Without
+                        // this, ADDQ.W #4, A7 (opcode $584F, used by K1.3 to
+                        // pop stack args at $FE0A50) masked the ALU to the
+                        // low byte and zero-cleared the high 3 bytes of A7.
+                        // After fix, SP = $C071E0 + 4 = $C071E4 (preserved).
+                        // Before fix, SP became $000000E4.  Caught WB1.3 FS
+                        // task stack corruption at r=4M.
+                        alu_size_c = (ex_src_mode == `EA_AREG) ? `SZ_L : ex_size;
                         if (ex_src_mode == `EA_DREG || ex_src_mode == `EA_AREG) begin
                             // ADDQ/SUBQ #imm, An: do NOT update CCR (per
                             // 68k spec, like ADDA/SUBA).  Surfaced by the
@@ -3147,6 +3155,25 @@ module m68k_core #(
                 dc_addr >= 32'h0000_1800 && dc_addr <= 32'h0000_1960)
                 $display("[STKW] r=%d pc=%h kind=%d addr=%h be=%b wdata=%h",
                     retired, ex_pc, ex_kind, dc_addr, dc_be, dc_wdata);
+            // Post-TST-fix new wall: RTS at $FE0A52 pops $0.  First fire
+            // SP=$71E0, second SP=$6058 at r=4M.  Watch a wider stack
+            // region $6000-$7FFF.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h0000_6000 && dc_addr <= 32'h0000_7FFF)
+                $display("[STK6058] r=%d pc=%h kind=%d addr=%h be=%b wdata=%h",
+                    retired, ex_pc, ex_kind, dc_addr, dc_be, dc_wdata);
+            // [FE0A52]: log every entry into the RTS at $FE0A52 with all
+            // registers.  PC trail before this tells us who set SP=$71E0.
+            if (is_settled && ex_pc == 32'h00fe_0a52)
+                $display("[FE0A52] r=%d sp=%h ssp=%h sr_s=%b d0=%h d1=%h a0=%h a3=%h",
+                    retired, u_rf.regs[15], usp_shadow, sr_s,
+                    u_rf.regs[0], u_rf.regs[1],
+                    u_rf.regs[8], u_rf.regs[11]);
+            // Also trace entry to $FE0A4A so we see what called the function
+            // that RTS-pops $0.
+            if (is_settled && ex_pc == 32'h00fe_0a4a)
+                $display("[FE0A4A] r=%d sp=%h ssp=%h sr_s=%b a0=%h",
+                    retired, u_rf.regs[15], usp_shadow, sr_s, u_rf.regs[8]);
             // [KBD-SP] / [KBD-CMD9]: trace keyboard.device's SP IRQ handler
             // and its cmd-9 (KBD_READMATRIX) handler.  Used to confirm whether
             // the queued IO at chipram $4468 (input.device's READMATRIX
