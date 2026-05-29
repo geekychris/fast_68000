@@ -1130,6 +1130,25 @@ module m68k_bus #(
     reg [5:0]  cop_xlat_addr;
     reg [31:0] cop_xlat_wdata;
     reg        cop_xlat_valid;
+    // OCS Agnus only has 19 address lines for COP1LC/COP2LC; bits 31:19
+    // of any value written to COP1LCH / COP2LCH are silently dropped.
+    // When the Copper master itself executes a "MOVE COP1LCH=$xxxx"
+    // instruction (a 16-bit half-word write), we must mirror that
+    // truncation, otherwise a runaway Copper that walks past the end
+    // of a list into chip-RAM garbage and decodes a stray $xxxx as
+    // COP1LCH ends up with cop1lc pointing past chip RAM — where the
+    // arbiter returns zeros forever — permanently parking the Copper.
+    // CPU MOVE.L writes to $DFF080/$DFF084 fall through `is_long &&
+    // be==1111` and use the full 32-bit wdata, so this gate only
+    // catches the 16-bit half-word path used by Copper-self writes
+    // and a hypothetical CPU MOVE.W (which K1.3 never does to these).
+    // The COP_MASTER_PORT computation mirrors m68k_top's localparam
+    // COP_PORT = 2*N_CORES + 1; with N_PORTS = 2*N_CORES + 4 (4 chipset
+    // masters), that is also N_PORTS - 3.
+    wire        winner_is_cop = (winner == (N_PORTS - 3));
+    wire [15:0] cop_self_high_masked = winner_is_cop
+                                       ? {13'd0, amiga_wdata_half[2:0]}
+                                       : amiga_wdata_half;
     always @* begin
         cop_xlat_addr  = 6'h00;
         cop_xlat_wdata = 32'd0;
@@ -1144,7 +1163,7 @@ module m68k_bus #(
                 cop_xlat_addr  = 6'h00;
                 cop_xlat_wdata = (is_long[winner] && be[winner] == 4'b1111)
                                  ? wdata[winner]
-                                 : {amiga_wdata_half, canon_cop1lc[15:0]};
+                                 : {cop_self_high_masked, canon_cop1lc[15:0]};
             end
             3'd1: begin                       // COP1LCL ($DFF082)
                 cop_xlat_valid = 1'b1;
@@ -1165,11 +1184,11 @@ module m68k_bus #(
                                  ? (wdata[winner] == 32'h0001_00C8
                                     ? 32'h00C0_5C40
                                     : wdata[winner])
-                                 : {amiga_wdata_half, canon_cop2lc[15:0]};
+                                 : {cop_self_high_masked, canon_cop2lc[15:0]};
 `else
                 cop_xlat_wdata = (is_long[winner] && be[winner] == 4'b1111)
                                  ? wdata[winner]
-                                 : {amiga_wdata_half, canon_cop2lc[15:0]};
+                                 : {cop_self_high_masked, canon_cop2lc[15:0]};
 `endif
             end
             3'd3: begin                       // COP2LCL ($DFF086)
@@ -1446,14 +1465,20 @@ module m68k_bus #(
                 endcase
             end
             if (winner_valid && we[winner] && is_cop_amiga) begin
+                // Mirror the xlat-side mask: a Copper-master write to
+                // COP1LCH/COP2LCH must also store the 19-bit-truncated
+                // value in the canon shadow.  Otherwise the next half-
+                // word write to COP1LCL (which reads canon_cop1lc[31:16]
+                // back to reconstruct the full 32-bit address) re-
+                // contaminates the slave with the dropped upper bits.
                 case (cop_amiga_reg)
                     3'd0: if (is_long[winner] && be[winner] == 4'b1111)
                                 canon_cop1lc <= wdata[winner];
-                          else canon_cop1lc[31:16] <= amiga_wdata_half;
+                          else canon_cop1lc[31:16] <= cop_self_high_masked;
                     3'd1: canon_cop1lc[15:0]  <= amiga_wdata_half;
                     3'd2: if (is_long[winner] && be[winner] == 4'b1111)
                                 canon_cop2lc <= wdata[winner];
-                          else canon_cop2lc[31:16] <= amiga_wdata_half;
+                          else canon_cop2lc[31:16] <= cop_self_high_masked;
                     3'd3: canon_cop2lc[15:0]  <= amiga_wdata_half;
                     default: ;
                 endcase
