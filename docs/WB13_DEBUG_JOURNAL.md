@@ -338,6 +338,60 @@ Both would explain the symptom: 1068 `Signal()` calls between tasks
 (they're alive and running event loops), but no drawing blits ever
 issued.
 
+## §10b. Task-list forensics — finding the parked CLI
+
+After establishing that Intuition opens the Screen successfully and
+the Copper executes the Workbench list but no real drawing ever
+happens, the next question was "what tasks are alive and what are
+they waiting on?"
+
+**Technique A: walk slow-RAM for task structs.** A task struct
+starts with a `Node`: `+0..+7 ln_Succ/ln_Pred (pointers), +8 ln_Type,
++9 ln_Pri, +0xA ln_Name (ptr)`. Scan slow-RAM (`$C00000..$C7FFFF`)
+two bytes at a time. If `d[off+8] == 1` (NT_TASK) or `13` (NT_PROCESS)
+and `d[off+0xA..0xD]` is a plausible pointer (into ROM `$FC0000..` or
+back into slow RAM), try to read the string at that pointer. Any string
+of printable ASCII is almost certainly a real task name.
+
+This walked 70 unique task-like structs in the dump and identified:
+- "File System" at `$C00A80`
+- "Initial CLI" at `$C05128`
+- "CON" at `$C06778`
+- "input.device" (name garbled — ROM string)
+- Plus many false positives (random data that happened to start with
+  `01` followed by what could be a pointer).
+
+**Technique B: classify blits by minterm to detect "drawing vs
+clearing."** `LF == $00` produces zero output for all (A,B,C)
+combinations — a clear blit. `LF == $FF` is fill. Anything else is
+real drawing. Of the 149 blits targeting the bitplane region after
+r=4M, every single one used `LF=$00`. **None of them were drawing
+blits.** That's a direct, unambiguous "the system isn't drawing" —
+no Workbench-task event-loop tracing needed.
+
+**Technique C: read each parked task's `tc_SigWait` and `tc_SigRecvd`
+to find the deadlock.** A task in WAIT state with `tc_SigWait` set
+and `tc_SigRecvd == 0` is waiting for a signal that hasn't arrived.
+If you can trace who would normally send that signal, and that sender
+is also parked, you've found a deadlock or a missing wake.
+
+Reading Initial CLI's struct directly from the dump:
+```
+ln_Type      = $0D  (NT_PROCESS — DOS process, not raw exec task)
+tc_SigWait   = $00000100  (= SIGB_DOS, bit 8)
+tc_SigRecvd  = $00000000
+```
+
+**Diagnosis:** Initial CLI is parked at `WaitPkt()` (or `Wait(SIGF_DOS)`)
+waiting for a DOS reply that never arrives. Without that reply it
+never reads the startup-sequence script, never runs `LoadWB`,
+workbench.task never starts, no desktop drawing ever happens.
+
+The same wall was hit in an earlier session (task #84) where it was
+marked completed; the fix at that point moved the wall forward but
+the underlying DOS-message-passing chain (CLI ↔ File System ↔ CON)
+still has a missing reply somewhere.
+
 ## §10. Suggested next steps
 
 1. Hook a trace at Workbench task's main event loop entry (need to
