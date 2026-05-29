@@ -861,6 +861,24 @@ module denise #(
                 end
 
                 S_WRITE: begin
+`ifdef KICKSTART_BOOT
+                    // Denise's chunky-pixel framebuffer at FB_BASE=$10000
+                    // overlaps Kickstart 1.3's LOFCprList Copper buffer at
+                    // chip-RAM $100C8, which graphics.library populates
+                    // during OpenScreen.  Denise's render writes ($FFFFFFFF
+                    // for "white"/unset chunky pixels) trampled the Copper
+                    // list, leaving BPLCON0=0 and the Workbench display
+                    // permanently blank at r=4.4M.  Under KICKSTART_BOOT
+                    // we skip the FB writes entirely — the sim harness
+                    // walks the live Copper via render_k13_screen.py for
+                    // visualization, so the chunky FB is not needed.
+                    fb_write_ptr <= fb_write_ptr + 32'd4;
+                    if (wr_long_idx == 2'd3) begin
+                        state <= S_NEXT_WG;
+                    end else begin
+                        wr_long_idx <= wr_long_idx + 2'd1;
+                    end
+`else
                     mst_req_r <= 1'b1;
                     mst_we    <= 1'b1;
                     mst_addr  <= fb_write_ptr;
@@ -880,6 +898,7 @@ module denise #(
                             wr_long_idx <= wr_long_idx + 2'd1;
                         end
                     end
+`endif
                 end
 
                 S_NEXT_WG: begin
