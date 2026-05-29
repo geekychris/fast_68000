@@ -392,6 +392,58 @@ marked completed; the fix at that point moved the wall forward but
 the underlying DOS-message-passing chain (CLI ↔ File System ↔ CON)
 still has a missing reply somewhere.
 
+**Refinement after counting Signal(task,mask) pairs across the full
+run:**
+
+```
+606 → task=$C026E2 mask=$40000000    (input.device VBL ticks)
+239 → task=$C0485E mask=$00000400    (timer task)
+ 91 → task=$C00A80 mask=$00000100    (File System SIGF_DOS)
+ 48 → task=$C0485E mask=$00000200
+ 35 → task=$C0485E mask=$00000100
+ 21 → task=$C05128 mask=$00000100    (Initial CLI  SIGF_DOS)
+  9 → task=$C06778 mask=$00000100    (CON          SIGF_DOS)
+```
+
+All three DOS handlers (File System, Initial CLI, CON) **do** receive
+SIGF_DOS — the PutMsg → Signal chain is functional in our sim. They
+each run an event loop:
+
+1. `Wait(SIGF_DOS)` → blocks until packet arrives.
+2. `GetMsg(port)` → pull packet.
+3. Process packet.
+4. `ReplyMsg(packet)` or `PutMsg(next-task-port, ...)`.
+5. Loop.
+
+The ratio (91 / 21 / 9 packets) is roughly what you'd expect: File
+System is busiest (all I/O goes through it), CLI medium (parsing
+startup script), CON least (just I/O).
+
+**The wall is finer than "no signal arrives":** every signal-recipient
+task processes its incoming packets, then drains to the WAIT state
+with `tc_SigRecvd=0`. The chain stalls at *one specific packet that
+never gets sent.* The candidate sequence:
+
+1. CLI sends `Open("S:Startup-Sequence", MODE_OLDFILE)` to File System.
+2. File System processes Open, replies success (?) to CLI.
+3. CLI receives reply, sends `Read(file, buffer, length)`.
+4. File System processes Read…
+
+…and somewhere in step 4, either the disk read returns wrong data,
+the FS metadata doesn't match what File System expects, or our
+trackdisk's MFM-decoded blocks have a hash/checksum mismatch that
+File System catches.
+
+The 57 DSKLEN events fire (disk reads happen), but it's possible
+the *content* of those reads doesn't survive File System's
+validation, so File System never sends back a successful Read reply
+and CLI is parked forever.
+
+Verifying that hypothesis would need a packet-level trace of
+`PutMsg` / `GetMsg` calls in DOS, plus correlating each packet's
+`dp_Type` and `dp_Res1` against the next task that handles it.
+Significant DOS-internals work; deferred.
+
 ## §10. Suggested next steps
 
 1. Hook a trace at Workbench task's main event loop entry (need to
