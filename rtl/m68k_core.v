@@ -319,7 +319,20 @@ module m68k_core #(
 
     wire [31:0] predicted_target_w = if_pc + 32'd2 + disp32;
     wire [31:0] next_seq_pc        = if_pc + ({29'd0, total_words_eff} << 1);
-    wire [31:0] if_fetch_target    = predict_taken_w ? predicted_target_w : next_seq_pc;
+    // Real 68000 has only 24 address lines, so any PC carried past
+    // \$00FFFFFE wraps to \$00000000 on the bus.  Mask the sequential
+    // / Bcc predicted target the same way: without this, a ROM-end
+    // JMP wraps to PC=\$01000000 internally, every subsequent
+    // sequential add keeps bit 24 set, and the CPU walks chip-RAM-
+    // mirror addresses while the bus correctly truncates to chip RAM.
+    // The bus arbiter already masks bits 24..31 (m68k_bus.v unflat),
+    // but the CPU-side PC register accumulates the bad high bits and
+    // pushes them as the return address on exception traps, so RTE
+    // pops back into the same garbage forever.  See also the redirect
+    // path at line ~372 which already applies this mask.
+    wire [31:0] if_fetch_target_raw = predict_taken_w ? predicted_target_w
+                                                      : next_seq_pc;
+    wire [31:0] if_fetch_target    = {8'd0, if_fetch_target_raw[23:0]};
 
     wire if_dispatch_w = would_be_complete && !stall && !redirect_valid && !halted;
 

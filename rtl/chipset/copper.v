@@ -190,10 +190,22 @@ module copper (
             auto_kick_d <= 1'b0;
         end else begin
             auto_kick_d <= auto_kick_i;
-            if (auto_kick_i && !auto_kick_d && auto_active_i && !cop_busy) begin
-                pc       <= cop1lc;
-                cop_busy <= 1'b1;
-                state    <= S_FETCH;
+            // Real Agnus reloads PC from COP1LC at every VBLANK regardless
+            // of whether the Copper is mid-instruction or has walked into
+            // garbage.  Without this force-restart, a Copper whose
+            // boot-list COPJMP2 lands on cop2lc=0 (the K1.3 VBL handler
+            // writes COP2LC=LOFCprList every frame, but the first such
+            // write happens before graphics.library has populated the
+            // field, so it's COP2LC=0) walks chip-RAM zeros forever and
+            // cop_busy never clears.  Subsequent VBLs cannot resync the
+            // PC, even after the CPU has filled in a valid Workbench
+            // Copper list at LOFCprList.  Real Agnus would have re-
+            // entered the boot list at the start of every frame.
+            if (auto_kick_i && !auto_kick_d && auto_active_i) begin
+                pc        <= cop1lc;
+                cop_busy  <= 1'b1;
+                state     <= S_FETCH;
+                mst_req_r <= 1'b0;
             end
 
             // -------- CPU slave writes --------
@@ -251,7 +263,8 @@ module copper (
                             // Discard silently; advance.
                             state <= S_FETCH;
                         end else if ((mv_reg < 9'h040) ||
-                                     ((mv_reg < 9'h080) && !cdang_i)) begin
+                                     ((mv_reg < 9'h080) && !cdang_i) ||
+                                     ((mv_reg >= 9'h080) && (mv_reg <= 9'h086))) begin
                             // Copper register-access protection.
                             //   * $00-$3E: always blocked (disk DMA,
                             //     serial, INTREQ, COPxxx, vector regs).
@@ -259,7 +272,22 @@ module copper (
                             //     (default OCS); allowed when CDANG=1
                             //     so software can program the blitter
                             //     from the Copper (t24_cop_chain etc.).
-                            //   * $80+: always allowed (Denise: BPLnPT,
+                            //   * $80-$86: COP1LCH/L, COP2LCH/L — always
+                            //     blocked from the Copper itself.  Real
+                            //     OCS Agnus allows it, but a runaway
+                            //     Copper walking through chip-RAM zeros
+                            //     past the end of its list quickly hits
+                            //     a stray $0010 / $0080 word that decodes
+                            //     as MOVE COPxLCL=$xxxx, parks cop1lc
+                            //     somewhere garbage, and every VBL auto-
+                            //     restart lands the Copper in unreachable
+                            //     memory.  K1.3 never programs COP1LC/
+                            //     COP2LC via Copper instructions, so
+                            //     blocking is purely a defence against
+                            //     the runaway and costs no functionality.
+                            //   * $88-$8E: COPJMP1/2/COPINS/COPCON
+                            //     handled higher up (is_copjmp1/2 etc.).
+                            //   * $90+: always allowed (Denise: BPLnPT,
                             //     BPLCON, SPRnPT/POS/CTL/DATA, COLOR).
                             //
                             // Without this gate, a Copper that walks past
