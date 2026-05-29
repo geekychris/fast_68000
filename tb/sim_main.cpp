@@ -27,6 +27,7 @@
 #include <utility>
 #include <string>
 #include <unordered_map>
+#include <unistd.h>   // chdir
 #include <algorithm>
 
 #ifdef HAVE_SDL2
@@ -90,6 +91,26 @@ static int run_graphics(Vm68k_top* top, uint64_t max_cycles, int n_cores);
 static int run_regression(Vm68k_top* top, uint64_t max_cycles, int n_cores);
 
 int main(int argc, char** argv) {
+    // The Verilog references program.hex / rom.hex / disk.hex via $readmemh,
+    // which resolves relative to the current working directory.  Each build
+    // directory (build, build_kick_boot, build_demo, etc.) gets its own hex
+    // files alongside Vm68k_top.  Invoking the binary from any other dir
+    // would silently load all-zero memory (Verilator prints a "%Warning:
+    // ... file not found" but does not abort) and the simulation would
+    // appear to run K1.3 but the CPU is actually executing NOP-of-zero
+    // opcodes forever.  Chdir to argv[0]'s directory so the lookup
+    // always finds the right hex files regardless of caller cwd.
+    if (argv[0] && argv[0][0]) {
+        const char* slash = std::strrchr(argv[0], '/');
+        if (slash) {
+            std::string bin_dir(argv[0], slash - argv[0]);
+            if (chdir(bin_dir.c_str()) != 0) {
+                std::fprintf(stderr,
+                    "[sim] WARNING: chdir(%s) failed; hex files may not load\n",
+                    bin_dir.c_str());
+            }
+        }
+    }
     Verilated::commandArgs(argc, argv);
     uint64_t max_cycles = 200000;
     bool graphics = false;
