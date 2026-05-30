@@ -3308,6 +3308,116 @@ module m68k_core #(
             if (is_settled && ex_pc == 32'h00FE_9C3E)
                 $display("[TD-BEGIO] r=%d A1=%h sp=%h",
                     retired, u_rf.regs[9], u_rf.regs[15]);
+            // [TD-READ-ENTRY]: trackdisk.device CMD_READ/WRITE handler at
+            // $FEA3B4.  A1=IORequest, A3 (loaded from A1's io_Unit) will
+            // be set up here.  Log A1 + the io_Offset/io_Length values to
+            // see what FS is asking for at this exact entry.
+            if (is_settled && ex_pc == 32'h00FE_A3B4)
+                $display("[TD-READ-ENTRY] r=%d A1=%h",
+                    retired, u_rf.regs[9]);
+            // [TD-OFFSET]: helper $FE9E02 is called from $FEA3D4 with
+            // D0 = io_Offset (the block address FS is reading).  Logs
+            // D0 to reveal whether FS reads different blocks (making
+            // progress through the FS walk) or hammers the same block
+            // (stuck verifying root over and over).
+            if (is_settled && ex_pc == 32'h00FE_9E02)
+                $display("[TD-OFFSET] r=%d D0=%h", retired, u_rf.regs[0]);
+            // [TD-READ-OFFSET-BAD]: BMI target after offset-to-track conv
+            // returns negative.  Means io_Offset (or end-offset) is off
+            // the disk.
+            if (is_settled && ex_pc == 32'h00FE_A5AA)
+                $display("[TD-READ-OFFSET-BAD] r=%d A1=%h",
+                    retired, u_rf.regs[9]);
+            // [TD-READ-EXIT]: common error-exit at $FEA5A0 where io_Error
+            // has been set to some specific TDERR_ value.
+            if (is_settled && ex_pc == 32'h00FE_A5A0)
+                $display("[TD-READ-EXIT] r=%d A1=%h",
+                    retired, u_rf.regs[9]);
+            // [TD-DISKCHANGED]: at $FEA416 trackdisk sets io_Error = $1D
+            // (TDERR_DiskChanged) and falls through to $FEA5A0.  If this
+            // fires, the BTST #1, $40(A3) at $FEA40E saw a non-zero bit.
+            if (is_settled && ex_pc == 32'h00FE_A416)
+                $display("[TD-DISKCHANGED] r=%d", retired);
+            // [TD-D0-ERROR]: at $FEA44C trackdisk does MOVE.B D0, $1F(A1)
+            // — writes D0 (low byte) into io_Error.  Logging D0 reveals
+            // exactly which TDERR_* code FS is being told the read failed
+            // with.  D0 = 21 NoSecHdr, 22 BadSecPreamble, 23 BadSecID,
+            //       24 BadHdrSum, 25 BadSecSum, 26 TooFewSecs ...
+            if (is_settled && ex_pc == 32'h00FE_A44C)
+                $display("[TD-D0-ERROR] r=%d D0=%h", retired, u_rf.regs[0]);
+            // [TD-D0-ERROR2]: at $FEA47C trackdisk does the SAME io_Error
+            // store (third error-setting path).  D0 here came from BSR
+            // $FEA61E + a comparison check on the unit's media buffer.
+            if (is_settled && ex_pc == 32'h00FE_A47C)
+                $display("[TD-D0-ERROR2] r=%d D0=%h", retired, u_rf.regs[0]);
+            // [TD-GETMSG-RET]: trackdisk's main-loop body at $FEA3AC TSTs
+            // D0 (the message returned by GetMsg).  If D0=0, the wake was
+            // spurious (no actual packet on the port) and the loop spins
+            // back to Wait.  Logging this distinguishes "stuck spinning on
+            // empty port" from "processing a packet but failing validation
+            // and retrying".
+            if (is_settled && ex_pc == 32'h00FE_A3AC)
+                $display("[TD-GETMSG-RET] r=%d D0=%h", retired, u_rf.regs[0]);
+            // [TD-MAINLOOP]: the outer trackdisk-task entry that calls the
+            // Wait+GetMsg sub-loop at $FEA38A and then dispatches.  Fires
+            // once per command processed.
+            if (is_settled && ex_pc == 32'h00FE_A316)
+                $display("[TD-MAINLOOP] r=%d A3=%h", retired, u_rf.regs[11]);
+            // [TD-READ-EPILOGUE]: the MOVEM.L (SP)+ at $FEA5B6 — actual
+            // last instruction of the read handler before RTS.  Catches
+            // ANY exit path (including ones that bypass $FEA5A0).
+            if (is_settled && ex_pc == 32'h00FE_A5B6)
+                $display("[TD-READ-EPILOGUE] r=%d", retired);
+            // [TD-PCWATCH]: bisect milestones inside the read handler.
+            // If the read enters at $FEA3B4 but never reaches $FEA5A0
+            // (the success epilogue), one of these PCs tells us how far.
+            if (is_settled && ex_pc == 32'h00FE_A3F8)
+                $display("[TD-A3F8] r=%d", retired);   // entry to bit-2 BTST
+            if (is_settled && ex_pc == 32'h00FE_A40E)
+                $display("[TD-A40E] r=%d", retired);   // entry to bit-1 BTST
+            if (is_settled && ex_pc == 32'h00FE_A414)
+                $display("[TD-A414] r=%d", retired);   // entry to BEQ
+            if (is_settled && ex_pc == 32'h00FE_A420)
+                $display("[TD-A420] r=%d D0=%h", retired, u_rf.regs[0]);   // past disk-changed
+            if (is_settled && ex_pc == 32'h00FE_A42E)
+                $display("[TD-A42E] r=%d", retired);   // after $FEA5BC ret
+            if (is_settled && ex_pc == 32'h00FE_A454)
+                $display("[TD-A454] r=%d", retired);   // alternate good
+            if (is_settled && ex_pc == 32'h00FE_A464)
+                $display("[TD-A464] r=%d D0=%h", retired, u_rf.regs[0]);
+            if (is_settled && ex_pc == 32'h00FE_A484)
+                $display("[TD-A484] r=%d", retired);   // write/continue
+            if (is_settled && ex_pc == 32'h00FE_A5BC)
+                $display("[TD-CALL-A5BC] r=%d D0=%h", retired, u_rf.regs[0]);
+            if (is_settled && ex_pc == 32'h00FE_A61E)
+                $display("[TD-CALL-A61E] r=%d D0=%h", retired, u_rf.regs[0]);
+            if (is_settled && ex_pc == 32'h00FE_A5D2)
+                $display("[TD-CALL-A5D2] r=%d", retired);
+            if (is_settled && ex_pc == 32'h00FE_A5D8)
+                $display("[TD-CALL-A5D8] r=%d D0=%h", retired, u_rf.regs[0]);
+            if (is_settled && ex_pc == 32'h00FE_A510)
+                $display("[TD-A510] r=%d", retired);   // BNE.W target from $FEA494
+            // Inside-$FEA61E milestones — bisect the cache-miss disk-read path:
+            if (is_settled && ex_pc == 32'h00FE_A0E2)
+                $display("[TD-CALL-A0E2] r=%d D0=%h", retired, u_rf.regs[0]);
+            if (is_settled && ex_pc == 32'h00FE_A05A)
+                $display("[TD-CALL-A05A] r=%d D0=%h", retired, u_rf.regs[0]);
+            if (is_settled && ex_pc == 32'h00FE_A1A4)
+                $display("[TD-CALL-A1A4] r=%d D0=%h", retired, u_rf.regs[0]);
+            if (is_settled && ex_pc == 32'h00FE_AC62)
+                $display("[TD-CALL-AC62] r=%d", retired);
+            // Read 15 path past $FEA61E body — milestones inside.
+            if (is_settled && ex_pc == 32'h00FE_A636)
+                $display("[TD-A636] r=%d D0=%h", retired, u_rf.regs[0]);
+            if (is_settled && ex_pc == 32'h00FE_A64E)
+                $display("[TD-A64E] r=%d", retired);
+            if (is_settled && ex_pc == 32'h00FE_A678)
+                $display("[TD-A678] r=%d", retired);
+            // Track Wait() calls with the calling SP so we can pinpoint
+            // whether it's trackdisk task or FS task that's parked.
+            if (is_settled && ex_pc == 32'h00FC_1F0C)
+                $display("[WAIT-CALL-SP] r=%d mask=%h sp=%h",
+                    retired, u_rf.regs[0], u_rf.regs[15]);
             // [PUTMSG]: trace every entry into PutMsg (LVO -$16E body
             // at $FC1B70).  A0 = port, A1 = message.  Confirms whether
             // the FileHandler-task signal storm includes real packet

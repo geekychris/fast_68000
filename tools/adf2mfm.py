@@ -23,12 +23,13 @@ all "odd/even half" encoded.  For each 32-bit longword L:
     even_half = L & 0x55555555            # bits L[0], L[2], ..., L[30]
 
 These half-density bytes have data at every other bit position; the
-remaining (clock) positions are normally filled in by the MFM encoder
-following the rule "clock = NOT (prev_data | next_data)".  Our
-simulator DMA delivers raw bytes verbatim and Kickstart's trackdisk
-extracts data bits at the same positions, so we leave the clock bits
-at zero.  A real floppy controller's PLL would refuse to lock onto
-this stream, but our simulator has no PLL.
+remaining (clock) positions are filled in by the MFM encoder following
+the rule "clock = NOT (prev_data | curr_data)".  Real K1.3 trackdisk
+doesn't validate clock bits (it just extracts data bits at the even
+positions), so the simulator works even when clock bits are zero.  We
+fill them anyway: it matches what a real Amiga floppy delivers, makes
+chip-RAM dumps readable as standard MFM, and removes a class of
+"impossible MFM" debugging false leads.
 
 For a longword buffer of N longs, the disk layout writes ALL the odd
 halves first (4*N bytes), then ALL the even halves (4*N bytes), for
@@ -84,6 +85,42 @@ def odd_even_halves(buf: bytes) -> tuple[bytes, bytes]:
     return bytes(odd_stream), bytes(even_stream)
 
 
+def mfm_clock_fill(sparse: bytes, prev_data_bit: int = 0) -> tuple[bytes, int]:
+    """Fill in MFM clock bits across a sparse longword stream.
+
+    Input: byte stream where each 4-byte longword has data bits at even
+    positions (0, 2, ..., 30) and clock positions (1, 3, ..., 31) = 0.
+
+    MFM rule: clock_k at position 31-2k = NOT (data_(k-1) OR data_k).
+    The first clock of the stream uses `prev_data_bit` (the last data
+    bit emitted before this stream, e.g. the last data bit of the sync
+    word that precedes the encoded body).
+
+    Returns: (encoded_stream, last_data_bit) where last_data_bit is the
+    data bit at position 0 of the final longword — used to chain into
+    a subsequent stream.
+    """
+    assert len(sparse) % 4 == 0
+    out = bytearray()
+    cur_prev = prev_data_bit & 1
+    for i in range(0, len(sparse), 4):
+        lw = int.from_bytes(sparse[i : i + 4], "big")
+        # (lw >> 1) puts data_(k-1) at the clock_k position (odd bits).
+        # No mask needed — the sparse input has zeros at clock positions
+        # so >> 1 produces zeros at data positions.  Bit 31 of (lw >> 1)
+        # comes from outside the word, so OR in prev_data_bit there.
+        prev_aligned = (lw >> 1) | (cur_prev << 31)
+        # (lw << 1) puts data_k at the clock_k position too.
+        curr_aligned = (lw << 1) & 0xFFFFFFFF
+        combined = prev_aligned | curr_aligned
+        # clock_k = NOT (data_(k-1) OR data_k); restrict to clock positions.
+        clock_bits = (~combined) & 0xAAAAAAAA
+        encoded = lw | clock_bits
+        out.extend(encoded.to_bytes(4, "big"))
+        cur_prev = lw & 1
+    return bytes(out), cur_prev
+
+
 def amiga_checksum(odd_then_even: bytes) -> int:
     """XOR every 4-byte longword in the (already-split) odd|even stream
     and mask with 0x55555555 -- the Amiga sector checksum convention."""
@@ -124,28 +161,31 @@ def encode_sector(track: int, sector: int, data: bytes) -> bytes:
     # then computes the header checksum across all 40 bytes.
     info_odd,  info_even  = odd_even_halves(info_raw)
     label_odd, label_even = odd_even_halves(label_raw)
-    out.extend(info_odd)
-    out.extend(info_even)
-    out.extend(label_odd)
-    out.extend(label_even)
 
     # Header checksum = XOR of every 4-byte longword in (info_odd +
-    # info_even + label_odd + label_even), masked to $55555555.
+    # info_even + label_odd + label_even), masked to $55555555.  This
+    # is computed on the SPARSE (pre-clock-fill) representation; the
+    # AND with $55555555 keeps only data-bit positions so clock bits
+    # don't affect the result.
     hdr_chk = amiga_checksum(info_odd + info_even + label_odd + label_even)
     hdr_chk_odd, hdr_chk_even = odd_even_halves(hdr_chk.to_bytes(4, "big"))
-    out.extend(hdr_chk_odd)
-    out.extend(hdr_chk_even)
 
     # Data interleave & checksum.
     data_odd, data_even = odd_even_halves(data)
     data_chk = amiga_checksum(data_odd + data_even)
     data_chk_odd, data_chk_even = odd_even_halves(data_chk.to_bytes(4, "big"))
-    out.extend(data_chk_odd)
-    out.extend(data_chk_even)
 
-    # Data area.
-    out.extend(data_odd)
-    out.extend(data_even)
+    # Assemble the sparse body, then apply MFM clock-fill across the
+    # whole stream so it matches the bit pattern a real Amiga floppy
+    # delivers.  Sync words ($4489 $4489) end with data bit 1, so we
+    # seed the clock-fill with prev_data_bit = 1.
+    sparse_body = (info_odd + info_even +
+                   label_odd + label_even +
+                   hdr_chk_odd + hdr_chk_even +
+                   data_chk_odd + data_chk_even +
+                   data_odd + data_even)
+    encoded_body, _ = mfm_clock_fill(sparse_body, prev_data_bit=1)
+    out.extend(encoded_body)
 
     assert len(out) == SECTOR_DISK_BYTES, (len(out), SECTOR_DISK_BYTES)
     return bytes(out)
