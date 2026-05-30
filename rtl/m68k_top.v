@@ -642,8 +642,17 @@ module m68k_top #(
         .vblank_int_i(vblank_pulse),
         .dskblk_int_i(dskblk_pulse),
         .dsksyn_int_i(dsksyn_pulse),
-        .irq_level_o (paula_irq_level)
+        .cpu_in_stop_i (all_cores_in_stop),
+        .irq_level_o (paula_irq_level),
+        .watchdog_kick_o (watchdog_kick)
     );
+
+    // Combine OVL-clear pulse + watchdog-kick pulse for cache invalidation.
+    // The watchdog kick is needed because the IRQ-entry sequence after a
+    // STOP exit can race with stale bus_resp_data; invalidating the cache
+    // forces a fresh bus read for the vector.
+    wire watchdog_kick;
+    wire cache_inval = ovl_clear_pulse | watchdog_kick;
 
     assign p_req  [PAU_PORT]                  = pau_mst_req;
     assign p_we   [PAU_PORT]                  = pau_mst_we;
@@ -702,7 +711,7 @@ module m68k_top #(
                     .snoop_valid (snoop_valid),
                     .snoop_addr  (snoop_addr),
                     .snoop_src_id(snoop_src_id),
-                    .inval_all_i (ovl_clear_pulse)
+                    .inval_all_i (cache_inval)
                 );
 
                 m68k_cache #(
@@ -735,7 +744,7 @@ module m68k_top #(
                     .snoop_valid (snoop_valid),
                     .snoop_addr  (snoop_addr),
                     .snoop_src_id(snoop_src_id),
-                    .inval_all_i (ovl_clear_pulse)
+                    .inval_all_i (cache_inval)
                 );
             end else begin : g_passthrough
                 m68k_passthrough #(
@@ -767,7 +776,7 @@ module m68k_top #(
                     .snoop_valid (snoop_valid),
                     .snoop_addr  (snoop_addr),
                     .snoop_src_id(snoop_src_id),
-                    .inval_all_i (ovl_clear_pulse)
+                    .inval_all_i (cache_inval)
                 );
 
                 m68k_passthrough #(
@@ -799,7 +808,7 @@ module m68k_top #(
                     .snoop_valid (snoop_valid),
                     .snoop_addr  (snoop_addr),
                     .snoop_src_id(snoop_src_id),
-                    .inval_all_i (ovl_clear_pulse)
+                    .inval_all_i (cache_inval)
                 );
             end
 

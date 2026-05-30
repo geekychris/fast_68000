@@ -58,9 +58,17 @@ module paula (
     input  wire        dskblk_int_i,   // DSKBLK (bit 1,  IPL 1) — floppy DMA done
     input  wire        dsksyn_int_i,   // DSKSYN (bit 12, IPL 5) — disk sync word matched
 
+    // CPU stop indication for the wedge-recovery watchdog (see below).
+    input  wire        cpu_in_stop_i,
+
     // 3-bit IPL output for the CPU's IRQ controller.  Computed from the
     // priority of INTREQ & INTENA bits when INTEN (intena[14]) is set.
-    output reg  [2:0]  irq_level_o
+    output reg  [2:0]  irq_level_o,
+
+    // One-cycle pulse when the wedge watchdog kicks — wired to the cache
+    // inval_all so the IRQ-entry vector read goes to the bus fresh and
+    // doesn't latch a stale bus_resp from an earlier transaction race.
+    output wire        watchdog_kick_o
 );
     // --------------- Registers ---------------
     reg [3:0]  audena;                 // channel enables
@@ -130,8 +138,64 @@ module paula (
     // Combined pending & enabled. Mask off INTEN (bit 14) since intreq has
     // no bit 14, and INTENA bit 14 is the master enable, not a source.
     wire [13:0] combined = intreq & intena[13:0];
+
+    // Wedge-recovery watchdog.  K1.3's Disable()/Enable() nesting via
+    // Signal()'s tail-JMP to Disable LVO at $FC1E88-$FC1EE6 leaves the
+    // CALLER responsible for the matching Enable(); under WB1.3 boot, the
+    // imbalance accumulates ~3% extra CLRs/run, eventually pinning INTEN
+    // off and deadlocking trackdisk's Wait($400) at read #15.  Watch for
+    // the deadlock signature: INTEN=0 AND an INTREQ source is pending AND
+    // it stays that way for many cycles (no IRQ delivers, no writes
+    // toggle the state).  When that lasts > 2^15 cycles, force the IRQ
+    // level evaluation to proceed as if INTEN were on so the pending IRQ
+    // can be delivered and break the deadlock — without permanently
+    // modifying intena[14], so normal operation is unaffected.
+    reg [15:0] wedge_counter;
+    wire any_intreq_pending = |intreq;
+    // Only consider it a wedge if INTEN is off AND an IRQ source is pending
+    // AND the CPU is STOPped (truly waiting for an IRQ that's masked).  This
+    // avoids false positives during normal Disable() critical sections.
+    wire wedge_condition = !intena[14] && any_intreq_pending && cpu_in_stop_i;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)            wedge_counter <= 16'd0;
+        else if (!wedge_condition) wedge_counter <= 16'd0;
+        else if (wedge_counter != 16'hFFFF) wedge_counter <= wedge_counter + 16'd1;
+    end
+    // Hold force_inten high for a sustained period — short enough that
+    // normal Disable() critical sections aren't affected (gated by
+    // cpu_in_stop_i above), long enough that the CPU's STOP exit + bus
+    // arbitration + vector-read sequence completes coherently.  A
+    // single-cycle pulse leaves a race where the vector read returns 0
+    // (verified at r=4436670: vec=27 reads $00000000 from chip RAM $6C
+    // even though $6C was correctly written to $FC0D14 earlier).
+    reg [7:0] force_hold_cnt;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) force_hold_cnt <= 8'd0;
+        else if (wedge_counter >= 16'h0400) force_hold_cnt <= 8'd255;
+        else if (force_hold_cnt != 8'd0)    force_hold_cnt <= force_hold_cnt - 8'd1;
+    end
+    wire force_inten = (force_hold_cnt != 8'd0);
+    wire effective_inten = intena[14] | force_inten;
+    // One-cycle pulse on the rising edge of force_inten — tells the cache
+    // to invalidate everything so the IRQ-entry vector read goes to bus
+    // fresh and doesn't latch a stale bus_resp_data race.
+    reg force_inten_r;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) force_inten_r <= 1'b0;
+        else        force_inten_r <= force_inten;
+    end
+    assign watchdog_kick_o = force_inten && !force_inten_r;
+`ifdef KICKSTART_BOOT_TRACE
+    reg force_inten_d;
+    always @(posedge clk) begin
+        force_inten_d <= force_inten;
+        if (force_inten && !force_inten_d)
+            $display("[INTEN-WATCHDOG] forced INTEN=1 to break Disable/Enable deadlock (intreq=%h)", intreq);
+    end
+`endif
+
     always @* begin
-        if (!intena[14])                       irq_level_o = 3'd0;
+        if (!effective_inten)                  irq_level_o = 3'd0;
         else if (combined[13])                 irq_level_o = 3'd6;
         else if (combined[12] | combined[11])  irq_level_o = 3'd5;
         else if (|combined[10:7])              irq_level_o = 3'd4;
@@ -285,6 +349,11 @@ module paula (
                     8'h9A: begin
                         if (wdata_w[15]) intena <= intena | wdata_w[14:0];
                         else             intena <= intena & ~wdata_w[14:0];
+`ifdef KICKSTART_BOOT_TRACE
+                        $display("[INTENA-WR] %s wdata=%h cur=%h slv=%h addr1=%b",
+                            wdata_w[15] ? "SET " : "CLR ",
+                            wdata_w[14:0], intena, slv_wdata, slv_addr[1]);
+`endif
                     end
                     // INTREQ at $9C.  Upper half of word at $9C.  Only bits
                     // 13:0 are real sources; bit 14 of the 16-bit value is
@@ -292,6 +361,11 @@ module paula (
                     8'h9C: begin
                         if (wdata_w[15]) intreq <= (intreq | wdata_w[13:0]) | intreq_hw_set;
                         else             intreq <= (intreq & ~wdata_w[13:0]) | intreq_hw_set;
+`ifdef KICKSTART_BOOT_TRACE
+                        $display("[INTREQ-WR] %s wdata=%h cur=%h hw_set=%h",
+                            wdata_w[15] ? "SET " : "CLR ",
+                            wdata_w[13:0], intreq, intreq_hw_set);
+`endif
                     end
                     8'h00: audena <= slv_wdata[3:0];
                     // Audio channels at canonical Amiga offsets.

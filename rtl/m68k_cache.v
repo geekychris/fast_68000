@@ -130,6 +130,18 @@ module m68k_cache #(
     assign cpu_rdata = comb_read_hit ? data[idx] :
                        bus_resp_now ? bus_resp_data : 32'd0;
 
+`ifdef KICKSTART_BOOT_TRACE
+    // Trace any read of vector $6C (vec=27 level-3 IRQ).  Diagnosing
+    // why the read returns 0 after the watchdog kicks at r=4436670.
+    always @(posedge clk) if (rst_n && cpu_req && !cpu_we &&
+                              (cpu_addr == 32'h0000_006C ||
+                               cpu_addr == 32'h0000_002C)) begin
+        $display("[CACHE-VEC] addr=%h hit=%b state=%d data[idx]=%h bus_resp_valid=%b bus_resp_data=%h ack=%b rdata=%h saved_idx=%h",
+            cpu_addr, hit, state, data[idx], bus_resp_valid, bus_resp_data,
+            cpu_ack, cpu_rdata, saved_idx);
+    end
+`endif
+
     function [31:0] merge_be;
         input [31:0] old_w, new_w;
         input [3:0]  be;

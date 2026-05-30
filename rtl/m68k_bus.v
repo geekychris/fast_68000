@@ -1498,6 +1498,16 @@ module m68k_bus #(
                     slowmem[slow_idx_of(blk_cur_dst)] <= disk[blk_cur_off[DISK_IDX_BITS+1:2]];
                 end else begin
                     mem[blk_cur_dst[AIDX_BITS+1:2]] <= disk[blk_cur_off[DISK_IDX_BITS+1:2]];
+`ifdef KICKSTART_BOOT_TRACE
+                    // Trace disk DMA writes near the vector table ($0..$FF)
+                    // — disk DMA bypasses the bus arbiter so VEC-BUS-WR
+                    // misses these.  We need to know if disk DMA is what
+                    // clears mem[$1B] to $0 after the legit write.
+                    if (blk_cur_dst < 32'h0000_0100)
+                        $display("[DMA-LOW-WR] dst=%h off=%h data=%h",
+                            blk_cur_dst, blk_cur_off,
+                            disk[blk_cur_off[DISK_IDX_BITS+1:2]]);
+`endif
 `ifdef HDRCHK_WATCH
                     if (blk_cur_dst >= 32'h0000_64A8 && blk_cur_dst <= 32'h0000_64E7)
                         $display("[HDRCHK_WR] cyc=%0d DMA dst=%h off=%h data=%h",
@@ -1845,6 +1855,20 @@ module m68k_bus #(
                     if (be[winner][1]) mem[mem_idx][15:8]  <= wdata[winner][15:8];
                     if (be[winner][0]) mem[mem_idx][7:0]   <= wdata[winner][7:0];
                 end
+`ifdef KICKSTART_BOOT_TRACE
+                // Trace any write that lands at chip RAM idx=$1B
+                // (vector table $6C-$6F).  Catches the mystery write
+                // that clears mem[$1B] to $0 between r=789829 and the
+                // watchdog moment.
+                if (mem_idx == 'h1B || addr[winner] == 32'h0000_006C ||
+                    addr[winner] == 32'h0000_002C ||
+                    addr[winner] == 32'h0000_006E ||
+                    addr[winner] == 32'h0000_002E) begin
+                    $display("[VEC-BUS-WR] port=%d addr=%h mem_idx=%h be=%b wdata=%h is_long=%b",
+                        winner, addr[winner], mem_idx, be[winner],
+                        wdata[winner], is_long[winner]);
+                end
+`endif
                 // [C2CC-BUS-WR] -- catch ALL writers (CPU, blitter, disk DMA,
                 // etc.) to chip-RAM \$C2AC..\$C2D0 (the 32-byte slot around
                 // the bad-RTS return PC at \$FCF104).  The CPU-only [C2CC-WR]
@@ -2184,6 +2208,17 @@ module m68k_bus #(
                        : mem[granted_idx_q];
         if (granted_valid_q) resp_valid[granted_port_q] = 1'b1;
     end
+`ifdef KICKSTART_BOOT_TRACE
+    // Trace bus responses for vector $6C reads to diagnose the watchdog
+    // race that returns $0 instead of the correct $FC0D14.
+    always @(posedge clk) if (rst_n && granted_valid_q &&
+                              (granted_addr_q == 32'h0000_006C ||
+                               granted_addr_q == 32'h0000_002C)) begin
+        $display("[BUS-VEC] port=%d addr=%h idx=%h resp_data=%h mem[idx]=%h is_slow=%b is_rom=%b",
+            granted_port_q, granted_addr_q, granted_idx_q, resp_data,
+            mem[granted_idx_q], granted_is_slow_q, granted_is_rom_q);
+    end
+`endif
 
     // DMA writes bypass the bus arbiter (mem[] is written directly at the
     // top of the always block), so they don't naturally show up on the

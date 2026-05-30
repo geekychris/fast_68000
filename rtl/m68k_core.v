@@ -3205,6 +3205,15 @@ module m68k_core #(
                 dc_addr >= 32'h00DF_F080 && dc_addr <= 32'h00DF_F087)
                 $display("[CPUCOP] r=%d pc=%h kind=%d addr=%h be=%b wdata=%h",
                     retired, ex_pc, ex_kind, dc_addr, dc_be, dc_wdata);
+            // [CPUINT]: CPU writes to INTENA ($DFF09A) or INTREQ ($DFF09C).
+            // Captures the PC of every Disable/Enable so we can identify
+            // which call site is leaking the +3% CLR/SET imbalance that
+            // wedges WB1.3 boot at the trackdisk Wait($400).
+            if (dc_req_r && dc_we && dc_ack &&
+                (dc_addr == 32'h00DF_F098 || dc_addr == 32'h00DF_F09A ||
+                 dc_addr == 32'h00DF_F09C))
+                $display("[CPUINT] r=%d pc=%h addr=%h be=%b wdata=%h",
+                    retired, ex_pc, dc_addr, dc_be, dc_wdata);
             // Watch CPU writes to ThisTask.tc_SigRecvd = $198A (within $1970+$1A..$198D)
             // Bit 31 (SIGF_ABORT) becoming set explains why the dispatcher
             // refuses to wake the READY task.  Catch the offending write and
@@ -3638,8 +3647,22 @@ module m68k_core #(
             // which is itself an ILLEGAL opcode).  We need to find what
             // wrote that bad value.
             if (dc_req_r && dc_we && dc_ack &&
-                dc_addr >= 32'h0000_0010 && dc_addr <= 32'h0000_0013)
+                dc_addr >= 32'h0000_0008 && dc_addr <= 32'h0000_002F)
                 $display("[VEC-WR] r=%d pc=%h addr=%h be=%b wdata=%h",
+                    retired, ex_pc, dc_addr, dc_be, dc_wdata);
+            // Also trace writes to chip RAM $0..$1F so we can see what
+            // set $14 to $F1DD that traps in the LINEF storm.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr <= 32'h0000_0017 && dc_addr >= 32'h0000_0000)
+                $display("[CHIPLOW-WR] r=%d pc=%h addr=%h be=%b wdata=%h",
+                    retired, ex_pc, dc_addr, dc_be, dc_wdata);
+            // Trace writes to the full vector table area $0..$FF and
+            // catch any CPU write that NULLs out a vector — specifically
+            // vec=27 ($6C) and vec=11 ($2C), both of which read NULL when
+            // the watchdog forces an IRQ at r=4436670.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h0000_0060 && dc_addr <= 32'h0000_006F)
+                $display("[VEC27-WR] r=%d pc=%h addr=%h be=%b wdata=%h",
                     retired, ex_pc, dc_addr, dc_be, dc_wdata);
             // [C2CC-WR] any CPU write to supervisor-stack slot \$C2CC..\$C2CF.
             // This is the slot the bad RTS at \$FCF104 pops a NULL from
