@@ -1045,5 +1045,49 @@ module m68k_top #(
             end
         end
     end
+
+    // [PUTMSG-PKT]: capture dp_Type for every PutMsg entry at $FC1B70.
+    // Layout: A1 = Message header.  In K1.3/V33's actual packet layout
+    // (verified at r=4305718 against project_wb13_release13_banner.md's
+    // ACTION_FINDINPUT trace: msg=$C0544C, expected dp_Type=1005=$3ED),
+    // dp_Type lives at offset $28 from msg start (NOT the textbook $1C —
+    // K1.3 BCPL inserts 8 bytes between Message and DosPacket).  dp_Arg1
+    // at $30.  Most WB1.3 packets live in slow RAM ($C00000+).
+    //
+    // dp_Type values to look up (AmigaDOS):
+    //   1004 ACTION_FINDOUTPUT  1005 ACTION_FINDINPUT  1006 ACTION_FINDUPDATE
+    //   1007 ACTION_END          82 ACTION_READ          87 ACTION_WRITE
+    //     1 ACTION_GET_BLOCK     2 ACTION_SET_MAP       3 ACTION_DIE
+    //     5 ACTION_CURRENT_VOLUME 6 ACTION_LOCATE_OBJECT 7 ACTION_RENAME_DISK
+    //
+    // Counting which dp_Types stop firing identifies the missing reply.
+    wire [31:0] pm_a0 = g_core[0].u_core.u_rf.regs[8];
+    wire [31:0] pm_a1 = g_core[0].u_core.u_rf.regs[9];
+    wire        pm_in_slow = (pm_a1[23:20] == 4'hC);
+    wire [31:0] pm_type_addr = pm_a1 + 32'h28;
+    wire [31:0] pm_arg1_addr = pm_a1 + 32'h30;
+    wire [31:0] pm_type_idx0 = u_bus.slowmem[(pm_type_addr - 32'h00C0_0000) >> 2];
+    wire [31:0] pm_type_idx1 = u_bus.slowmem[((pm_type_addr - 32'h00C0_0000) >> 2) + 1];
+    wire [31:0] pm_arg1_idx0 = u_bus.slowmem[(pm_arg1_addr - 32'h00C0_0000) >> 2];
+    wire [31:0] pm_arg1_idx1 = u_bus.slowmem[((pm_arg1_addr - 32'h00C0_0000) >> 2) + 1];
+    wire [31:0] pm_type = !pm_in_slow ? 32'hFFFFFFFF :
+                          (pm_type_addr[1:0] == 2'b10)
+                          ? {pm_type_idx0[15:0], pm_type_idx1[31:16]}
+                          : pm_type_idx0;
+    wire [31:0] pm_arg1 = !pm_in_slow ? 32'hFFFFFFFF :
+                          (pm_arg1_addr[1:0] == 2'b10)
+                          ? {pm_arg1_idx0[15:0], pm_arg1_idx1[31:16]}
+                          : pm_arg1_idx0;
+    reg [31:0] pm_last_r;
+    initial pm_last_r = 32'hFFFF_FFFF;
+    always @(posedge clk) begin
+        if (rst_n && g_core[0].u_core.is_settled &&
+            g_core[0].u_core.ex_pc == 32'h00FC_1B70 &&
+            retired_flat[31:0] != pm_last_r) begin
+            $display("[PUTMSG-PKT] r=%0d port=%h msg=%h type=%h arg1=%h",
+                retired_flat[31:0], pm_a0, pm_a1, pm_type, pm_arg1);
+            pm_last_r <= retired_flat[31:0];
+        end
+    end
 `endif
 endmodule

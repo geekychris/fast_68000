@@ -666,7 +666,7 @@ test-kickstart-boot:
 	$(MAKE) --no-print-directory build BUILD=build_kick_boot N_CORES=1 USE_CACHE=1 \
 	    MEM_WORDS=131072 ROM_WORDS=$(ROMSIZE_WORDS) ROM_HEXFILE=rom.hex OVL_RESET=1 \
 	    DISK_WORDS=$$DISK_WORDS_USED DISK_HEXFILE=disk.hex \
-	    VERI_DEFS='+define+KICKSTART_BOOT +define+KICKSTART_FAST_BOOT $(BOOT_TRACE_DEF) $(EXTRA_VERI_DEFS)' \
+	    VERI_DEFS='+define+KICKSTART_BOOT +define+KICKSTART_FAST_BOOT +define+BLT_VECTABLE_GUARD $(BOOT_TRACE_DEF) $(EXTRA_VERI_DEFS)' \
 	    >build_kick_boot/_build.log 2>&1
 	$(PYTHON) $(TB_DIR)/asm68k.py tests/t63_boot_rom.s build_kick_boot/program.hex
 	@echo "Running Kickstart + bootblock disk for up to $${ROMCYCLES:-1500000000} cycles..."

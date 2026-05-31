@@ -2412,6 +2412,58 @@ module m68k_bus #(
         .hit_o   ()
     );
 
+    // [5E40-BUS-WR]: chip RAM $5E40..$5E47, the BCPL DOS table entry
+    // that gets zeroed between r=2.5M and r=4.3M of WB1.3 boot.  CPU
+    // writes are captured by [5E40-WR] in m68k_core.v; this bus-arbiter
+    // watch ALSO captures blitter/copper/DMA writes, identifying the
+    // non-CPU writer that the existing probe missed.  src_id shows the
+    // arbiter port (0=CPU0 I, 1=CPU0 D, 2=blitter, 3=copper, etc.).
+    hw_watch #(
+        .LABEL      ("5E40-BUS-WR"),
+        .ADDR_LO    (32'h0000_5E3C),
+        .ADDR_HI    (32'h0000_5E47),
+        .MATCH_WE   (1),
+        .MATCH_RE   (0)
+    ) u_w_5e40_bus (
+        .clk     (clk),
+        .rst_n   (rst_n),
+        .valid   (bus_we_now),
+        .we      (1'b1),
+        .addr    (addr[winner]),
+        .wdata   (wdata[winner]),
+        .be      (be[winner]),
+        .src_id  (bus_src),
+        .pc      (32'd0),
+        .retired (32'd0),
+        .hit_o   ()
+    );
+
+    // [INTVECS-WR]: chip RAM $C0..$FF — K1.3's IntVects[] array (16
+    // pointers, one per IRQ source).  FS-UAE save state shows this
+    // populated with 16 consecutive slow-RAM pointers $00C096DC,
+    // $00C096DE, ... pointing into a BSR.B dispatcher trampoline at
+    // $C096DC.  Ours is all zeros — K1.3 never sets up the IntVects.
+    // Capture any writer to find which K1.3 init path is being skipped.
+    hw_watch #(
+        .LABEL      ("INTVECS-WR"),
+        .ADDR_LO    (32'h0000_00C0),
+        .ADDR_HI    (32'h0000_00FF),
+        .MATCH_WE   (1),
+        .MATCH_RE   (0)
+    ) u_w_intvecs (
+        .clk     (clk),
+        .rst_n   (rst_n),
+        .valid   (bus_we_now),
+        .we      (1'b1),
+        .addr    (addr[winner]),
+        .wdata   (wdata[winner]),
+        .be      (be[winner]),
+        .src_id  (bus_src),
+        .pc      (32'd0),
+        .retired (32'd0),
+        .hit_o   ()
+    );
+
 `ifdef KICKSTART_BOOT_TRACE
     // [BB-BLT-SRC]: snapshot of chip RAM at $20A0 + $22A0 (the sector
     // copy blit's A and B source starts) at every BLTSIZE write.  Lets

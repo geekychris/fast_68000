@@ -3316,11 +3316,22 @@ module m68k_core #(
                     retired, u_rf.regs[8], u_rf.regs[9], u_rf.regs[10],
                     u_rf.regs[14], u_rf.regs[15]);
             // [STKSET-932]: same at $FEA932 (the LINK A2,#-$1E that
-            // creates the frame which $FEA936 then saves into).
+            // creates the frame which $FEA936 then saves into).  Includes
+            // D0 (= what gets saved at $C04A8E by MOVEM at $FEA936) so we
+            // can see directly whether the caller passed D0=0 or whether
+            // D0 was clobbered between MOVE.L #imm,D0 and the BSR.
             if (is_settled && ex_pc == 32'h00fe_a932)
-                $display("[STKSET-932] r=%d A0=%h A1=%h A2=%h A6=%h SP=%h",
-                    retired, u_rf.regs[8], u_rf.regs[9], u_rf.regs[10],
-                    u_rf.regs[14], u_rf.regs[15]);
+                $display("[STKSET-932] r=%d D0=%h A0=%h A1=%h A2=%h A6=%h SP=%h ret=%h",
+                    retired,
+                    u_rf.regs[0], u_rf.regs[8], u_rf.regs[9], u_rf.regs[10],
+                    u_rf.regs[14], u_rf.regs[15], u_rf.regs[15]);
+            // [LSR-FC7C86]: detection probe at PC=$FC7C86 (the LSR.W
+            // $10(A1) site flagged by the original K_SHIFT investigation).
+            // If our boot path never reaches this PC, K_SHIFT fix doesn't
+            // help.  Dumps D1 so we can compare to expected vs corrupted.
+            if (is_settled && ex_pc == 32'h00fc_7c86)
+                $display("[LSR-FC7C86] r=%d D1=%h A1=%h",
+                    retired, u_rf.regs[1], u_rf.regs[9]);
             // [STKSET-970]: same at $FEA970 (the reader — A1 source of
             // the struct).
             if (is_settled && ex_pc == 32'h00fe_a970)

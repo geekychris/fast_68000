@@ -121,6 +121,20 @@ module blitter (
     assign busy_o = blt_busy;
     assign bzero_o = blt_bzero;
 
+    // D-write pipeline (mirrors FS-UAE/real-Amiga 1-cycle delay).  The
+    // blitter's D channel is pipelined one word behind the C read: the
+    // FIRST D-iteration of a blit only LATCHES the dst address and the
+    // computed D value; subsequent iterations write the previously-latched
+    // pair to memory BEFORE latching the new one.  At blit end the last
+    // pending pair is flushed in S_DONE.  See blitter_dofast() in FS-UAE's
+    // blitter.cpp (lines 546-563 + 574-575).  Without this delay our
+    // emulated blitter writes D in the same cycle as it reads C, which
+    // diverges from real-Amiga timing.  Documented in
+    // project_wb13_fsuae_reference.md.
+    reg        d_pipe_valid;
+    reg [31:0] d_pipe_addr;
+    reg [15:0] d_pipe_data;
+
     // Decoded BLTCON fields.
     wire [7:0]  lf       = bltcon[31:24];
     wire [3:0]  ash      = bltcon[23:20];
@@ -371,6 +385,10 @@ module blitter (
             mst_addr  <= 32'd0;
             mst_wdata <= 32'd0;
             mst_be    <= 4'b0000;
+
+            d_pipe_valid <= 1'b0;
+            d_pipe_addr  <= 32'd0;
+            d_pipe_data  <= 16'd0;
         end else begin
             // Default: int_o is a single-cycle pulse; clear it every cycle
             // unless S_DONE sets it this cycle.
@@ -440,6 +458,7 @@ module blitter (
                                           : {10'd0, slv_wdata[5:0]};
                             blt_busy   <= 1'b1;
                             blt_bzero  <= 1'b1;
+                            d_pipe_valid <= 1'b0; // restart D pipeline per blit
                             cur_word   <= 16'd0;
                             cur_row    <= 16'd0;
                             a_prev_word <= 16'd0;
@@ -545,35 +564,66 @@ module blitter (
                     filled  = apply_fill(combined_w, fill_carry, ife, efe, desc);
                     final_w = filled[15:0];
 
-                    if (use_d) begin
-                        mst_req_r <= 1'b1;
-                        mst_we    <= 1'b1;
-                        mst_addr  <= bltdpt;
-                        mst_be    <= half_be(bltdpt[1]);
-                        mst_wdata <= put_half(final_w, bltdpt[1]);
-                        if (mst_ack) begin
+                    if (use_d) begin : use_d_block
+                        // D-write pipeline: write the PREVIOUSLY-latched
+                        // pair, then latch the current pair.  Matches
+                        // FS-UAE/real-Amiga semantics where D is delayed
+                        // one word behind the A/B/C reads.
+                        reg should_advance;
+                        should_advance = 1'b0;
+`ifdef BLT_VECTABLE_GUARD
+                        if (d_pipe_valid && d_pipe_addr < 32'h0000_0400) begin
+                            // Pending pair targets the vector table —
+                            // refuse the bus write but still rotate the
+                            // pipeline so the blit completes normally.
+                            if (cur_word == 16'd1 && cur_row == 16'd0)
+                                $display("[BLT_GUARD] refusing blit dst=%h bltcon=%h size=%0dx%0d",
+                                    d_pipe_addr, bltcon, blt_width, blt_height);
+                            d_pipe_addr <= bltdpt;
+                            d_pipe_data <= final_w;
+                            d_pipe_valid <= 1'b1;
+                            should_advance = 1'b1;
+                        end else
+`endif
+                        if (d_pipe_valid) begin
+                            mst_req_r <= 1'b1;
+                            mst_we    <= 1'b1;
+                            mst_addr  <= d_pipe_addr;
+                            mst_be    <= half_be(d_pipe_addr[1]);
+                            mst_wdata <= put_half(d_pipe_data, d_pipe_addr[1]);
+                            if (mst_ack) begin
 `ifdef BLT_DEBUG_FIRST_WR
-                            if (cur_row == 16'd0 && cur_word < 16'd4)
-                                $display("[BLT_WRD] bltdpt=%h bltbpt=%h final_w=%h b_cur=%h b_prev=%h cur_word=%0d cur_row=%0d",
-                                    bltdpt, bltbpt, final_w, b_cur_word_q, b_prev_word, cur_word, cur_row);
+                                if (cur_row == 16'd0 && cur_word < 16'd4)
+                                    $display("[BLT_WRD] bltdpt=%h bltbpt=%h final_w=%h b_cur=%h b_prev=%h cur_word=%0d cur_row=%0d",
+                                        d_pipe_addr, bltbpt, d_pipe_data, b_cur_word_q, b_prev_word, cur_word, cur_row);
 `endif
 `ifdef HDRCHK_WATCH
-                            if (bltdpt >= 32'h0000_64B0 && bltdpt <= 32'h0000_64BB)
-                                $display("[BLT_WR] bltdpt=%h bltbpt=%h bltcon=%h final_w=%h b_cur=%h cur_word=%0d cur_row=%0d width=%0d",
-                                    bltdpt, bltbpt, bltcon, final_w, b_cur_word_q, cur_word, cur_row, blt_width);
-                            if (bltdpt >= 32'h0000_68E0 && bltdpt <= 32'h0000_68FB)
-                                $display("[BLT_SEC1_WR] bltdpt=%h bltbpt=%h final_w=%h b_cur=%h cur_word=%0d cur_row=%0d",
-                                    bltdpt, bltbpt, final_w, b_cur_word_q, cur_word, cur_row);
+                                if (d_pipe_addr >= 32'h0000_64B0 && d_pipe_addr <= 32'h0000_64BB)
+                                    $display("[BLT_WR] bltdpt=%h bltbpt=%h bltcon=%h final_w=%h b_cur=%h cur_word=%0d cur_row=%0d width=%0d",
+                                        d_pipe_addr, bltbpt, bltcon, d_pipe_data, b_cur_word_q, cur_word, cur_row, blt_width);
+                                if (d_pipe_addr >= 32'h0000_68E0 && d_pipe_addr <= 32'h0000_68FB)
+                                    $display("[BLT_SEC1_WR] bltdpt=%h bltbpt=%h final_w=%h b_cur=%h cur_word=%0d cur_row=%0d",
+                                        d_pipe_addr, bltbpt, d_pipe_data, b_cur_word_q, cur_word, cur_row);
 `endif
-                            mst_req_r <= 1'b0;
-                            // Latch previous-word state for next iteration's shift.
+                                mst_req_r <= 1'b0;
+                                if (d_pipe_data != 16'd0) blt_bzero <= 1'b0;
+                                d_pipe_addr <= bltdpt;
+                                d_pipe_data <= final_w;
+                                // d_pipe_valid stays 1
+                                should_advance = 1'b1;
+                            end
+                        end else begin
+                            // First word of blit — just latch, no bus.
+                            d_pipe_valid <= 1'b1;
+                            d_pipe_addr  <= bltdpt;
+                            d_pipe_data  <= final_w;
+                            should_advance = 1'b1;
+                        end
+
+                        if (should_advance) begin
                             a_prev_word <= a_cur_word_q;
                             b_prev_word <= b_cur_word_q;
-                            // Update fill carry from this word's processing.
                             fill_carry  <= filled[16];
-                            // BZERO tracks D-channel output: clear as soon
-                            // as any non-zero word is committed.
-                            if (final_w != 16'd0) blt_bzero <= 1'b0;
                             bltdpt <= bltdpt + (desc ? -32'sd2 : 32'sd2);
                             if (cur_word == (blt_width - 16'd1)) begin
                                 cur_word <= 16'd0;
@@ -631,12 +681,49 @@ module blitter (
                     end
                 end
                 S_DONE: begin
-                    blt_busy <= 1'b0;
-                    int_o    <= 1'b1;        // one-cycle pulse
+                    // Flush the last pending D-pipeline pair before
+                    // declaring the blit done.  Mirrors FS-UAE's final
+                    // post-loop blit_chipmem_agnus_wput() at line 574.
+                    if (use_d && d_pipe_valid) begin
+`ifdef BLT_VECTABLE_GUARD
+                        if (d_pipe_addr < 32'h0000_0400) begin
+                            // Last pending word lands in the vector table —
+                            // drop the write but complete the blit.
+                            d_pipe_valid <= 1'b0;
+                            blt_busy <= 1'b0;
+                            int_o    <= 1'b1;
 `ifdef HDRCHK_WATCH
-                    $display("[BLT_DONE] bltcon=%h", bltcon);
+                            $display("[BLT_DONE] bltcon=%h", bltcon);
 `endif
-                    state    <= S_IDLE;
+                            state <= S_IDLE;
+                        end else
+`endif
+                        begin
+                            mst_req_r <= 1'b1;
+                            mst_we    <= 1'b1;
+                            mst_addr  <= d_pipe_addr;
+                            mst_be    <= half_be(d_pipe_addr[1]);
+                            mst_wdata <= put_half(d_pipe_data, d_pipe_addr[1]);
+                            if (mst_ack) begin
+                                mst_req_r <= 1'b0;
+                                if (d_pipe_data != 16'd0) blt_bzero <= 1'b0;
+                                d_pipe_valid <= 1'b0;
+                                blt_busy <= 1'b0;
+                                int_o    <= 1'b1;
+`ifdef HDRCHK_WATCH
+                                $display("[BLT_DONE] bltcon=%h", bltcon);
+`endif
+                                state <= S_IDLE;
+                            end
+                        end
+                    end else begin
+                        blt_busy <= 1'b0;
+                        int_o    <= 1'b1;        // one-cycle pulse
+`ifdef HDRCHK_WATCH
+                        $display("[BLT_DONE] bltcon=%h", bltcon);
+`endif
+                        state    <= S_IDLE;
+                    end
                 end
 
                 // -------- Line mode --------
