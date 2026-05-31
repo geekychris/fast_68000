@@ -2464,6 +2464,35 @@ module m68k_bus #(
         .hit_o   ()
     );
 
+    // [LIB-LIST-WR]: chip RAM $0410..$043F — covers the exec library
+    // MemList Node header at $0410-$041F and the start of the library
+    // dispatch table at $0420-$043F.  The fsuae_diff.py tool revealed
+    // (journal §17/18) that at PC=$FC0CE2 (autovec L2 first hit), FS-UAE
+    // has chip $042C = $01220478 while our system has $042C = $01220C80.
+    // Same overall structure but ONE pointer in the table differs.  The
+    // FS-UAE write that produces $0478 doesn't happen on our side.
+    // Capture every write to this region to compare against the
+    // FS-UAE trace.
+    hw_watch #(
+        .LABEL      ("LIB-LIST-WR"),
+        .ADDR_LO    (32'h0000_0410),
+        .ADDR_HI    (32'h0000_043F),
+        .MATCH_WE   (1),
+        .MATCH_RE   (0)
+    ) u_w_lib_list (
+        .clk     (clk),
+        .rst_n   (rst_n),
+        .valid   (bus_we_now),
+        .we      (1'b1),
+        .addr    (addr[winner]),
+        .wdata   (wdata[winner]),
+        .be      (be[winner]),
+        .src_id  (bus_src),
+        .pc      (32'd0),
+        .retired (32'd0),
+        .hit_o   ()
+    );
+
 `ifdef KICKSTART_BOOT_TRACE
     // [BB-BLT-SRC]: snapshot of chip RAM at $20A0 + $22A0 (the sector
     // copy blit's A and B source starts) at every BLTSIZE write.  Lets

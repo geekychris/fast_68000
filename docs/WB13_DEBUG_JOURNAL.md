@@ -817,3 +817,145 @@ selection.
 
 This is now narrowed to a **single byte in chip RAM** as the
 diagnostic anchor.
+
+## §18. Finer diff: divergence is THREE longwords, not 96 bytes
+
+Re-examining the chip `$0410-$047F` window at `$FC0CE2` first hit
+shows the diff is actually much smaller than the hunk count suggested:
+
+| Offset | FS-UAE | Verilator | Diff |
+|---|---|---|---|
+| `$0410` | `$00000C80` | `$000059E8` | LN_SUCC pointer different |
+| `$041C` | `$0007F380` | `$0007A618` | `mh_Free` differs by `$D68` |
+| `$042C` | `$01220478` | `$01220C80` | only the LOW half differs ($0478 vs $0C80) |
+
+Everything else in the table at `$0420-$047F` (the
+`$00E00000 $00E20000 $01200000 $0122xxxx ...` pattern) **matches
+exactly** between the two emulators.
+
+So our system populated the same data structure as FS-UAE, with the
+same overall layout, but:
+
+1. A different pointer at `$0410` (LN_SUCC of the MemList node)
+2. A different `mh_Free` value (`$D68` = 3432 bytes more allocated
+   on our side)
+3. One entry in the table at `$042C` points to `$0C80` instead of
+   `$0478`
+
+The repeating `$0122xxxx` pattern with low-half pointers at `$042E`,
+`$0436`, `$043E`, etc. all matching ($0478) suggests this is a list
+of nodes whose initial pointers point to `$0478`, except the FIRST
+entry which is the LIST HEAD — and that's what differs on our side.
+
+At first idle (`$FC0F94`), the diff tool reports **ZERO chip RAM
+differences** between FS-UAE and our Verilator.  This is the
+lockstep checkpoint — they're byte-identical until both reach idle
+the first time.
+
+Between first idle and the first `$FC0CE2` (autovec L2 / CIA-A
+PORTS) hit, FS-UAE writes `$01220478` to chip `$042C`.  Our system
+doesn't make the same write.
+
+The fsuae_remote_patch watchpoint to catch the FS-UAE writer is
+flaky in the current build (bank-wrapping doesn't reliably survive
+the reset+resume sequence — see fsuae_remote_patch's ROADMAP).
+Two approaches remain for nailing the PC:
+
+1. Add a Verilog `hw_watch` on chip `$042C` in our Verilator to log
+   the PC of the write that SHOULD happen but doesn't.  If we never
+   see the write, we know our boot diverges before that code path.
+2. Use FS-UAE's `console_debugger` directly (drop into a terminal,
+   `wp $42c 4 W`, `g`) to catch the FS-UAE writer that way without
+   the RPC layer.
+
+## §19. Found it: PC `$FCEC68` overwrites `$042E` on BOTH sides, but FS-UAE has a later write back
+
+Adding `rtl/m68k_bus.v::u_w_lib_list` (a hw_watch on chip `$0410-$043F`)
+and tracing the boot produced this sequence on **our Verilator**:
+
+```
+r=1530720  PC=$FCAD34  writes $0478 to $042E  (be=0011, MOVE.W A0,(A1))
+r=1593974  PC=$FCEC68  writes $0C80 to $042E  (be=0011, MOVE.W D2,$6(A0))  ← OVERWRITE
+r=1594294  PC=$FCEC68  writes $0C80 to $042E  (again)
+r=1610724  PC=$FCEC68  writes $0C80 to $042E  (third time)
+```
+
+So our system writes the "right" value ($0478) once, then overwrites
+it with $0C80 three times.  By the snapshot point, $042E = $0C80.
+
+### FS-UAE comparison via fsuae_remote_patch RPC
+
+Setting a BP at `$FCEC68` on FS-UAE shows it **also reaches that PC**
+with **`D2=$0C80`** — i.e. FS-UAE *also* executes the
+`MOVE.W D2, $6(A0)` instruction with the same operands as us.
+
+Stepping confirmed: after the MOVE.W on FS-UAE, chip `$042C` = `$01220C80`
+— matching ours.
+
+But at the snapshot point (`$FC0CE2` first hit), FS-UAE has
+`$042C = $01220478` again.  So **FS-UAE writes $0478 BACK** at some
+later PC.  Our system doesn't.
+
+### The bug
+
+On FS-UAE: there's a write that restores `$0478` to `$042E` *after*
+`$FCEC68` runs.  Likely either:
+- The `$FCAD34` loop runs another iteration that lands on `$042E` again
+- A different code path writes the canonical $0478 marker
+
+On our Verilator: that subsequent write doesn't happen.  The `$0C80`
+sticks.  This is the **single byte-level difference** that triggers
+the entire downstream chain that ends with chip `$C0-$FF` not being
+populated and DMACON.BPLEN never being set.
+
+### Disasm context
+
+At `$FCEC68`:
+```
+$FCEC50: MOVEA.L (A1,$26), A0   ; A0 = (A1 + $26).val
+$FCEC54: LEA $8(A0), A0
+$FCEC58: MOVE.L A0, D3
+$FCEC5A: ADD.L  D3, D0
+$FCEC5C: MOVEA.L D0, A0          ; A0 = D0 = computed target
+$FCEC5E: MOVE.L D2, D0
+$FCEC60: MOVE.L #$10, D1
+$FCEC62: ASR.L  D1, D0           ; D0 = D2 >> 16
+$FCEC64: MOVE.W D0, $2(A0)       ; write high half
+$FCEC68: MOVE.W D2, $6(A0)       ; <-- writes $C80 to $042E
+$FCEC6C: MOVEM.L (A7)+, D2-D3
+$FCEC70: RTS
+```
+
+This looks like a SETUP function for some struct field at `+$2`/`+$6`
+within an object pointed to by `A0` (= `(A1+$26)+$8+D3`).
+
+At `$FCAD34`:
+```
+$FCAD20: <previous code>
+$FCAD2C: MOVEA.L (A2,$26), A0    ; A0 = (A2+$26).val
+$FCAD30: LEA $58(A0), A0         ; A0 = ... + $58
+$FCAD34: MOVE.W A0, (A1)         ; <-- writes $0478 (= LOW half of A0)
+$FCAD36: ADDQ.L #1, D1
+```
+
+This is a different routine that writes a *low-half address pointer*
+to a struct field pointed to by A1.
+
+### Why FS-UAE writes $0478 back but we don't
+
+This is the question for the next session.  Most likely:
+- A **later iteration** of the `$FCAD34` loop on FS-UAE walks through
+  more nodes and ends up writing back to `$042E`
+- Our `$FCAD34` loop terminates earlier (a `CMP` reaches its threshold
+  sooner because a register/memory value differs)
+
+The triggering register or memory value is what we need to find next.
+
+The watchpoint infrastructure in `fsuae_remote_patch` has a known
+issue with surviving fast resume cycles after a step; this can be
+worked around by using FS-UAE's interactive `console_debugger` (via
+the GUI) for the next-level bisection, or by extending the patch
+with a "step until address X is written" primitive.
+
+This is **a single instruction** of divergence between FS-UAE and
+our Verilator.  We are very close.
