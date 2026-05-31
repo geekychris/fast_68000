@@ -133,6 +133,43 @@ slow-RAM IRQ-dispatcher trampoline on FS-UAE) — which finally
 identified K1.3 skipping its IRQ-server install as the upstream
 cause of the bitplane-DMA-never-enabled symptom.
 
+### `tools/fsuae_diff.py` — live FS-UAE vs Verilator comparison at any PC
+
+Builds on the [`fsuae_remote_patch`](https://github.com/geekychris/fsuae_remote_patch)
+sister project (cloned/built once via `cd ../fsuae_remote_patch && ./build.sh`).
+That gives us a controllable FS-UAE instance over HTTP/JSON-RPC.
+
+```sh
+make cosim-window                       # build our Verilator boot binary
+tools/fsuae_diff.py --pc 0xFC0240       # compare at "after-zclr"
+tools/fsuae_diff.py --pc 0xFC2F80       # compare at "first-CopyMem"
+tools/fsuae_diff.py --pc PC --skip-fsuae --skip-veri
+                                         # reuse cached captures
+```
+
+The tool:
+1. Boots fs-uae via its RPC, installs a breakpoint at the target PC,
+   hard-resets, waits for the BP to fire
+2. Dumps FS-UAE's chip RAM (0..$80000), slow RAM ($C00000-$C7FFFF),
+   CPU registers, and custom-chip state to files under `/tmp/fsuae_diff/`
+3. Runs our `build_cosim_window/Vm68k_top` with
+   `CHIPRAM_SNAP_PCS=PC` to dump chip RAM at the same PC
+4. Diffs the two chip-RAM binaries, prints first divergence + a
+   hex window around it, then dumps the IRQ-vector slots `$C0-$FC`
+   side by side
+
+Output is colour-highlighted: bytes the two emulators agree on are
+dim, divergent bytes are bright.  Hunk grouping coalesces
+near-adjacent differences.
+
+vs the older `fsuae_state.py` approach: `fsuae_state.py` parses an
+*offline* `.uss` save state taken by a human in the GUI.
+`fsuae_diff.py` is fully scripted — you specify a PC, both
+emulators run automatically.  Much faster iteration during
+bisection.
+
+Documented in WB13_DEBUG_JOURNAL.md §16.
+
 ## 2. In-RTL `$display` traces
 
 All traces in `rtl/m68k_core.v` are wrapped in

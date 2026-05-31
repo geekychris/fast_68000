@@ -657,3 +657,81 @@ finding. The right next move:
 The pieces of the puzzle now fit. The exact ROM disassembly is the
 work that's left.
 
+
+## §16. fsuae_diff — first cross-emulator state comparison
+
+### The tool
+
+`tools/fsuae_diff.py` brings up the sister `fsuae_remote_patch`
+project's patched fs-uae over its RPC, sets a breakpoint at a target
+PC, dumps chip RAM + slow RAM + CPU + chipset state into binary
+snapshots, then runs `build_cosim_window/Vm68k_top` with
+`CHIPRAM_SNAP_PCS=PC` to produce the same chip-RAM snapshot from our
+Verilator at the same PC.  Diffs the two and reports the first
+divergence with a hex window.
+
+Usage:
+
+```
+make cosim-window                     # build Vm68k_top with snap support
+tools/fsuae_diff.py --pc 0xFC0240     # diff at "post-exec-zero-clear"
+tools/fsuae_diff.py --pc 0xFC2F80     # diff at first CopyMem call
+tools/fsuae_diff.py --pc 0xFC0F94 --skip-fsuae --skip-veri
+                                       # reuse cached captures
+```
+
+### What we learned (initial run, 2026-05-31)
+
+**At PC=$FC0240** (right after the exec zero-clear loop completes):
+**ZERO chip RAM differences** between FS-UAE and our Verilator.
+Both systems are in identical state.  This eliminates a wide class
+of potential bugs (CPU init, ROM mapping, zero-clear correctness)
+and proves the early-boot equivalence.
+
+**At PC=$FC2F80** (the first time exec.CopyMem is called):
+59 distinct chip-RAM diff hunks, **first divergence at chip $0412**.
+Our system arrives at $FC2F80 at retired=4,004,106 instructions vs
+FS-UAE's earlier hit — meaning our boot is taking MORE instructions
+to reach the same PC, and writing more chip RAM in the process.
+
+  - First-CopyMem A0=$E92000, A1=$C014C6, D0=$E.  Source $E92000 is
+    the Z2 expansion device autoconfig space (carries the "UAE"
+    fingerprint we already see in the bytes there).
+  - Hunks at chip $0410-$04FF, $0C80+, $0CD1+, $0D0D+, $0D65+
+    show our system has populated chip RAM with a 4-byte-stride
+    jump-table-like structure (`01 24 00 00 01 26 04 78 ...`) that
+    FS-UAE hasn't written yet at this moment.
+
+**Interpretation:** Our K1.3 takes a *different code path* in the
+window between $FC0240 (zero-clear done) and $FC2F80 (first CopyMem
+call).  We aren't yet running the same residents in the same order.
+Since both reach the same PC eventually, the divergence is in WHICH
+residents run, not whether they run at all.
+
+### Where this points
+
+The divergence somewhere in `$FC0240..$FC2F80` is the next-level
+target.  Possible sources, in order of likelihood:
+
+1. **A chipset register read returns a different value** — our
+   blitter/copper/CIA shadow state may differ from FS-UAE's at the
+   moment exec probes it.  Exec's resident-init order depends on
+   probe results (e.g. CIA-A presence affects which resources get
+   built).
+2. **A memory-probe write reads back differently** — exec scans for
+   chip RAM size by writing patterns and reading them back; if our
+   slow RAM responds to one pattern but not another, exec would
+   compute different sizes.
+3. **CPU exception emulation** — some unimplemented or
+   slightly-wrong exception handler could shunt us through a
+   different code path.  We've fixed most of these (LINK/UNLK, CLR
+   predec, etc.) but a subtle one might remain.
+
+### Next step
+
+Bisect the $FC0240..$FC2F80 window with finer-grained PC checkpoints
+to find where the chip-RAM trajectories first diverge.  The PC range
+covers ~12 KB of ROM — at 100 instructions per call we'd need ~25
+checkpoints to bisect.  Or alternatively, set a WP on the FIRST
+divergent address (chip $0412) and find the PC of the offending
+write on each side.
