@@ -842,8 +842,10 @@ module m68k_decoder (
             // ----------------------------------------------------------
             // 1110_*: Shifts / rotates
             // ----------------------------------------------------------
-            // Memory single-bit shift: 1110_0??_011_mm_rrr (W only)
-            16'b1110_0??_011_???_???: begin
+            // Memory single-bit shift: 1110_0op_dr_11_mm_rrr (W only).
+            // The `dr` bit (opcode[8]) is part of the pattern (left vs right),
+            // so the pattern lets bit 8 float: 1110_0op_?_11_mm_rrr.
+            16'b1110_0??_?11_???_???: begin
                 kind = K_SHIFT;
                 size = `SZ_W;
                 src_mode = m3;

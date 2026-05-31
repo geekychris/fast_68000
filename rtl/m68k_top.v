@@ -82,6 +82,19 @@ module m68k_top #(
     wire [4*N_PORTS-1:0]  p_be;
     wire [N_PORTS-1:0]    p_is_long;
     wire [N_PORTS-1:0]    p_grant;     // unused by caches but routed for completeness
+
+    // Cosim window signals driven into the bus and chipset modules so
+    // their non-CPU memory writes can emit `[CosimMW]` traces aligned
+    // with the CPU's retired counter.  Default to 0/off in non-cosim
+    // builds — see `+cosim_start=` / `+cosim_end=` plusargs (m68k_core.v).
+    wire [31:0] cosim_retired_w = retired_flat[31:0];
+`ifdef KICKSTART_COSIM_TRACE
+    wire cosim_in_window_w =
+        (cosim_retired_w >= g_core[0].u_core.cosim_start_r) &&
+        (cosim_retired_w <= g_core[0].u_core.cosim_end_r);
+`else
+    wire cosim_in_window_w = 1'b0;
+`endif
     wire [N_PORTS-1:0]    p_resp_valid;
     wire [31:0]           p_resp_data;
 
@@ -109,6 +122,7 @@ module m68k_top #(
     wire        blt_slv_we;
     wire [5:0]  blt_slv_addr;
     wire [3:0]  blt_slv_be;
+    wire        blt_slv_is_long;
     wire [31:0] blt_slv_wdata;
     wire [31:0] blt_slv_rdata;
 
@@ -227,11 +241,14 @@ module m68k_top #(
         .mem_poke_strobe(mem_poke_strobe),
         .mem_poke_addr  (mem_poke_addr),
         .mem_poke_data  (mem_poke_data),
+        .cosim_retired_i (cosim_retired_w),
+        .cosim_in_window_i (cosim_in_window_w),
         .fb_peek_data(fb_peek_data),
         .blt_slv_req (blt_slv_req),
         .blt_slv_we  (blt_slv_we),
         .blt_slv_addr(blt_slv_addr),
         .blt_slv_be  (blt_slv_be),
+        .blt_slv_is_long(blt_slv_is_long),
         .blt_slv_wdata(blt_slv_wdata),
         .blt_slv_rdata(blt_slv_rdata),
         .blt_busy_i  (blt_busy),
@@ -489,6 +506,7 @@ module m68k_top #(
         .slv_we       (blt_slv_we),
         .slv_addr     (blt_slv_addr),
         .slv_be       (blt_slv_be),
+        .slv_is_long  (blt_slv_is_long),
         .slv_wdata    (blt_slv_wdata),
         .slv_rdata    (blt_slv_rdata),
         .slv_ack      (),               // unused: bus handles ack timing
@@ -850,4 +868,182 @@ module m68k_top #(
             );
         end
     endgenerate
+
+    // ----------------------------------------------------------------
+    // Snapshot-at-PC breakpoint.
+    //
+    // Set +snap_pc=0xFEA970 +snap_dir=build_kick_boot/snap on the
+    // Vm68k_top command line.  When core 0's executing PC reaches
+    // snap_pc (and core 0 is in the "is_settled" commit cycle), we
+    // dump:
+    //   <dir>/regs.txt   — D0..D7 / A0..A7 / PC / SR / USP
+    //   <dir>/mem.hex    — chip RAM (one 32-bit longword per line)
+    //   <dir>/slow.hex   — slow/trapdoor RAM
+    //   <dir>/chip.txt   — chipset shadow regs (intena/intreq/dmacon/vpos)
+    // then call $finish so the snapshot files reflect a quiescent state.
+    //
+    // The snapshot is the "switch ON cosim" trigger from the user's
+    // mental model: re-launch musashi_kick with the snapshot dir to
+    // resume from this point.  See `make cosim-window` (TODO).
+`ifdef KICKSTART_BOOT_TRACE
+    reg [31:0] snap_pc;
+    reg [31:0] snap_after_retired;
+    reg        snap_armed;
+    reg [255*8-1:0] snap_dir;
+    initial begin
+        if (!$value$plusargs("snap_pc=%h", snap_pc)) snap_pc = 32'hFFFF_FFFF;
+        if (!$value$plusargs("snap_after_retired=%d", snap_after_retired))
+            snap_after_retired = 32'd0;
+        if (!$value$plusargs("snap_dir=%s", snap_dir)) snap_dir = "snap";
+        snap_armed = 1'b1;
+    end
+    integer snap_fp;
+    always @(posedge clk) begin
+        if (rst_n && snap_armed &&
+            snap_pc != 32'hFFFF_FFFF &&
+            retired_flat[31:0] >= snap_after_retired &&
+            g_core[0].u_core.is_settled &&
+            g_core[0].u_core.ex_pc == snap_pc) begin
+            $display("=== SNAPSHOT @ PC=%h retired=%0d ===",
+                g_core[0].u_core.ex_pc, retired_flat[31:0]);
+            // Write machine-readable regs.txt (one KEY=HEX per line).
+            // Consumers: tools/snap_to_musashi.py, musashi_kick.c --seed.
+            snap_fp = $fopen({snap_dir, "/regs.txt"}, "w");
+            $fwrite(snap_fp, "PC=%h\n", g_core[0].u_core.ex_pc);
+            $fwrite(snap_fp, "SR=%h\n", g_core[0].u_core.sr_now);
+            $fwrite(snap_fp, "USP=%h\n", g_core[0].u_core.usp_shadow);
+            $fwrite(snap_fp, "D0=%h\n", g_core[0].u_core.u_rf.regs[0]);
+            $fwrite(snap_fp, "D1=%h\n", g_core[0].u_core.u_rf.regs[1]);
+            $fwrite(snap_fp, "D2=%h\n", g_core[0].u_core.u_rf.regs[2]);
+            $fwrite(snap_fp, "D3=%h\n", g_core[0].u_core.u_rf.regs[3]);
+            $fwrite(snap_fp, "D4=%h\n", g_core[0].u_core.u_rf.regs[4]);
+            $fwrite(snap_fp, "D5=%h\n", g_core[0].u_core.u_rf.regs[5]);
+            $fwrite(snap_fp, "D6=%h\n", g_core[0].u_core.u_rf.regs[6]);
+            $fwrite(snap_fp, "D7=%h\n", g_core[0].u_core.u_rf.regs[7]);
+            $fwrite(snap_fp, "A0=%h\n", g_core[0].u_core.u_rf.regs[8]);
+            $fwrite(snap_fp, "A1=%h\n", g_core[0].u_core.u_rf.regs[9]);
+            $fwrite(snap_fp, "A2=%h\n", g_core[0].u_core.u_rf.regs[10]);
+            $fwrite(snap_fp, "A3=%h\n", g_core[0].u_core.u_rf.regs[11]);
+            $fwrite(snap_fp, "A4=%h\n", g_core[0].u_core.u_rf.regs[12]);
+            $fwrite(snap_fp, "A5=%h\n", g_core[0].u_core.u_rf.regs[13]);
+            $fwrite(snap_fp, "A6=%h\n", g_core[0].u_core.u_rf.regs[14]);
+            $fwrite(snap_fp, "A7=%h\n", g_core[0].u_core.u_rf.regs[15]);
+            $fwrite(snap_fp, "INTENA=%h\n", u_pau.intena);
+            $fwrite(snap_fp, "INTREQ=%h\n", u_pau.intreq);
+            $fwrite(snap_fp, "DMACON=%h\n", u_bus.dmacon);
+            $fwrite(snap_fp, "RETIRED=%0d\n", retired_flat[31:0]);
+            $fclose(snap_fp);
+            // Also dump to stdout for at-a-glance inspection.
+            $display("[SNAP] PC=%h SR=%h USP=%h",
+                g_core[0].u_core.ex_pc,
+                g_core[0].u_core.sr_now,
+                g_core[0].u_core.usp_shadow);
+            $display("[SNAP] D0..D7 A0..A7 + chipset written to regs.txt");
+            // Dump chip RAM and slow RAM via $writememh.  The Musashi
+            // resume needs both — graphics primitives and most Exec
+            // structures live in slow RAM, so cosim diverges immediately
+            // without it.
+            $writememh({snap_dir, "/mem.hex"}, u_bus.mem);
+            $writememh({snap_dir, "/slow.hex"}, u_bus.slowmem);
+            $display("[SNAP] mem.hex (chip) + slow.hex written");
+            snap_armed <= 1'b0;
+            $finish;
+        end
+    end
+
+    // [TD-BEGIO-DEEP]: at trackdisk.device.BeginIO entry ($FE9C3E), log
+    // io_Command (byte at $1D(A1)) and the return-PC sitting at the top
+    // of SP.  Distinguishes "spinning on same command from same caller"
+    // from "different commands queued from different sites".  A1 and SP
+    // are in slow RAM at boot ($C00000..$C7FFFF range).
+    wire [31:0] td_a1 = g_core[0].u_core.u_rf.regs[9];
+    wire [31:0] td_sp = g_core[0].u_core.u_rf.regs[15];
+    wire        td_a1_in_slow = (td_a1[23:20] == 4'hC);
+    wire        td_sp_in_slow = (td_sp[23:20] == 4'hC);
+    wire [31:0] td_ioreq_w    = td_a1_in_slow
+                                ? u_bus.slowmem[(td_a1 + 32'h1D - 32'h00C0_0000) >> 2]
+                                : 32'd0;
+    wire [1:0]  td_cmd_baddr  = (td_a1[1:0] + 2'd1);  // ($1D & 3) = 1 + a1[1:0]
+    reg  [7:0]  td_cmd_b;
+    always @* begin
+        case (td_cmd_baddr)
+            2'd0: td_cmd_b = td_ioreq_w[31:24];
+            2'd1: td_cmd_b = td_ioreq_w[23:16];
+            2'd2: td_cmd_b = td_ioreq_w[15:8];
+            default: td_cmd_b = td_ioreq_w[7:0];
+        endcase
+    end
+    // Longword at SP and at SP+12 (caller-of-DoIO return PC: BeginIO's
+    // return + pushed A6 + pushed A1 = 12-byte frame above SP).  SP may
+    // be word-aligned but not longword-aligned (SP[1:0] == 2'b10 is
+    // common after odd-pair pushes), in which case the longword straddles
+    // two slowmem slots: high half lives in the low half of slot[idx],
+    // low half in the high half of slot[idx+1].
+    wire [31:0] td_sp_idx0 = u_bus.slowmem[(td_sp - 32'h00C0_0000) >> 2];
+    wire [31:0] td_sp_idx1 = u_bus.slowmem[((td_sp - 32'h00C0_0000) >> 2) + 1];
+    wire [31:0] td_sp_top  = !td_sp_in_slow ? 32'd0 :
+                             (td_sp[1:0] == 2'b10)
+                             ? {td_sp_idx0[15:0], td_sp_idx1[31:16]}
+                             : td_sp_idx0;
+    wire [31:0] td_sp12    = td_sp + 32'd12;
+    wire [31:0] td_sp12_idx0 = u_bus.slowmem[(td_sp12 - 32'h00C0_0000) >> 2];
+    wire [31:0] td_sp12_idx1 = u_bus.slowmem[((td_sp12 - 32'h00C0_0000) >> 2) + 1];
+    wire [31:0] td_caller   = !td_sp_in_slow ? 32'd0 :
+                              (td_sp12[1:0] == 2'b10)
+                              ? {td_sp12_idx0[15:0], td_sp12_idx1[31:16]}
+                              : td_sp12_idx0;
+    reg [31:0] td_last_r;
+    initial td_last_r = 32'hFFFF_FFFF;
+    always @(posedge clk) begin
+        if (rst_n &&
+            g_core[0].u_core.is_settled &&
+            g_core[0].u_core.ex_pc == 32'h00FE_9C3E &&
+            (retired_flat[31:0] != td_last_r)) begin
+            $display("[TD-BEGIO-DEEP] r=%0d A1=%h sp=%h cmd=%h retpc=%h caller=%h",
+                retired_flat[31:0], td_a1, td_sp, td_cmd_b, td_sp_top, td_caller);
+            td_last_r <= retired_flat[31:0];
+        end
+    end
+
+    // [BB-VAL]: bootblock validation at $FE85A0/$FE85AA/$FE85C0.
+    // Three failure branches into the TD_CHANGENUM wait loop at $FE8600.
+    // Log which branch fires + D0 (io_Error or checksum), A4 (buffer ptr).
+    wire [31:0] bb_a4 = g_core[0].u_core.u_rf.regs[12];
+    wire [31:0] bb_d0 = g_core[0].u_core.u_rf.regs[0];
+    wire        bb_a4_in_slow = (bb_a4[23:20] == 4'hC);
+    wire        bb_a4_in_chip = (bb_a4 < 32'h0008_0000);
+    wire [31:0] bb_a4_word0_slow = u_bus.slowmem[(bb_a4 - 32'h00C0_0000) >> 2];
+    wire [31:0] bb_a4_word0_chip = u_bus.mem[bb_a4[18:2]];
+    wire [31:0] bb_a4_word0 = bb_a4_in_slow ? bb_a4_word0_slow
+                            : bb_a4_in_chip ? bb_a4_word0_chip
+                            : 32'd0;
+    reg [31:0] bb_last_r;
+    initial bb_last_r = 32'hFFFF_FFFF;
+    // Source buffer at $20A0 in chip RAM (the decoded-sector start) —
+    // dump alongside BB-VAL traces so we can tell if the corruption came
+    // from a bad copy (dst != src) or a bad source (src already wrong).
+    // Index = $20A0 / 4 = $828 = 2088.
+    wire [31:0] bb_src_20a0 = u_bus.mem[2088];
+
+    always @(posedge clk) begin
+        if (rst_n && g_core[0].u_core.is_settled &&
+            (retired_flat[31:0] != bb_last_r)) begin
+            if (g_core[0].u_core.ex_pc == 32'h00FE_85A2) begin
+                $display("[BB-VAL] r=%0d at $FE85A2 IO_ERR D0=%h A4=%h *A4=%h src@20A0=%h",
+                    retired_flat[31:0], bb_d0, bb_a4, bb_a4_word0, bb_src_20a0);
+                bb_last_r <= retired_flat[31:0];
+            end
+            if (g_core[0].u_core.ex_pc == 32'h00FE_85AA) begin
+                $display("[BB-VAL] r=%0d at $FE85AA MAGIC D0=%h A4=%h *A4=%h src@20A0=%h (want $444F5300)",
+                    retired_flat[31:0], bb_d0, bb_a4, bb_a4_word0, bb_src_20a0);
+                bb_last_r <= retired_flat[31:0];
+            end
+            if (g_core[0].u_core.ex_pc == 32'h00FE_85C0) begin
+                $display("[BB-VAL] r=%0d at $FE85C0 CHECKSUM D0=%h A4=%h *A4=%h src@20A0=%h",
+                    retired_flat[31:0], bb_d0, bb_a4, bb_a4_word0, bb_src_20a0);
+                bb_last_r <= retired_flat[31:0];
+            end
+        end
+    end
+`endif
 endmodule

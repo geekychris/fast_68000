@@ -38,6 +38,47 @@ static uint8_t rom[ROM_SIZE];
 static uint16_t dmacon, intena, intreq, adkcon;
 static uint64_t vpos_counter;     /* tick per cycle ~PAL-ish */
 
+/* Chipset replay log (from `+cosim_start`/`+cosim_end` post-snapshot run).
+ * Each entry: { retired_at_read, addr, size, value }.  Musashi consumes
+ * entries in order whenever it reads a chipset address; this guarantees
+ * the CPU sees identical chipset state between Verilator and Musashi
+ * regardless of Musashi's stub model. */
+struct cosim_read {
+    uint64_t retired;
+    uint32_t addr;
+    int      size;
+    uint32_t value;
+};
+static struct cosim_read* replay_log = NULL;
+static int replay_n = 0;
+static int replay_idx = 0;
+
+/* Memory-write replay log ([CosimMW]).  Non-CPU writes (blitter, copper,
+ * DMA) emitted by Verilator's bus.  Musashi applies them between
+ * instructions when retired_count catches up to the entry's retired
+ * timestamp, simulating the blitter/DMA effects on memory without
+ * needing to model them. */
+struct cosim_mwrite {
+    uint64_t retired;
+    uint32_t addr;
+    int      size;
+    uint32_t value;
+};
+static struct cosim_mwrite* mwrite_log = NULL;
+static int mwrite_n = 0;
+static int mwrite_idx = 0;
+
+/* IRQ replay log ([CosimI]).  Each entry: { retired_at_irq, level }.
+ * Musashi calls m68k_set_irq(level) between instructions when its own
+ * retired_count catches up to the timestamp. */
+struct cosim_irq {
+    uint64_t retired;
+    int      level;
+};
+static struct cosim_irq* irq_log = NULL;
+static int irq_n = 0;
+static int irq_idx = 0;
+
 static int trace_enabled = 0;
 static FILE* trace_fp = NULL;
 static int wtrace_enabled = 0;
@@ -117,6 +158,35 @@ static void chipset_write16(uint32_t addr, uint16_t val) {
  * picks different flags. */
 static uint32_t handled_read(uint32_t addr, int size) {
     addr &= 0x00FFFFFF;
+    /* Replay-log consult.  The CPU may issue different access widths
+     * for the same chipset address (e.g. Verilator emits a 32-bit read
+     * but Musashi requests two 16-bit reads of the high and low halves).
+     * Match by checking whether `addr` falls within the entry's byte
+     * range AND extract the right portion.  If the entry's logged size
+     * (r->size) is 4, the value covers r->addr..r->addr+3:
+     *   - read at r->addr,   size 2  -> high half (bits 31:16)
+     *   - read at r->addr+2, size 2  -> low half  (bits 15:0)
+     *   - read at r->addr,   size 4  -> full value
+     *   - read at r->addr+N, size 1  -> byte N of value (big-endian)
+     * If the entry's size is 2, the value covers r->addr..r->addr+1.
+     * We advance replay_idx only when the read is at r->addr (start of
+     * range), otherwise we re-use the same entry for the next access. */
+    if (replay_idx < replay_n) {
+        struct cosim_read* r = &replay_log[replay_idx];
+        if (addr >= r->addr && addr < r->addr + r->size) {
+            uint32_t off = addr - r->addr;
+            uint32_t val;
+            if (size == 4) {
+                val = r->value;
+            } else if (size == 2) {
+                val = (r->value >> ((r->size - off - 2) * 8)) & 0xFFFF;
+            } else {
+                val = (r->value >> ((r->size - off - 1) * 8)) & 0xFF;
+            }
+            if (off + size >= r->size) replay_idx++;
+            return val;
+        }
+    }
     /* Chipset $DFF000-$DFFFFF */
     if (addr >= 0x00DFF000 && addr < 0x00E00000) {
         uint32_t aligned = addr & ~1u;
@@ -196,6 +266,17 @@ static uint32_t handled_read(uint32_t addr, int size) {
                ((uint32_t)mem[(addr + 2) & (MEM_SIZE - 1)] << 8) |
                mem[(addr + 3) & (MEM_SIZE - 1)];
     }
+    /* Slow / trapdoor RAM at $C00000-$C7FFFF (512 KB on real Amiga A500
+     * expansion, matches our Verilator slowmem[]).  The snapshot loader
+     * places slow.hex contents at the matching mem[] offset. */
+    if (addr >= 0x00C00000 && addr < 0x00C80000) {
+        if (size == 1) return mem[addr];
+        if (size == 2) return ((uint32_t)mem[addr] << 8) | mem[addr + 1];
+        return ((uint32_t)mem[addr]     << 24) |
+               ((uint32_t)mem[addr + 1] << 16) |
+               ((uint32_t)mem[addr + 2] <<  8) |
+                          mem[addr + 3];
+    }
     /* Unmapped: matches Verilator's "(granted_addr_q >= MEM_WORDS<<2) ? 0". */
     return 0;
 }
@@ -207,8 +288,11 @@ static void handled_write(uint32_t addr, uint32_t val, int size) {
          * Writes occur during instruction N's execution, but our
          * instr_hook already incremented retired_count to N+1 before
          * the write callback fires -- subtract one to align with
-         * Verilator's "retired index of the writing instruction". */
-        if (addr < CHIP_RAM_SIZE)
+         * Verilator's "retired index of the writing instruction".
+         * Covers BOTH chip RAM (< 512 KB) AND slow RAM ($C00000..$C7FFFF)
+         * to match Verilator's [CosimW] range. */
+        if (addr < CHIP_RAM_SIZE ||
+            (addr >= 0x00C00000 && addr < 0x00C80000))
             fprintf(wtrace_fp, "%llu %06x %d %0*x\n",
                     (unsigned long long)(retired_count - 1), addr, size,
                     size * 2, val & (size == 1 ? 0xFFu : size == 2 ? 0xFFFFu : 0xFFFFFFFFu));
@@ -223,20 +307,35 @@ static void handled_write(uint32_t addr, uint32_t val, int size) {
         return;
     }
     if (addr >= 0x00F80000 && addr <= 0x00FFFFFF) return;  /* ROM read-only */
-    /* Only writes inside the populated 256 KB chip RAM stick; everything
-     * else (FAST-RAM sizing scans, expansion ROM probes, etc.) is dropped
-     * the same way Verilator drops them. */
-    if (addr + (uint32_t)size > CHIP_RAM_SIZE) return;
-    if (size == 1) { mem[addr] = val & 0xFF; return; }
-    if (size == 2) {
-        mem[addr]                       = (val >> 8) & 0xFF;
-        mem[(addr + 1) & (MEM_SIZE - 1)] = val & 0xFF;
+    /* Chip-RAM writes (matches Verilator's mem[] write). */
+    if (addr + (uint32_t)size <= CHIP_RAM_SIZE) {
+        if (size == 1) { mem[addr] = val & 0xFF; return; }
+        if (size == 2) {
+            mem[addr]                       = (val >> 8) & 0xFF;
+            mem[(addr + 1) & (MEM_SIZE - 1)] = val & 0xFF;
+            return;
+        }
+        mem[addr]                       = (val >> 24) & 0xFF;
+        mem[(addr + 1) & (MEM_SIZE - 1)] = (val >> 16) & 0xFF;
+        mem[(addr + 2) & (MEM_SIZE - 1)] = (val >> 8)  & 0xFF;
+        mem[(addr + 3) & (MEM_SIZE - 1)] = val & 0xFF;
         return;
     }
-    mem[addr]                       = (val >> 24) & 0xFF;
-    mem[(addr + 1) & (MEM_SIZE - 1)] = (val >> 16) & 0xFF;
-    mem[(addr + 2) & (MEM_SIZE - 1)] = (val >> 8)  & 0xFF;
-    mem[(addr + 3) & (MEM_SIZE - 1)] = val & 0xFF;
+    /* Slow-RAM writes (matches Verilator's slowmem[] write). */
+    if (addr >= 0x00C00000 && addr + (uint32_t)size <= 0x00C80000) {
+        if (size == 1) { mem[addr] = val & 0xFF; return; }
+        if (size == 2) {
+            mem[addr]     = (val >> 8) & 0xFF;
+            mem[addr + 1] = val & 0xFF;
+            return;
+        }
+        mem[addr]     = (val >> 24) & 0xFF;
+        mem[addr + 1] = (val >> 16) & 0xFF;
+        mem[addr + 2] = (val >> 8)  & 0xFF;
+        mem[addr + 3] = val & 0xFF;
+        return;
+    }
+    /* Everything else dropped, matching Verilator. */
 }
 
 /* Musashi callbacks. */
@@ -250,16 +349,45 @@ unsigned int m68k_read_disassembler_8 (unsigned int a) { return m68k_read_memory
 unsigned int m68k_read_disassembler_16(unsigned int a) { return m68k_read_memory_16(a); }
 unsigned int m68k_read_disassembler_32(unsigned int a) { return m68k_read_memory_32(a); }
 
+/* Forward declarations for replay-apply helpers defined further down. */
+static void apply_replay_mwrites(uint64_t now);
+static void apply_replay_irqs(uint64_t now);
+/* `skip_one_emit`: set when an IRQ is delivered.  Next instr_hook call
+ * skips emission AND skips the retired_count++.  This aligns with
+ * Verilator, which absorbs the handler's first instruction (MOVEM at
+ * $FC0D14 for the K1.3 IRQ handler) into the exception-entry sequence
+ * and never emits a [Cosim] line for it.  After the skip, the second
+ * handler instr emits at the same retired count Verilator uses. */
+static int skip_one_emit = 0;
+
 static void instr_hook(unsigned int pc) {
-    if (!trace_enabled) return;
-    uint32_t op = m68k_read_memory_16(pc);
-    fprintf(trace_fp, "%llu %06x %04x", (unsigned long long)retired_count, pc, op);
-    for (int i = 0; i < 8; i++)
-        fprintf(trace_fp, " %08x", m68k_get_reg(NULL, M68K_REG_D0 + i));
-    for (int i = 0; i < 8; i++)
-        fprintf(trace_fp, " %08x", m68k_get_reg(NULL, M68K_REG_A0 + i));
-    fprintf(trace_fp, " %04x\n", m68k_get_reg(NULL, M68K_REG_SR) & 0xFFFF);
-    retired_count++;
+    /* Apply pending replay-log memory writes before this instruction's
+     * fetches/reads, so it sees blitter/DMA effects at the same
+     * retired-count boundary Verilator did. */
+    apply_replay_mwrites(retired_count);
+    /* If the previous IRQ delivery marked the next instruction for
+     * absorption (matching Verilator's exception-entry behaviour),
+     * skip both emission and retired_count++ — the NEXT instr will
+     * print at the retired count Verilator uses for it. */
+    if (skip_one_emit) {
+        skip_one_emit = 0;
+    } else if (trace_enabled) {
+        uint32_t op = m68k_read_memory_16(pc);
+        fprintf(trace_fp, "%llu %06x %04x",
+                (unsigned long long)retired_count, pc, op);
+        for (int i = 0; i < 8; i++)
+            fprintf(trace_fp, " %08x", m68k_get_reg(NULL, M68K_REG_D0 + i));
+        for (int i = 0; i < 8; i++)
+            fprintf(trace_fp, " %08x", m68k_get_reg(NULL, M68K_REG_A0 + i));
+        fprintf(trace_fp, " %04x\n", m68k_get_reg(NULL, M68K_REG_SR) & 0xFFFF);
+        retired_count++;
+    }
+    /* Apply IRQ replays AFTER printing the current instruction.  An IRQ
+     * logged at retired=N fires between Verilator's instr at retired=N
+     * and the handler at retired=N+1.  Doing it here matches that
+     * boundary: STOP prints, then IRQ is delivered, Musashi services it
+     * between this instr_hook and the next. */
+    apply_replay_irqs(retired_count);
 }
 
 static int load_rom(const char* path) {
@@ -270,17 +398,195 @@ static int load_rom(const char* path) {
     return (n == ROM_SIZE) ? 0 : -1;
 }
 
+/* Load a Verilator snapshot (regs.txt + mem.hex) produced by m68k_top.v's
+ * +snap_pc / +snap_dir machinery.  After this, Musashi resumes from the
+ * exact CPU + chip-RAM state Verilator was in at the trigger PC, so a
+ * lockstep run from that point can diff per-instruction behaviour.
+ *
+ * Returns 0 on success, -1 on missing files / malformed lines.
+ *
+ * Chipset shadow registers (INTENA/INTREQ/DMACON) are restored too so the
+ * ?R reads return the right values; *POSR is left running from a fresh
+ * vpos_counter (acceptable for short windows where no VBL fires). */
+static int load_snapshot(const char* dir) {
+    char path[1024];
+    /* regs.txt — KEY=HEX one per line. */
+    snprintf(path, sizeof(path), "%s/regs.txt", dir);
+    FILE* f = fopen(path, "r");
+    if (!f) { fprintf(stderr, "snapshot: missing %s\n", path); return -1; }
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+        char key[32]; unsigned long val;
+        if (sscanf(line, "%31[^=]=%lx", key, &val) != 2) continue;
+        if (!strcmp(key, "PC"))   m68k_set_reg(M68K_REG_PC, val);
+        else if (!strcmp(key, "SR"))   m68k_set_reg(M68K_REG_SR, val);
+        else if (!strcmp(key, "USP"))  m68k_set_reg(M68K_REG_USP, val);
+        else if (key[0] == 'D' && key[1] >= '0' && key[1] <= '7' && !key[2])
+            m68k_set_reg(M68K_REG_D0 + (key[1] - '0'), val);
+        else if (key[0] == 'A' && key[1] >= '0' && key[1] <= '7' && !key[2]) {
+            int idx = key[1] - '0';
+            if (idx == 7) m68k_set_reg(M68K_REG_SP, val);  /* current SP */
+            else          m68k_set_reg(M68K_REG_A0 + idx, val);
+        }
+        else if (!strcmp(key, "INTENA")) intena = val & 0x7FFF;
+        else if (!strcmp(key, "INTREQ")) intreq = val & 0x7FFF;
+        else if (!strcmp(key, "DMACON")) dmacon = val & 0x7FFF;
+        else if (!strcmp(key, "RETIRED")) {
+            /* Carry forward the retired counter so trace lines align with
+             * the Verilator continuation trace. */
+            retired_count = strtoull(strchr(line, '=') + 1, NULL, 10);
+        }
+    }
+    fclose(f);
+    /* mem.hex (chip RAM at $00000) and slow.hex (slow RAM at $C00000) —
+     * one 32-bit longword per line, big-endian.  Matches $writememh
+     * output. */
+    uint32_t chip_idx = 0, slow_idx = 0;
+    snprintf(path, sizeof(path), "%s/mem.hex", dir);
+    f = fopen(path, "r");
+    if (!f) { fprintf(stderr, "snapshot: missing %s\n", path); return -1; }
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '/' || line[0] == '@' || line[0] == '\n') continue;
+        unsigned long w = strtoul(line, NULL, 16);
+        uint32_t base = chip_idx * 4;
+        if (base + 3 >= MEM_SIZE) break;
+        mem[base + 0] = (w >> 24) & 0xFF;
+        mem[base + 1] = (w >> 16) & 0xFF;
+        mem[base + 2] = (w >>  8) & 0xFF;
+        mem[base + 3] = (w >>  0) & 0xFF;
+        chip_idx++;
+    }
+    fclose(f);
+    /* Slow RAM is optional — older snapshots don't have it.  Skip if
+     * missing (degraded mode; cosim windows touching $C00000+ will
+     * diverge). */
+    snprintf(path, sizeof(path), "%s/slow.hex", dir);
+    f = fopen(path, "r");
+    if (f) {
+        while (fgets(line, sizeof(line), f)) {
+            if (line[0] == '/' || line[0] == '@' || line[0] == '\n') continue;
+            unsigned long w = strtoul(line, NULL, 16);
+            uint32_t base = 0x00C00000 + slow_idx * 4;
+            if (base + 3 >= MEM_SIZE) break;
+            mem[base + 0] = (w >> 24) & 0xFF;
+            mem[base + 1] = (w >> 16) & 0xFF;
+            mem[base + 2] = (w >>  8) & 0xFF;
+            mem[base + 3] = (w >>  0) & 0xFF;
+            slow_idx++;
+        }
+        fclose(f);
+    }
+    fprintf(stderr, "[musashi-kick] resumed from snapshot %s: PC=%08x SP=%08x retired=%llu (chip=%u slow=%u longs)\n",
+            dir, m68k_get_reg(NULL, M68K_REG_PC),
+            m68k_get_reg(NULL, M68K_REG_SP),
+            (unsigned long long)retired_count, chip_idx, slow_idx);
+    return 0;
+}
+
+/* Load chipset/memory/IRQ replay logs from Verilator's [CosimR]/[CosimMW]/
+ * [CosimI] lines.  Single file; we grep for prefixes and dispatch. */
+static int load_replay_log(const char* path) {
+    FILE* f = fopen(path, "r");
+    if (!f) { fprintf(stderr, "replay: missing %s\n", path); return -1; }
+    int rcap = 256, mcap = 256, icap = 64;
+    replay_log = (struct cosim_read*)malloc(rcap * sizeof(struct cosim_read));
+    mwrite_log = (struct cosim_mwrite*)malloc(mcap * sizeof(struct cosim_mwrite));
+    irq_log    = (struct cosim_irq*)malloc(icap * sizeof(struct cosim_irq));
+    replay_n = mwrite_n = irq_n = 0;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long long ret;
+        unsigned addr, size, val, level;
+        if (!strncmp(line, "[CosimR] ", 9)) {
+            if (sscanf(line + 9, "%llu %x %u %x", &ret, &addr, &size, &val) != 4) continue;
+            if (replay_n == rcap) { rcap *= 2; replay_log = (struct cosim_read*)realloc(replay_log, rcap*sizeof(*replay_log)); }
+            replay_log[replay_n].retired = ret;
+            replay_log[replay_n].addr = addr;
+            replay_log[replay_n].size = (int)size;
+            replay_log[replay_n].value = val;
+            replay_n++;
+        } else if (!strncmp(line, "[CosimMW] ", 10)) {
+            if (sscanf(line + 10, "%llu %x %u %x", &ret, &addr, &size, &val) != 4) continue;
+            if (mwrite_n == mcap) { mcap *= 2; mwrite_log = (struct cosim_mwrite*)realloc(mwrite_log, mcap*sizeof(*mwrite_log)); }
+            mwrite_log[mwrite_n].retired = ret;
+            mwrite_log[mwrite_n].addr = addr;
+            mwrite_log[mwrite_n].size = (int)size;
+            mwrite_log[mwrite_n].value = val;
+            mwrite_n++;
+        } else if (!strncmp(line, "[CosimI] ", 9)) {
+            unsigned vec;
+            if (sscanf(line + 9, "%llu %u %u", &ret, &vec, &level) != 3) continue;
+            if (irq_n == icap) { icap *= 2; irq_log = (struct cosim_irq*)realloc(irq_log, icap*sizeof(*irq_log)); }
+            irq_log[irq_n].retired = ret;
+            irq_log[irq_n].level = (int)level;
+            irq_n++;
+        }
+    }
+    fclose(f);
+    fprintf(stderr, "[musashi-kick] replay log %s: %d chipset reads, %d mem writes, %d IRQs loaded\n",
+            path, replay_n, mwrite_n, irq_n);
+    return 0;
+}
+
+/* Apply replay-log memory writes whose retired timestamp is <= now.
+ * Called between Musashi instructions (from instr_hook) so writes land
+ * at the right place in the trace. */
+static void apply_replay_mwrites(uint64_t now) {
+    while (mwrite_idx < mwrite_n && mwrite_log[mwrite_idx].retired <= now) {
+        struct cosim_mwrite* m = &mwrite_log[mwrite_idx++];
+        uint32_t addr = m->addr & 0x00FFFFFF;
+        if (addr + m->size > CHIP_RAM_SIZE) continue;
+        if (m->size == 1) {
+            mem[addr] = m->value & 0xFF;
+        } else if (m->size == 2) {
+            mem[addr]   = (m->value >> 8) & 0xFF;
+            mem[addr+1] = m->value & 0xFF;
+        } else if (m->size == 4) {
+            mem[addr]   = (m->value >> 24) & 0xFF;
+            mem[addr+1] = (m->value >> 16) & 0xFF;
+            mem[addr+2] = (m->value >> 8) & 0xFF;
+            mem[addr+3] = m->value & 0xFF;
+        }
+    }
+}
+
+/* Trigger replay-log IRQs whose retired timestamp is <= now. */
+static void apply_replay_irqs(uint64_t now) {
+    while (irq_idx < irq_n && irq_log[irq_idx].retired <= now) {
+        m68k_set_irq(irq_log[irq_idx].level);
+        skip_one_emit = 1;
+        irq_idx++;
+    }
+}
+
 int main(int argc, char** argv) {
-    if (argc < 2) {
-        fprintf(stderr, "usage: %s rom.bin [max_instructions] [trace.log]\n", argv[0]);
+    /* Gather positional args + optional --seed=DIR.  Positional layout:
+     *   argv[1] = rom.bin
+     *   argv[2] = max_instructions
+     *   argv[3] = trace.log
+     *   argv[4] = wtrace.log
+     *   --seed=DIR (optional, anywhere) = resume from Verilator snapshot
+     */
+    const char* seed_dir = NULL;
+    const char* replay_path = NULL;
+    int positional_argc = 0;
+    char* positional_argv[8] = {0};
+    positional_argv[positional_argc++] = argv[0];
+    for (int i = 1; i < argc; i++) {
+        if (!strncmp(argv[i], "--seed=", 7)) seed_dir = argv[i] + 7;
+        else if (!strncmp(argv[i], "--replay=", 9)) replay_path = argv[i] + 9;
+        else if (positional_argc < 8) positional_argv[positional_argc++] = argv[i];
+    }
+    if (positional_argc < 2) {
+        fprintf(stderr, "usage: %s rom.bin [max_instructions] [trace.log] [wtrace.log] [--seed=DIR]\n", argv[0]);
         return 1;
     }
-    if (load_rom(argv[1]) < 0) {
-        fprintf(stderr, "musashi-kick: failed to load %s\n", argv[1]);
+    if (load_rom(positional_argv[1]) < 0) {
+        fprintf(stderr, "musashi-kick: failed to load %s\n", positional_argv[1]);
         return 1;
     }
-    long max_instr = (argc >= 3) ? strtol(argv[2], NULL, 10) : 5000000L;
-    const char* trace_path = (argc >= 4) ? argv[3] : NULL;
+    long max_instr = (positional_argc >= 3) ? strtol(positional_argv[2], NULL, 10) : 5000000L;
+    const char* trace_path = (positional_argc >= 4) ? positional_argv[3] : NULL;
     if (trace_path) {
         trace_fp = fopen(trace_path, "w");
         if (!trace_fp) {
@@ -289,7 +595,7 @@ int main(int argc, char** argv) {
         }
         trace_enabled = 1;
     }
-    const char* wtrace_path = (argc >= 5) ? argv[4] : NULL;
+    const char* wtrace_path = (positional_argc >= 5) ? positional_argv[4] : NULL;
     if (wtrace_path) {
         wtrace_fp = fopen(wtrace_path, "w");
         if (!wtrace_fp) {
@@ -316,11 +622,26 @@ int main(int argc, char** argv) {
     m68k_set_cpu_type(M68K_CPU_TYPE_68000);
     m68k_set_instr_hook_callback(instr_hook);
     m68k_pulse_reset();
-    m68k_set_reg(M68K_REG_PC, 0x00FC00D2);
-    m68k_set_reg(M68K_REG_SP, 0x00004000);
-    /* Clear the X flag so SR matches Verilator's reset SR = $2700
-     * (supervisor mode, IRQ mask = 7, T=0, C/V/Z/N/X all clear). */
-    m68k_set_reg(M68K_REG_SR, 0x2700);
+    if (replay_path) {
+        if (load_replay_log(replay_path) < 0) return 1;
+    }
+    if (seed_dir) {
+        if (load_snapshot(seed_dir) < 0) return 1;
+        /* max_instr is the retired-count target.  With a snapshot, treat
+         * it as the ABSOLUTE target (so e.g. "snapshot taken at 1.6M
+         * retired, max_instr=2M" runs 400K instrs from the snapshot).
+         * If max_instr <= retired_count, do nothing — caller error. */
+        if (max_instr <= (long)retired_count) {
+            fprintf(stderr, "[musashi-kick] max_instr (%ld) <= snapshot retired (%llu); nothing to do\n",
+                    max_instr, (unsigned long long)retired_count);
+        }
+    } else {
+        m68k_set_reg(M68K_REG_PC, 0x00FC00D2);
+        m68k_set_reg(M68K_REG_SP, 0x00004000);
+        /* Clear the X flag so SR matches Verilator's reset SR = $2700
+         * (supervisor mode, IRQ mask = 7, T=0, C/V/Z/N/X all clear). */
+        m68k_set_reg(M68K_REG_SR, 0x2700);
+    }
 
     long total = 0;
     while ((long)retired_count < max_instr) {

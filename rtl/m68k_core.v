@@ -219,6 +219,22 @@ module m68k_core #(
         end
     endfunction
 
+`ifdef KICKSTART_COSIM_TRACE
+    // Cosim trace window bounds (set via +cosim_start=N +cosim_end=N
+    // plusargs).  Default: cover the whole run.
+    reg [31:0] cosim_start_r;
+    reg [31:0] cosim_end_r;
+    reg [31:0] cosim_last_retired;   // dedupe filter — emit [Cosim] only on
+                                     // retired-counter advance, not every
+                                     // settled cycle (STOP idles otherwise
+                                     // produce one [Cosim] per clock).
+    initial begin
+        if (!$value$plusargs("cosim_start=%d", cosim_start_r)) cosim_start_r = 32'd0;
+        if (!$value$plusargs("cosim_end=%d",   cosim_end_r))   cosim_end_r   = 32'hFFFFFFFF;
+        cosim_last_retired = 32'hFFFFFFFF;
+    end
+`endif
+
     // ====================================================================
     //  IF stage (streaming: latch + dispatch + start next fetch in one cycle).
     // ====================================================================
@@ -1169,12 +1185,18 @@ module m68k_core #(
                               (ex_src_mode != `EA_DREG) &&
                               (ex_src_mode != `EA_AREG);
     wire alu_mem_dst_writes = alu_mem_dst;  // never CMP
+    // Memory single-bit shift (ASR/ASL/LSR/LSL/ROXR/ROXL/ROR/ROL on .W EA).
+    // Decoder routes via K_SHIFT with src_mode = EA mode (not EA_DREG).
+    wire shift_mem        = (ex_kind == K_SHIFT) &&
+                            (ex_src_mode != `EA_DREG);
+    wire shift_mem_writes = shift_mem;
     wire is_settled_after_load = (ex_state == S_LOAD)  && dc_ack &&
                                  ex_valid && !halted && (ex_kind != K_TAS) &&
                                  !(load_starts_rmw && (ex_src_mode != `EA_DREG)) &&
                                  !bit_mem_writes &&
                                  !alui_mem_writes &&
                                  !alu_mem_dst_writes &&
+                                 !shift_mem_writes &&
                                  (ex_kind != K_CMPM) &&
                                  !(ex_kind == K_MOVE && dst_is_mem);
     wire is_settled_after_store= (ex_state == S_STORE) && dc_ack && ex_valid && !halted;
@@ -1872,13 +1894,31 @@ module m68k_core #(
                         alu_shamt_c = ex_shift_dyn
                                        ? ex_rb[5:0]
                                        : ((ex_shift_count == 4'd0) ? 6'd8 : {2'b00, ex_shift_count[2:0]});
-                        cc_we_c    = 1'b1;
-                        cc_x_we_c  = (alu_shamt_c != 6'd0);
-                        cc_n_c = alu_n; cc_z_c = alu_z; cc_v_c = alu_v;
-                        cc_c_c = alu_c; cc_x_c = alu_x;
-                        wb_main_we_c   = 1'b1;
-                        wb_main_idx_c  = {1'b0, ex_src_reg};
-                        wb_main_data_c = alu_y;
+                        if (ex_src_mode == `EA_DREG) begin
+                            cc_we_c    = 1'b1;
+                            cc_x_we_c  = (alu_shamt_c != 6'd0);
+                            cc_n_c = alu_n; cc_z_c = alu_z; cc_v_c = alu_v;
+                            cc_c_c = alu_c; cc_x_c = alu_x;
+                            wb_main_we_c   = 1'b1;
+                            wb_main_idx_c  = {1'b0, ex_src_reg};
+                            wb_main_data_c = alu_y;
+                        end else begin
+                            // Memory shift (single-bit, .W only).  RMW:
+                            // read 16-bit word, shift, write back, update
+                            // CCR.  The current decoder routes src_mode to
+                            // the EA mode (e.g. 5 for d16(An)).  Without
+                            // this branch the EA's An-source register
+                            // collided with a D-register via
+                            // `wb_main_idx_c = {1'b0, ex_src_reg}`, causing
+                            // the WB1.3 boot to corrupt D1 on LSR.W $10(A1)
+                            // at $FC7C86 — found via cosim diff.  Issue
+                            // the memory read; capture happens in S_LOAD.
+                            want_mem  = 1'b1;
+                            want_we   = 1'b0;
+                            want_lock = 1'b1;
+                            want_addr = src_ea;
+                            want_be   = 4'b1111;
+                        end
                     end
                     K_LINK: begin
                         // Push An, set An = SP-4, SP = SP-4 + disp16.
@@ -2282,6 +2322,27 @@ module m68k_core #(
                             wb_aux_idx_c  = {1'b1, ex_dst_reg};
                             wb_aux_data_c = dst_an_next;
                         end
+                    end else if (ex_kind == K_SHIFT) begin
+                        // Memory single-bit shift: CCR was captured at
+                        // S_LOAD ack from the ALU snapshot.  Commit all 5
+                        // flags — memory shift always updates X/C from
+                        // the shifted-out bit, N/Z from the result.
+                        cc_we_c   = 1'b1;
+                        cc_x_we_c = 1'b1;
+                        cc_n_c = ex_alui_n_q;
+                        cc_z_c = ex_alui_z_q;
+                        cc_v_c = ex_alui_v_q;
+                        cc_c_c = ex_alui_c_q;
+                        cc_x_c = ex_alui_x_q;
+                        // Memory-shift addressing modes that update An
+                        // (postinc/predec) are not part of the
+                        // single-bit-memshift EA set (modes 2..7 except
+                        // 0/1), but cover them for completeness.
+                        if (src_an_update) begin
+                            wb_aux_we_c   = 1'b1;
+                            wb_aux_idx_c  = {1'b1, ex_src_reg};
+                            wb_aux_data_c = src_an_next;
+                        end
                     end else if (ex_kind == K_ALUI || ex_kind == K_ALUQ ||
                                  ex_kind == K_ALU) begin
                         // Mem-dest ADDI/SUBI/ANDI/ORI/EORI + ADDQ/SUBQ +
@@ -2383,6 +2444,17 @@ module m68k_core #(
                                 wb_aux_data_c = src_an_next;
                             end
                         end
+                    end
+                    K_SHIFT: begin
+                        // Memory single-bit shift: alu_b = the loaded word
+                        // (lane-extracted), shamt = 1.  Result + CCR
+                        // snapshot captured in the sequential block;
+                        // S_RMW_W writes the shifted word back.
+                        alu_op_c    = ex_alu_op;
+                        alu_size_c  = `SZ_W;  // memory shift is always .W
+                        alu_b       = {16'd0, dc_addr[1] ? dc_rdata[15:0]
+                                                         : dc_rdata[31:16]};
+                        alu_shamt_c = 6'd1;
                     end
                     K_ALU: begin
                         // dc_rdata is the 32-bit aligned read; the ALU operand
@@ -3214,6 +3286,114 @@ module m68k_core #(
                  dc_addr == 32'h00DF_F09C))
                 $display("[CPUINT] r=%d pc=%h addr=%h be=%b wdata=%h",
                     retired, ex_pc, dc_addr, dc_be, dc_wdata);
+            // [CPUBLT]: CPU writes to the canonical blitter pointer
+            // regs $DFF048..$DFF057.  Captures the PC of every BLTAPT/BPT/
+            // CPT/DPT write so we can find who set bltdpt=$01FF (the
+            // value that makes the blitter walk through the vector table).
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h00DF_F048 && dc_addr <= 32'h00DF_F057)
+                $display("[CPUBLT] r=%d pc=%h addr=%h be=%b wdata=%h",
+                    retired, ex_pc, dc_addr, dc_be, dc_wdata);
+            // [BLT-DST-SRC]: probe registers right after the MOVEM.L $8(A1)
+            // at $FEA97A that loads D0/D1/A5 from the struct.  This is the
+            // graphics primitive that computes BLTDPT = D1 + $200 - 1.
+            // Dumping A1 + the post-MOVEM values lets us see whether the
+            // struct field really holds 0 (legitimate K1.3 behaviour),
+            // or whether the bus read returned 0 erroneously.
+            if (is_settled && (ex_pc == 32'h00fe_a980 ||
+                               ex_pc == 32'h00fe_a988 ||
+                               ex_pc == 32'h00fe_a98e))
+                $display("[BLT-DST-SRC] r=%d pc=%h D0=%h D1=%h A1=%h A5=%h",
+                    retired, ex_pc, u_rf.regs[0], u_rf.regs[1],
+                    u_rf.regs[9], u_rf.regs[13]);
+            // [STKSET-906]: dump regs at the outer graphics-prep entry
+            // $FEA906 — that function's caller passes A0; A0 then flows
+            // through to $FEA932 → MOVEM save at $FEA936.  Comparing A0
+            // across calls finds the one where it became 0 (the bug
+            // origin upstream).
+            if (is_settled && ex_pc == 32'h00fe_a906)
+                $display("[STKSET-906] r=%d A0=%h A1=%h A2=%h A6=%h SP=%h",
+                    retired, u_rf.regs[8], u_rf.regs[9], u_rf.regs[10],
+                    u_rf.regs[14], u_rf.regs[15]);
+            // [STKSET-932]: same at $FEA932 (the LINK A2,#-$1E that
+            // creates the frame which $FEA936 then saves into).
+            if (is_settled && ex_pc == 32'h00fe_a932)
+                $display("[STKSET-932] r=%d A0=%h A1=%h A2=%h A6=%h SP=%h",
+                    retired, u_rf.regs[8], u_rf.regs[9], u_rf.regs[10],
+                    u_rf.regs[14], u_rf.regs[15]);
+            // [STKSET-970]: same at $FEA970 (the reader — A1 source of
+            // the struct).
+            if (is_settled && ex_pc == 32'h00fe_a970)
+                $display("[STKSET-970] r=%d A0=%h A1=%h A2=%h A6=%h SP=%h",
+                    retired, u_rf.regs[8], u_rf.regs[9], u_rf.regs[10],
+                    u_rf.regs[14], u_rf.regs[15]);
+            // [PC-TRACE-4M]: dump PC + A0 for the 50 instructions
+            // leading up to the bad-blit $FEA932 entry at retired
+            // ≈ 4436232.  Pinpoints the exact CALL site that passes
+            // A0=0 instead of a Y-coord.
+            if (is_settled && retired >= 32'd4436180 && retired <= 32'd4436240)
+                $display("[PC-TRACE-4M] r=%d pc=%h opcode=%h A0=%h A1=%h A3=%h A4=%h",
+                    retired, ex_pc, ex_opcode, u_rf.regs[8], u_rf.regs[9],
+                    u_rf.regs[11], u_rf.regs[12]);
+            // [PC-TRACE-4305K]: trace around the bad MOVE.L D3, $28(A3)
+            // at r=4305781.  Shows what set D3=0 (vs reasonable Y in
+            // good iterations).
+            if (is_settled && retired >= 32'd4305740 && retired <= 32'd4305790)
+                $display("[PC-TRACE-4305K] r=%d pc=%h opcode=%h D3=%h A1=%h A3=%h",
+                    retired, ex_pc, ex_opcode, u_rf.regs[3], u_rf.regs[9], u_rf.regs[11]);
+            // [FFC4EE-CHK]: at the indexed read `MOVE.L (d8,A0,D2.L),D3`
+            // dump A0 + D2 + effective addr so we can find the BCPL
+            // table whose entry is 0.  Disp = $14 = +20.
+            if (is_settled && ex_pc == 32'h00ff_c4ee)
+                $display("[FFC4EE-CHK] r=%d A0=%h D2=%h EA=%h",
+                    retired, u_rf.regs[8], u_rf.regs[2],
+                    u_rf.regs[8] + 32'h14 + u_rf.regs[2]);
+            // [5E40-WR]: every write to mem[$5E40] (the linked-list
+            // slot that gets nulled).  Identifies who broke the chain
+            // (was $5E44 at r=2737456, is $0 at r=4305766).
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h0000_5E3E && dc_addr <= 32'h0000_5E43)
+                $display("[5E40-WR] r=%d pc=%h kind=%d addr=%h be=%b wdata=%h",
+                    retired, ex_pc, ex_kind, dc_addr, dc_be, dc_wdata);
+            // [Y-FIELD-CHK]: at every $FEA548 (MOVEA.L $56(A3), A0)
+            // dump A3 + (A3+$56) so we can see whose struct field is
+            // zero in the bad case.
+            if (is_settled && ex_pc == 32'h00fe_a548)
+                $display("[Y-FIELD-CHK] r=%d A3=%h (A3+$56=%h)",
+                    retired, u_rf.regs[11], u_rf.regs[11] + 32'h56);
+            // [Y-FIELD-WR]: catch every CPU write to the persistent
+            // Y-coord field at $C04786 (long; covers $C04784..$C04787
+            // for safety since the .L write might land on $C04784 or
+            // straddle).  Identifies who zeroed it before r=4436229.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h00C0_4784 && dc_addr <= 32'h00C0_4789)
+                $display("[Y-FIELD-WR] r=%d pc=%h kind=%d addr=%h be=%b wdata=%h",
+                    retired, ex_pc, ex_kind, dc_addr, dc_be, dc_wdata);
+            // [STRUCT-CHK-3B4]: dump A1 (and mem[A1+$28] later) at the
+            // entry of the function at $FEA3B4 that writes Y-coord.
+            if (is_settled && ex_pc == 32'h00fe_a3b4)
+                $display("[STRUCT-CHK-3B4] r=%d A1=%h A0=%h",
+                    retired, u_rf.regs[9], u_rf.regs[8]);
+            // [STRUCT-CHK-3CA]: dump A2 at the WRITE instruction so we
+            // see exactly what (A2+$28) source address is.  This will
+            // tell us which struct field is zero.
+            if (is_settled && ex_pc == 32'h00fe_a3ca)
+                $display("[STRUCT-CHK-3CA] r=%d A2=%h A3=%h",
+                    retired, u_rf.regs[10], u_rf.regs[11]);
+            // [C00C9C-WR]: trace every write to $C00C9C — the Y source
+            // (= mem[A2+$28] when A2=$C00C74) that was zeroed before
+            // the bad blit. Find who wrote 0 here.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h00C0_0C9A && dc_addr <= 32'h00C0_0C9F)
+                $display("[C00C9C-WR] r=%d pc=%h kind=%d addr=%h be=%b wdata=%h",
+                    retired, ex_pc, ex_kind, dc_addr, dc_be, dc_wdata);
+            // [WBPC-WR-C04A8E]: any write to the long at $C04A8E (the
+            // "D1 source" struct field that loaded 0 right before the bad
+            // blit).  Print PC + value so we can find the bug source.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h00C0_4A8C && dc_addr <= 32'h00C0_4A91)
+                $display("[WBPC-WR-C04A8E] r=%d pc=%h kind=%d addr=%h be=%b wdata=%h",
+                    retired, ex_pc, ex_kind, dc_addr, dc_be, dc_wdata);
             // Watch CPU writes to ThisTask.tc_SigRecvd = $198A (within $1970+$1A..$198D)
             // Bit 31 (SIGF_ABORT) becoming set explains why the dispatcher
             // refuses to wake the READY task.  Catch the offending write and
@@ -3931,7 +4111,13 @@ module m68k_core #(
 `ifdef KICKSTART_COSIM_TRACE
             // Per-instruction state dump for the Musashi cosim diff.
             // Format: `[Cosim] <retired> <pc> <opcode> <D0..D7> <A0..A7> <SR>`
-            if (is_settled && ex_kind != K_STOP) begin
+            //
+            // Window-gated: when `+cosim_start=N` / `+cosim_end=N` are set
+            // on the command line, the trace fires only for retired in
+            // [N, M].  Lets `make cosim-window` capture a focused trace
+            // matching the snapshot+resume Musashi trace.
+            if (is_settled && retired != cosim_last_retired &&
+                retired >= cosim_start_r && retired <= cosim_end_r) begin
                 $display("[Cosim] %0d %06h %04h %08h %08h %08h %08h %08h %08h %08h %08h %08h %08h %08h %08h %08h %08h %08h %08h %04h",
                     retired, ex_pc, ex_opcode,
                     u_rf.regs[0],  u_rf.regs[1],  u_rf.regs[2],  u_rf.regs[3],
@@ -3940,16 +4126,22 @@ module m68k_core #(
                     u_rf.regs[12], u_rf.regs[13], u_rf.regs[14], u_rf.regs[15],
                     {1'b0, sr_t, 1'b0, sr_s, 2'b0, sr_i, 3'b0,
                      cc_x, cc_n, cc_z, cc_v, cc_c});
+                cosim_last_retired <= retired;
+                if (retired == cosim_end_r) $finish;
             end
             // Memory-write trace.  Fires when a write completes (dc_ack
-            // with dc_we=1) on a chip-RAM address (< 512 KB).  Format:
+            // with dc_we=1) on chip RAM (< 512 KB) OR slow RAM
+            // ($C00000..$C7FFFF).  Format:
             //   [CosimW] <retired> <addr> <size> <data>
             // Size pulled from dc_be (which is what the bus actually
             // commits): 1111 = 4 bytes long-write, 1100/0011 = 2 bytes
             // word-write, single bit = 1 byte.  dc_is_long is only set
             // for true .L MOVEs; BSR/JSR/exception pushes use be=1111
             // without is_long but still write four bytes.
-            if (dc_req_r && dc_we && dc_ack && dc_addr < 32'h0008_0000) begin
+            if (dc_req_r && dc_we && dc_ack &&
+                (dc_addr < 32'h0008_0000 ||
+                 (dc_addr >= 32'h00C0_0000 && dc_addr < 32'h00C8_0000)) &&
+                retired >= cosim_start_r && retired <= cosim_end_r) begin
                 if (dc_be == 4'b1111)
                     $display("[CosimW] %0d %06h 4 %08h", retired, dc_addr, dc_wdata);
                 else if (dc_be == 4'b1100)
@@ -3964,6 +4156,46 @@ module m68k_core #(
                     $display("[CosimW] %0d %06h 1 %02h", retired, dc_addr | 32'd2, dc_wdata[15:8]);
                 else if (dc_be == 4'b0001)
                     $display("[CosimW] %0d %06h 1 %02h", retired, dc_addr | 32'd3, dc_wdata[7:0]);
+            end
+            // [CosimR]: chipset reads inside the window.  Captures every
+            // value the CPU saw at custom-chip ($DFF000..$DFFFFF), CIA
+            // ($BFD000..$BFEFFF), or autoconfig ($E80000..$E8FFFF)
+            // addresses.  Musashi resume replays these so the post-
+            // snapshot path is deterministic regardless of Musashi's
+            // chipset stubs.
+            //   [CosimR] <retired> <addr> <size> <value>
+            if (dc_req_r && !dc_we && dc_ack &&
+                retired >= cosim_start_r && retired <= cosim_end_r &&
+                ((dc_addr >= 32'h00DF_F000 && dc_addr <= 32'h00DF_FFFF) ||
+                 (dc_addr >= 32'h00BF_D000 && dc_addr <= 32'h00BF_FFFF) ||
+                 (dc_addr >= 32'h00E8_0000 && dc_addr <= 32'h00E8_FFFF))) begin
+                if (dc_be == 4'b1111)
+                    $display("[CosimR] %0d %06h 4 %08h", retired, dc_addr, dc_rdata);
+                else if (dc_be == 4'b1100)
+                    $display("[CosimR] %0d %06h 2 %04h", retired, dc_addr, dc_rdata[31:16]);
+                else if (dc_be == 4'b0011)
+                    $display("[CosimR] %0d %06h 2 %04h", retired, dc_addr | 32'd2, dc_rdata[15:0]);
+                else if (dc_be == 4'b1000)
+                    $display("[CosimR] %0d %06h 1 %02h", retired, dc_addr, dc_rdata[31:24]);
+                else if (dc_be == 4'b0100)
+                    $display("[CosimR] %0d %06h 1 %02h", retired, dc_addr | 32'd1, dc_rdata[23:16]);
+                else if (dc_be == 4'b0010)
+                    $display("[CosimR] %0d %06h 1 %02h", retired, dc_addr | 32'd2, dc_rdata[15:8]);
+                else if (dc_be == 4'b0001)
+                    $display("[CosimR] %0d %06h 1 %02h", retired, dc_addr | 32'd3, dc_rdata[7:0]);
+            end
+            // [CosimI]: IRQ events inside the window.  Auto-vectored
+            // 68000 IRQs land at vec=25..31 (level 1..7).  Trap
+            // exceptions (vec<25) come from CPU state Musashi reproduces
+            // on its own, so we only replay IRQs.  Musashi's
+            // `--replay=` consumer triggers `m68k_set_irq(level)` at
+            // the matching retired count.
+            //   [CosimI] <retired> <vec> <level>
+            if (ex_state == S_RUN && ex_valid && !halted && exc_launch_c &&
+                retired >= cosim_start_r && retired <= cosim_end_r &&
+                exc_vector_c >= 8'd25 && exc_vector_c <= 8'd31) begin
+                $display("[CosimI] %0d %0d %0d",
+                    retired, exc_vector_c, exc_vector_c - 8'd24);
             end
 `endif
             if (is_settled && cc_we_c) begin
@@ -4263,6 +4495,21 @@ module m68k_core #(
                                     dc_wdata <= alu_y;
                                 end
                             endcase
+                            ex_state <= S_RMW_W;
+                        end else if (shift_mem_writes) begin
+                            // K_SHIFT memory destination — capture the
+                            // shifted word + CCR snapshot, issue the
+                            // 16-bit write-back (memory shifts are .W).
+                            ex_tas_word <= alu_y;
+                            ex_alui_n_q <= alu_n;
+                            ex_alui_z_q <= alu_z;
+                            ex_alui_v_q <= alu_v;
+                            ex_alui_c_q <= alu_c;
+                            ex_alui_x_q <= alu_x;
+                            dc_req_r <= 1'b1;
+                            dc_we    <= 1'b1;
+                            dc_be    <= be_for_word(dc_addr[1]);
+                            dc_wdata <= word_into_word(alu_y[15:0], dc_addr[1]);
                             ex_state <= S_RMW_W;
                         end else if (bit_mem_writes) begin
                             // Memory BCHG/BCLR/BSET: capture the original

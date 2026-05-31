@@ -68,6 +68,7 @@ module blitter (
     input  wire        slv_we,
     input  wire [5:0]  slv_addr,    // byte offset 0..0x3F
     input  wire [3:0]  slv_be,      // byte enables
+    input  wire        slv_is_long, // CPU did a .L write that spans this reg + next
     input  wire [31:0] slv_wdata,
     output reg  [31:0] slv_rdata,
     output reg         slv_ack,
@@ -379,7 +380,21 @@ module blitter (
             if (slv_req && slv_we) begin
                 case (slv_addr[5:2])
                     4'h0: bltcon       <= slv_wdata;
-                    4'h1: bltafwm      <= slv_wdata;
+                    4'h1: begin
+                        // For longword CPU writes (`slv_is_long`), split
+                        // slv_wdata: high half is BLTAFWM ($DFF044), low
+                        // half is BLTALWM ($DFF046).  K1.3 trackdisk does
+                        // MOVE.L #$FFFFFFFF, $DFF044 as a single instruction
+                        // to set both masks; without this split, BLTALWM
+                        // retained its stale value and caused single-bit
+                        // corruption in MFM decode.  See tests/t152.
+                        if (slv_is_long) begin
+                            bltafwm <= {16'd0, slv_wdata[31:16]};
+                            bltalwm <= {16'd0, slv_wdata[15:0]};
+                        end else begin
+                            bltafwm <= slv_wdata;
+                        end
+                    end
                     4'h2: bltalwm      <= slv_wdata;
                     4'h3: bltapt       <= slv_wdata;
                     4'h4: bltbpt       <= slv_wdata;
@@ -406,6 +421,17 @@ module blitter (
                             $display("[BLT_START] bltcon=%h bltapt=%h bltbpt=%h bltcpt=%h bltdpt=%h bltsize=%h bltamod=%h bltbmod=%h bltcmod=%h bltdmod=%h",
                                 bltcon, bltapt, bltbpt, bltcpt, bltdpt, slv_wdata[15:0],
                                 bltamod, bltbmod, bltcmod, bltdmod);
+                            // [BLT_DAT_PRE]: track *_dat_pre values at every
+                            // BLT_START — when USE_X=0 the LF combine uses
+                            // *_dat_pre[15:0] as the missing channel.  Stale
+                            // values across blits could explain non-det
+                            // outputs on sector copies (WB1.3 boot, r=116M).
+                            // bltafwm/bltalwm are critical: applied to the
+                            // first/last word of A in apply_a_masks; if these
+                            // change across blits, the masked output differs.
+                            $display("[BLT_DAT_PRE] bltadat=%h bltbdat=%h bltcdat=%h afwm=%h alwm=%h",
+                                bltadat_pre[15:0], bltbdat_pre[15:0], bltcdat_pre[15:0],
+                                bltafwm[15:0], bltalwm[15:0]);
 `endif
                             blt_height <= slv_wdata[21:6];
                             // width 0 (= 64) is a real-Amiga quirk; we treat 0 as 64.

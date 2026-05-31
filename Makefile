@@ -15,7 +15,8 @@ SDL2_CFLAGS := $(shell sdl2-config --cflags 2>/dev/null)
 SDL2_LIBS   := $(shell sdl2-config --libs 2>/dev/null)
 HAVE_SDL2   := $(if $(SDL2_LIBS),1,0)
 
-RTL_SRCS := $(RTL_DIR)/m68k_alu.v \
+RTL_SRCS := $(RTL_DIR)/debug/hw_watch.v \
+            $(RTL_DIR)/m68k_alu.v \
             $(RTL_DIR)/m68k_regfile.v \
             $(RTL_DIR)/m68k_decoder.v \
             $(RTL_DIR)/m68k_cache.v \
@@ -194,6 +195,90 @@ $(MUSASHI_BUILD)/musashi_kick: $(MUSASHI_BUILD)/m68kops.c $(MUSASHI_DIR)/m68kcpu
 # diff per-instruction traces, report the first divergence.
 ROMFILE      ?= kickstart/kick_13.bin
 COSIM_INSTRS ?= 1000000
+
+# Snapshot-and-resume cosim window.
+#
+# Usage:
+#   make cosim-window SNAP_PC=0xFC0F90 WINDOW=50000
+#
+# Pipeline:
+#   1. Run Verilator with +snap_pc=<PC>; dumps snap/regs.txt + snap/mem.hex
+#      when the breakpoint fires, then $finish.
+#   2. Run Verilator again WITHOUT snap to get a trace of the post-snapshot
+#      window (KICKSTART_COSIM_TRACE enabled, max retired = snap_retired
+#      + WINDOW).
+#   3. Run musashi_kick with --seed=snap/ to resume from the snapshot and
+#      trace the same window.
+#   4. Diff the two traces.
+#
+# Caveats:
+#   - Musashi has no chipset IRQ model; if the snapshot PC is a STOP, the
+#     window must include the WAKE-by-IRQ that gets PC moving again — set
+#     SNAP_PC to a PC that's actively executing, not idle.
+#   - Chipset reads in Musashi return stub constants; if the window touches
+#     VPOSR/INTREQR/etc. divergence may be from the stub, not a CPU bug.
+SNAP_PC ?= 00FC0F90
+WINDOW  ?= 50000
+SNAP_AFTER ?= 0
+SNAP_CYCLES ?= 50000000
+# Build a Verilator binary with both KICKSTART_BOOT_TRACE (for snapshot
+# triggers) and KICKSTART_COSIM_TRACE (for [Cosim]/[CosimW] window
+# emission).  Separate build dir so the bigger trace doesn't pollute
+# the main test-kickstart-boot binary.
+cosim-window: $(MUSASHI_BUILD)/musashi_kick
+	@mkdir -p build_cosim_window
+	@if [ ! -f $(ROMFILE) ]; then echo "ROMFILE=$(ROMFILE) missing"; exit 1; fi
+	@$(PYTHON) tools/bin2rom.py --mem-words $(ROMSIZE_WORDS) $(ROMFILE) build_cosim_window/rom.hex
+	@if [ -n "$(ADFFILE)" ]; then \
+	    cp "$(ADFFILE)" build_cosim_window/boot.adf; \
+	    $(PYTHON) tools/adf2mfm.py --mem-words $(DISK_WORDS_FULL) \
+	        build_cosim_window/boot.adf build_cosim_window/disk.hex; \
+	    DW=$(DISK_WORDS_FULL); \
+	else \
+	    $(PYTHON) tools/mkbootblock.py build_cosim_window/boot.adf; \
+	    $(PYTHON) tools/adf2mfm.py --mem-words 4096 --track 0 \
+	        build_cosim_window/boot.adf build_cosim_window/disk.hex; \
+	    DW=4096; \
+	fi; \
+	$(MAKE) --no-print-directory build BUILD=build_cosim_window N_CORES=1 USE_CACHE=1 \
+	    MEM_WORDS=131072 ROM_WORDS=$(ROMSIZE_WORDS) ROM_HEXFILE=rom.hex OVL_RESET=1 \
+	    DISK_WORDS=$$DW DISK_HEXFILE=disk.hex \
+	    VERI_DEFS='+define+KICKSTART_BOOT +define+KICKSTART_FAST_BOOT +define+KICKSTART_BOOT_TRACE +define+KICKSTART_COSIM_TRACE' \
+	    >build_cosim_window/_build.log 2>&1
+	@mkdir -p build_cosim_window/snap
+	@rm -f build_cosim_window/snap/regs.txt build_cosim_window/snap/mem.hex
+	@echo "[cosim-window] phase 1: Verilator → snapshot at PC=$(SNAP_PC)"
+	@(cd build_cosim_window && ./Vm68k_top $(SNAP_CYCLES) +snap_pc=$(SNAP_PC) +snap_after_retired=$(SNAP_AFTER) +snap_dir=snap) \
+	    >build_cosim_window/_phase1.log 2>&1 || true
+	@if [ ! -f build_cosim_window/snap/regs.txt ]; then \
+	    echo "[cosim-window] FAIL: snapshot not produced (PC=$(SNAP_PC) never reached)"; \
+	    grep -E 'SNAPSHOT|ERROR' build_cosim_window/_phase1.log | head -5; \
+	    exit 1; \
+	fi
+	@snap_retired=$$(grep '^RETIRED=' build_cosim_window/snap/regs.txt | cut -d= -f2); \
+	end_r=$$((snap_retired + $(WINDOW))); \
+	echo "[cosim-window] snapshot at retired=$$snap_retired, window=$(WINDOW) (end=$$end_r)"; \
+	echo "[cosim-window] phase 2: Verilator → post-snapshot trace"; \
+	(cd build_cosim_window && ./Vm68k_top $(SNAP_CYCLES) +cosim_start=$$snap_retired +cosim_end=$$end_r) \
+	    >build_cosim_window/_phase2.log 2>&1 || true; \
+	grep '^\[Cosim\] ' build_cosim_window/_phase2.log | awk '{print substr($$0, index($$0,$$2))}' \
+	    > build_cosim_window/veri_window.log; \
+	echo "[cosim-window] phase 3: Musashi from snapshot (+ chipset replay)"; \
+	./$(MUSASHI_BUILD)/musashi_kick $(ROMFILE) $$end_r \
+	    build_cosim_window/musashi_window.log build_cosim_window/musashi_window_w.log \
+	    --seed=build_cosim_window/snap \
+	    --replay=build_cosim_window/_phase2.log; \
+	echo "[cosim-window] Verilator window: $$(wc -l < build_cosim_window/veri_window.log) lines"; \
+	echo "[cosim-window] Musashi window: $$(wc -l < build_cosim_window/musashi_window.log) lines"; \
+	echo "[cosim-window] phase 4: diff"; \
+	if diff -q build_cosim_window/veri_window.log build_cosim_window/musashi_window.log >/dev/null 2>&1; then \
+	    echo "[cosim-window] PASS — windows identical"; \
+	else \
+	    echo "[cosim-window] DIVERGENCE — first 10 differing instructions:"; \
+	    diff -u build_cosim_window/veri_window.log build_cosim_window/musashi_window.log \
+	        | grep -E '^[+-]' | head -10; \
+	fi
+
 cosim-kick: $(MUSASHI_BUILD)/musashi_kick
 	@$(MAKE) --no-print-directory test-kickstart-boot \
 	    ROMFILE=$(ROMFILE) ROMSIZE_WORDS=65536 ROMCYCLES=20000000 \
@@ -591,6 +676,15 @@ test-kickstart-boot:
 	    echo "PASS test-kickstart-boot (bootblock executed)"; \
 	    grep -E '\[OVL\]|\[DSKLEN\]|\[BOOTBLOCK\]' build_kick_boot/run.log; \
 	    tail -3 build_kick_boot/run.log; \
+	elif grep -qE '\[RESINIT\].*dos\.library code' build_kick_boot/run.log && \
+	     grep -qE '\[RESINIT\].*ramlib\.library code' build_kick_boot/run.log; then \
+	    final_retired=$$(grep -oE 'retired=[0-9]+' build_kick_boot/run.log | tail -1 | sed 's/retired=//'); \
+	    echo "PASS test-kickstart-boot (WB1.3 bootblock validated + dos.library RESINIT, retired=$$final_retired)"; \
+	    echo "  Library init summary (last 12):"; \
+	    grep -E '\[RESINIT\]' build_kick_boot/run.log | tail -12; \
+	    echo "  WB1.3 BCPL DOS bootstrap is running.  Bootblock magic+checksum validated"; \
+	    echo "  on the re-read at r~116M (BLTAFWM .L-write fix); dos.library and"; \
+	    echo "  ramlib.library both reached RESINIT entry."; \
 	elif grep -qE '\[DSKLEN\].*dsk_pt=000064ac' build_kick_boot/run.log && \
 	     grep -qE '\[RESINIT\].*strap entry' build_kick_boot/run.log; then \
 	    final_retired=$$(grep -oE 'retired=[0-9]+' build_kick_boot/run.log | tail -1 | sed 's/retired=//'); \

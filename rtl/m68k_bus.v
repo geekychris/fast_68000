@@ -79,6 +79,12 @@ module m68k_bus #(
     input  wire [31:0]                    mem_poke_addr,
     input  wire [31:0]                    mem_poke_data,
 
+    // Cosim trace inputs (used only by `[CosimMW]` emission inside
+    // KICKSTART_COSIM_TRACE).  Driven by m68k_top from the CPU's
+    // retired counter and cosim window plusargs.
+    input  wire [31:0]                    cosim_retired_i,
+    input  wire                           cosim_in_window_i,
+
     // Blitter slave interface.  Writes/reads from BLT_BASE..BLT_BASE+0x3F
     // are diverted to this port instead of main memory.  The blitter module
     // sits on a separate master port for its own memory R/W; the slave
@@ -87,6 +93,7 @@ module m68k_bus #(
     output reg                            blt_slv_we,
     output reg  [5:0]                     blt_slv_addr,
     output reg  [3:0]                     blt_slv_be,
+    output reg                            blt_slv_is_long,
     output reg  [31:0]                    blt_slv_wdata,
     input  wire [31:0]                    blt_slv_rdata,
 
@@ -1011,10 +1018,18 @@ module m68k_bus #(
                     canon_bltcon0[11:8]
                 };
             end
-            5'd2: begin                       // BLTAFWM
+            5'd2: begin                       // BLTAFWM (.L writes commit BLTALWM too)
                 blt_xlat_valid = 1'b1;
                 blt_xlat_addr  = 6'h04;
-                blt_xlat_wdata = {16'd0, amiga_wdata_half};
+                // K1.3 trackdisk does MOVE.L #$FFFFFFFF, $DFF044 to
+                // set both BLTAFWM and BLTALWM in one instruction.
+                // Without passing the full 32-bit wdata, BLTALWM retains
+                // its stale value from the previous blit ($FFFC was
+                // observed at the WB1.3 bootblock re-read at r=116M),
+                // causing single-bit corruption in MFM decode.
+                blt_xlat_wdata = (is_long[winner] && be[winner] == 4'b1111)
+                                 ? wdata[winner]
+                                 : {16'd0, amiga_wdata_half};
             end
             5'd3: begin                       // BLTALWM
                 blt_xlat_valid = 1'b1;
@@ -1220,19 +1235,39 @@ module m68k_bus #(
     // the chipset shadow chip_regs[]).
     always @* begin
         if (is_blt_amiga) begin
-            blt_slv_req   = winner_valid && we[winner] && blt_xlat_valid;
-            blt_slv_we    = winner_valid && we[winner] && blt_xlat_valid;
-            blt_slv_addr  = blt_xlat_addr;
-            blt_slv_be    = 4'b1111;
-            blt_slv_wdata = blt_xlat_wdata;
+            blt_slv_req     = winner_valid && we[winner] && blt_xlat_valid;
+            blt_slv_we      = winner_valid && we[winner] && blt_xlat_valid;
+            blt_slv_addr    = blt_xlat_addr;
+            blt_slv_be      = 4'b1111;
+            // is_long signals "CPU did a 32-bit write that spans two 16-bit
+            // chipset regs" — only valid for the Amiga $DFFnnn path where
+            // adjacent regs (BLTAFWM/BLTALWM, BLTAPTH/BLTAPTL, etc.) live
+            // at adjacent addresses.  The legacy path uses 32-bit-aligned
+            // internal regs where the CPU's .L write targets a single reg.
+            blt_slv_is_long = is_long[winner] && (be[winner] == 4'b1111);
+            blt_slv_wdata   = blt_xlat_wdata;
         end else begin
-            blt_slv_req   = winner_valid && is_blt_legacy;
-            blt_slv_we    = winner_valid && is_blt_legacy && we[winner];
-            blt_slv_addr  = addr[winner][5:0];
-            blt_slv_be    = be[winner];
-            blt_slv_wdata = wdata[winner];
+            blt_slv_req     = winner_valid && is_blt_legacy;
+            blt_slv_we      = winner_valid && is_blt_legacy && we[winner];
+            blt_slv_addr    = addr[winner][5:0];
+            blt_slv_be      = be[winner];
+            blt_slv_is_long = 1'b0;   // legacy regs are 32-bit-aligned standalone
+            blt_slv_wdata   = wdata[winner];
         end
     end
+`ifdef KICKSTART_BOOT_TRACE
+    // Trace every write to the blitter slave port targeting any of the
+    // pointer regs (offsets $0C BLTAPT, $10 BLTBPT, $14 BLTCPT, $18 BLTDPT).
+    always @(posedge clk) if (rst_n && blt_slv_req && blt_slv_we &&
+                              (blt_slv_addr[5:2] == 4'h3 ||
+                               blt_slv_addr[5:2] == 4'h4 ||
+                               blt_slv_addr[5:2] == 4'h5 ||
+                               blt_slv_addr[5:2] == 4'h6)) begin
+        $display("[BLT-SLV-PTR-WR] port=%0d via=%s slv_addr=%h wdata=%h be=%b raw_addr=%h",
+            winner, is_blt_amiga ? "AMIGA" : "LEGACY",
+            blt_slv_addr, blt_slv_wdata, blt_slv_be, addr[winner]);
+    end
+`endif
     always @* begin
         if (is_cop_amiga) begin
             cop_slv_req   = winner_valid && we[winner] && cop_xlat_valid;
@@ -1463,6 +1498,20 @@ module m68k_bus #(
                     5'd11: canon_bltdpt[15:0]  <= amiga_wdata_half;
                     default: ;
                 endcase
+`ifdef KICKSTART_BOOT_TRACE
+                // Trace any CPU/master write to a BLT canonical register —
+                // diagnoses where bltdpt=$01FF (and other oddly-aligned
+                // pointers) come from for the blit that corrupts mem[$1B].
+                if (blt_amiga_reg == 5'd10 || blt_amiga_reg == 5'd11)
+                    $display("[BLT-CANON-DPT-WR] port=%0d reg=%0d is_long=%b be=%b wdata=%h half=%h canon_dpt(after)=%h",
+                        winner, blt_amiga_reg, is_long[winner],
+                        be[winner], wdata[winner], amiga_wdata_half,
+                        (blt_amiga_reg == 5'd10)
+                            ? ((is_long[winner] && be[winner] == 4'b1111)
+                               ? wdata[winner]
+                               : {amiga_wdata_half, canon_bltdpt[15:0]})
+                            : {canon_bltdpt[31:16], amiga_wdata_half});
+`endif
             end
             if (winner_valid && we[winner] && is_cop_amiga) begin
                 // Mirror the xlat-side mask: a Copper-master write to
@@ -1505,6 +1554,14 @@ module m68k_bus #(
                     // clears mem[$1B] to $0 after the legit write.
                     if (blk_cur_dst < 32'h0000_0100)
                         $display("[DMA-LOW-WR] dst=%h off=%h data=%h",
+                            blk_cur_dst, blk_cur_off,
+                            disk[blk_cur_off[DISK_IDX_BITS+1:2]]);
+                    // [BB-DEC-DMA-WR]: catch disk DMA writes to the bootblock
+                    // decoded-magic location $20A0..$20A3.  Counterpart to the
+                    // arbiter-side BB-DEC-WR probe — disk DMA bypasses the
+                    // arbiter.
+                    if (blk_cur_dst >= 32'h0000_20A0 && blk_cur_dst <= 32'h0000_20A3)
+                        $display("[BB-DEC-DMA-WR] dst=%h off=%h data=%h",
                             blk_cur_dst, blk_cur_off,
                             disk[blk_cur_off[DISK_IDX_BITS+1:2]]);
 `endif
@@ -1857,10 +1914,16 @@ module m68k_bus #(
                 end
 `ifdef KICKSTART_BOOT_TRACE
                 // Trace any write that lands at chip RAM idx=$1B
-                // (vector table $6C-$6F).  Catches the mystery write
-                // that clears mem[$1B] to $0 between r=789829 and the
-                // watchdog moment.
-                if (mem_idx == 'h1B || addr[winner] == 32'h0000_006C ||
+                // (vector table $6C-$6F).  IMPORTANT: an unaligned-.L
+                // write at addr=$6A has mem_idx=$1A but ALSO writes
+                // mem[$1B] via the second-slot path on line 1850-1851.
+                // Catch BOTH paths.
+                if (mem_idx == 'h1B || mem_idx == 'h0B ||
+                    (mem_idx == 'h1A && be[winner] == 4'b1111 &&
+                     addr[winner][1:0] == 2'b10) ||
+                    (mem_idx == 'h0A && be[winner] == 4'b1111 &&
+                     addr[winner][1:0] == 2'b10) ||
+                    addr[winner] == 32'h0000_006C ||
                     addr[winner] == 32'h0000_002C ||
                     addr[winner] == 32'h0000_006E ||
                     addr[winner] == 32'h0000_002E) begin
@@ -1869,15 +1932,23 @@ module m68k_bus #(
                         wdata[winner], is_long[winner]);
                 end
 `endif
-                // [C2CC-BUS-WR] -- catch ALL writers (CPU, blitter, disk DMA,
-                // etc.) to chip-RAM \$C2AC..\$C2D0 (the 32-byte slot around
-                // the bad-RTS return PC at \$FCF104).  The CPU-only [C2CC-WR]
-                // trace in m68k_core.v misses some writes -- this fires at
-                // the actual mem[] commit, regardless of source.
-                if (addr[winner] >= 32'h0000_C2AC &&
-                    addr[winner] <= 32'h0000_C2D0)
-                    $display("[C2CC-BUS-WR] t=%0t port=%0d addr=%h be=%b wdata=%h",
-                        $time, winner, addr[winner], be[winner], wdata[winner]);
+                // [C2CC-BUS-WR] watchpoint moved to a hw_watch instance
+                // outside this always block — see u_w_c2cc below.  Same
+                // semantics (catches ALL bus writers — CPU, blitter, DMA
+                // — to chip RAM $C2AC..$C2D0).
+`ifdef KICKSTART_BOOT_TRACE
+                // [5E40-BUS-WR]: catch any bus-side write touching the
+                // linked-list slot at $5E40 (mem[$1797]/mem[$1798]).
+                // Includes unaligned .L straddles via the second-slot
+                // path on lines 1850-1851.
+                if (mem_idx == 17'h1798 || mem_idx == 17'h1797 ||
+                    (mem_idx == 17'h1796 && be[winner] == 4'b1111 &&
+                     addr[winner][1:0] == 2'b10) ||
+                    addr[winner] == 32'h0000_5E40 ||
+                    addr[winner] == 32'h0000_5E42)
+                    $display("[5E40-BUS-WR] port=%d addr=%h mem_idx=%h be=%b wdata=%h",
+                        winner, addr[winner], mem_idx, be[winner], wdata[winner]);
+`endif
 `ifdef HDRCHK_WATCH
                 // Watch writes that touch \$64DC..\$64E7 (hdr_chk + data_chk
                 // pair in the K1.3 disk-decode buffer).  Helps pin down what
@@ -2218,6 +2289,176 @@ module m68k_bus #(
             granted_port_q, granted_addr_q, granted_idx_q, resp_data,
             mem[granted_idx_q], granted_is_slow_q, granted_is_rom_q);
     end
+    // Per-cycle change detector for mem[$1B] — fires when its value
+    // differs from the previous cycle.  This catches ANY hidden write
+    // path that clears it to $0 (or any other change).
+    reg [31:0] mem_1b_prev;
+    always @(posedge clk) begin
+        if (!rst_n) mem_1b_prev <= 32'd0;
+        else begin
+            if (mem[17'h1B] != mem_1b_prev) begin
+                $display("[MEM-1B-CHG] prev=%h new=%h winner=%d we=%b addr=%h wdata=%h be=%b",
+                    mem_1b_prev, mem[17'h1B],
+                    winner, we[winner], addr[winner], wdata[winner], be[winner]);
+            end
+            mem_1b_prev <= mem[17'h1B];
+        end
+    end
+
+    // [CosimMW]: non-CPU memory writes (blitter, copper, denise, paula)
+    // and disk-DMA-bypass writes, emitted only inside the cosim window.
+    // Format: `[CosimMW] <retired> <addr> <size> <value>`
+    // The CPU's own writes are already captured by [CosimW] in
+    // m68k_core.v; we skip port 1 (CPU 0 D-cache) here so we don't
+    // double-count.
+    always @(posedge clk) if (rst_n && cosim_in_window_i &&
+                              winner_valid && we[winner] &&
+                              winner != {{(PID_BITS-1){1'b0}}, 1'b1}) begin
+        if (be[winner] == 4'b1111)
+            $display("[CosimMW] %0d %06h 4 %08h",
+                cosim_retired_i, addr[winner], wdata[winner]);
+        else if (be[winner] == 4'b1100)
+            $display("[CosimMW] %0d %06h 2 %04h",
+                cosim_retired_i, addr[winner], wdata[winner][31:16]);
+        else if (be[winner] == 4'b0011)
+            $display("[CosimMW] %0d %06h 2 %04h",
+                cosim_retired_i, addr[winner] | 32'd2, wdata[winner][15:0]);
+    end
+
+    // [CosimMW] for disk-DMA bypass (writes that don't go through the bus
+    // arbiter).  Emits during blk_busy active steps for BOTH chip-RAM
+    // (mem[]) and slow-RAM (slowmem[]) destinations — the trackdisk
+    // load can write to either depending on bootblock placement.
+    wire dma_committing_now = blk_busy &&
+        !((blk_byte_mode && blk_cur_dst >= blk_dst + blk_count_in_bytes) ||
+          (!blk_byte_mode && blk_cur_dst >= blk_dst + (blk_cnt << 9)));
+    always @(posedge clk) if (rst_n && cosim_in_window_i && dma_committing_now) begin
+        $display("[CosimMW] %0d %06h 4 %08h",
+            cosim_retired_i, blk_cur_dst,
+            disk[blk_cur_off[DISK_IDX_BITS+1:2]]);
+    end
+`endif
+
+    // ----------------------------------------------------------------
+    // hw_watch instances at the bus arbiter port.
+    //
+    // Pattern: each instantiation replaces what would otherwise be a
+    // hand-written `if (addr >= LO && addr <= HI && we) $display(...)`
+    // inside the mem-write always block.  Drives at the bus master
+    // outputs so every CPU/blitter/copper/denise/paula write is seen.
+    // Disk DMA bypasses the arbiter and needs its own watch on
+    // blk_cur_dst (see u_w_dma_* below).
+    //
+    // Adding a new bus watchpoint:
+    //   1. Pick a unique LABEL.
+    //   2. Set ADDR_LO/HI (use LO==HI for exact match).
+    //   3. Decide MATCH_WE / MATCH_RE.
+    //   4. Instantiate below.  No new always block required.
+    //
+    // For HALT-ON-HIT, set STOP_ON_HIT=1 — cheap substitute for a CPU
+    // breakpoint until a real debug controller exists.
+    wire bus_committing = winner_valid;
+    wire bus_we_now     = winner_valid && we[winner];
+    wire [7:0] bus_src  = {{(8 - PID_BITS){1'b0}}, winner};
+
+    // [C2CC-BUS-WR]: chip RAM $C2AC..$C2D0 (32-byte slot around the bad-
+    // RTS return PC at $FCF104).  Catches all bus writers — CPU, blitter,
+    // DMA — at the actual mem[] commit.  (DMA does not flow through this
+    // path; if you also want DMA writes, add a separate hw_watch wired
+    // to the disk DMA destination address — see u_w_dma_low_mem below.)
+    hw_watch #(
+        .LABEL      ("C2CC-BUS-WR"),
+        .ADDR_LO    (32'h0000_C2AC),
+        .ADDR_HI    (32'h0000_C2D0),
+        .MATCH_WE   (1),
+        .MATCH_RE   (0)
+    ) u_w_c2cc (
+        .clk     (clk),
+        .rst_n   (rst_n),
+        .valid   (bus_we_now),
+        .we      (1'b1),
+        .addr    (addr[winner]),
+        .wdata   (wdata[winner]),
+        .be      (be[winner]),
+        .src_id  (bus_src),
+        .pc      (32'd0),
+        .retired (32'd0),
+        .hit_o   ()
+    );
+
+    // [BB-DEC-WR]: chip RAM $20A0..$20A3, the bootblock-magic byte location
+    // in the decoded-sector buffer.  WB1.3 boot at r=116M sees the byte
+    // 1 at $20A1 = $4D instead of $4F (one-bit corruption), causing the
+    // bootblock magic check at $FE85AA to fail.  This probe identifies who
+    // is writing to this location between the MFM decode blit and the
+    // sector-copy blit.
+    hw_watch #(
+        .LABEL      ("BB-DEC-WR"),
+        .ADDR_LO    (32'h0000_20A0),
+        .ADDR_HI    (32'h0000_20A3),
+        .MATCH_WE   (1),
+        .MATCH_RE   (0)
+    ) u_w_bb_dec (
+        .clk     (clk),
+        .rst_n   (rst_n),
+        .valid   (bus_we_now),
+        .we      (1'b1),
+        .addr    (addr[winner]),
+        .wdata   (wdata[winner]),
+        .be      (be[winner]),
+        .src_id  (bus_src),
+        .pc      (32'd0),
+        .retired (32'd0),
+        .hit_o   ()
+    );
+
+`ifdef KICKSTART_BOOT_TRACE
+    // [BB-BLT-SRC]: snapshot of chip RAM at $20A0 + $22A0 (the sector
+    // copy blit's A and B source starts) at every BLTSIZE write.  Lets
+    // us see the actual blit input — independent of any subsequent DMA
+    // refill that BB-VAL's src@20A0 captures later.
+    wire bb_blt_start_wr = winner_valid && we[winner] &&
+                           (addr[winner] == 32'h00DF_F058);
+    always @(posedge clk) begin
+        if (rst_n && bb_blt_start_wr) begin
+            $display("[BB-BLT-SRC] bltsize=%h be=%b mem[20A0]=%h mem[22A0]=%h",
+                wdata[winner],
+                be[winner],
+                mem[14'd2088],     // $20A0 / 4 = $828
+                mem[14'd2216]);    // $22A0 / 4 = $8A8
+        end
+    end
+`endif
+
+    // [DMA-LOW-MEM]: disk DMA destination < $100 — the disk DMA path
+    // (mem[blk_cur_dst[..]] <= disk[..]) bypasses the arbiter.  Existing
+    // [DMA-LOW-WR] trace at line ~1500 already covers this gated by
+    // KICKSTART_BOOT_TRACE; this hw_watch is the same idea but as a
+    // standalone instance.  Wired to blk_cur_dst with blk_busy as valid.
+`ifdef KICKSTART_BOOT_TRACE
+    wire dma_committing = blk_busy &&
+        !((blk_byte_mode && blk_cur_dst >= blk_dst + blk_count_in_bytes) ||
+          (!blk_byte_mode && blk_cur_dst >= blk_dst + (blk_cnt << 9))) &&
+        !is_slow_addr(blk_cur_dst);
+    hw_watch #(
+        .LABEL      ("DMA-LOW-MEM"),
+        .ADDR_LO    (32'h0000_0000),
+        .ADDR_HI    (32'h0000_00FF),
+        .MATCH_WE   (1),
+        .MATCH_RE   (0)
+    ) u_w_dma_low_mem (
+        .clk     (clk),
+        .rst_n   (rst_n),
+        .valid   (dma_committing),
+        .we      (1'b1),
+        .addr    (blk_cur_dst),
+        .wdata   (disk[blk_cur_off[DISK_IDX_BITS+1:2]]),
+        .be      (4'b1111),
+        .src_id  (8'hFF),                   // DMA pseudo-port
+        .pc      (32'd0),
+        .retired (32'd0),
+        .hit_o   ()
+    );
 `endif
 
     // DMA writes bypass the bus arbiter (mem[] is written directly at the
