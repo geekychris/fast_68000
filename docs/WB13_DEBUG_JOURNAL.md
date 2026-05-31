@@ -735,3 +735,85 @@ covers ~12 KB of ROM — at 100 instructions per call we'd need ~25
 checkpoints to bisect.  Or alternatively, set a WP on the FIRST
 divergent address (chip $0412) and find the PC of the offending
 write on each side.
+
+## §17. Diff at multiple PCs narrows the divergence window
+
+Following §16's "snap-once" sim_main fix (which prevented the 53 GB
+snap explosion at idle PCs), the diff tool now runs cleanly at any PC.
+
+### Diff matrix
+
+| PC | First-hit description | Chip-RAM diff |
+|---|---|---|
+| $FC0240 | after exec zero-clear | **identical** (0 hunks) |
+| $FC0F94 | idle STOP loopback (first hit) | **identical** (0 hunks) |
+| $FC0D14 | autovec L3 (VBL/COPER/BLIT) first hit | 1 hunk at $0412 |
+| $FC0CE2 | autovec L2 (CIA-A / PORTS) first hit | 20 hunks |
+| $FC2F80 | first exec.CopyMem call | 59 hunks |
+
+Both retired counts at $FC0F94 first hit are equivalent — confirmed by
+the identical chip RAM, which can only happen if both emulators have
+retired the same instructions.  This is a **lockstep checkpoint**.
+
+### What the data tells us
+
+At $FC0D14 first hit (autovec L3), the divergence is just chip $0413-$0498
+(one hunk).  Reading the bytes as an exec MemHeader structure:
+
+```
+$0410: 00 00 04 20    ; ln_pred (back-pointer in node header)
+$0414: 00 00 04 20    ; mh_First — pointer to first free MemChunk
+$0418: 00 08 00 00    ; mh_Upper — end of memory ($80000)
+$041C: 00 07 FB E0    ; mh_Free  — bytes free
+$0420: <free chunk starts here>
+```
+
+**FS-UAE at $FC0D14 first hit:**
+
+- mh_First = `$00000420`
+- mh_Free  = `$0007FBE0` (= `$80000 - $420`)
+
+**Our Verilator at $FC0D14 first hit:**
+
+- mh_First = `$00000480` (+ $60)
+- mh_Free  = `$0007FB80` (- $60)
+
+So our chip RAM MemHeader has **`$60` (96) more bytes allocated** than
+FS-UAE's at the same PC.  The data sitting in those 96 bytes at chip
+`$0420-$047F` on our side is a 12-entry table of paired-address +
+constant `$0478` records — looks like a function-dispatch table for
+some library or resource we have but FS-UAE doesn't.
+
+### Root cause now hypothesised
+
+Between the first idle STOP and the first autovec L3 fire, **a
+resource init runs on our system that doesn't run on FS-UAE** (or
+runs differently).  The 96-byte allocation it makes from chip RAM at
+`$0420-$047F` is the visible footprint.
+
+Likely culprits, by order of likelihood:
+
+1. **Different chipset probe result.**  Our `rtl/zorro_autoconfig.v`
+   or `rtl/agnus.v` may return a value that triggers an extra
+   Resident init.  The `$0420` data starts with `$00E00000 $00E20000` —
+   these *look* like Zorro 2 board addresses, suggesting our
+   autoconfig is reporting boards FS-UAE doesn't.
+
+2. **CIA register quirk.**  If our CIA-A returns a different ICR or
+   timer state, exec's CIA resource init may run a longer path.
+
+3. **Memory probe result.**  Exec's chip-RAM size probe may compute
+   a different size on our side, leading to a different MemHeader
+   layout.
+
+### Next concrete experiment
+
+Set a Verilator hw_watch on chip `$0412` (the diverging byte) and log
+the PC of the first write that puts `$0480` there.  Compare with
+FS-UAE's first write of `$0420` to the same location (via a watchpoint).
+Same PC + different value → bug is in some computation (most likely
+a chipset register read).  Different PC → bug is in the code-path
+selection.
+
+This is now narrowed to a **single byte in chip RAM** as the
+diagnostic anchor.

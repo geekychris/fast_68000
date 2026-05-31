@@ -455,10 +455,28 @@ static int run_regression(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
     struct SnapTrigger {
         uint32_t pc24;     // 24-bit masked PC value
         std::string label; // filename tag
+        int fired = 0;     // # of times we've already snap-dumped
     };
     std::vector<SnapTrigger> snap_triggers;
     std::string snap_dir = ".";
     if (const char* d = std::getenv("CHIPRAM_SNAP_DIR")) snap_dir = d;
+    // CHIPRAM_SNAP_LIMIT — max number of times each trigger fires.
+    // Default is 1 (snapshot ONCE per PC, on the first arrival).  For
+    // long-running idle PCs this avoids the snap explosion that
+    // happens when "fire on PC change" sees the loop come back to
+    // the trigger every iteration.  Set to 0 for unlimited (old
+    // behaviour) or to N to cap per-trigger.
+    int snap_limit = 1;
+    if (const char* l = std::getenv("CHIPRAM_SNAP_LIMIT")) {
+        snap_limit = std::atoi(l);
+    }
+    // CHIPRAM_SNAP_HALT=1 — stop the simulation after all triggers
+    // have fired their limit.  Useful for diff workflows where the
+    // snapshot is the only output we care about.
+    bool snap_halt = false;
+    if (const char* h = std::getenv("CHIPRAM_SNAP_HALT")) {
+        snap_halt = (h[0] == '1' || h[0] == 'y' || h[0] == 'Y');
+    }
     if (const char* s = std::getenv("CHIPRAM_SNAP_PCS")) {
         const char* p = s;
         while (*p) {
@@ -596,7 +614,9 @@ static int run_regression(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
             const uint32_t* pc_arr = reinterpret_cast<const uint32_t*>(&top->core_pc_flat);
             uint32_t cur_pc = pc_arr[0] & 0xFFFFFFu;
             if (cur_pc != last_core0_pc) {
-                for (const auto& t : snap_triggers) {
+                int all_done = 1;
+                for (auto& t : snap_triggers) {
+                    if (snap_limit > 0 && t.fired >= snap_limit) continue;
                     if (t.pc24 == cur_pc) {
                         const uint32_t* r_arr =
                             reinterpret_cast<const uint32_t*>(&top->retired_flat);
@@ -620,7 +640,15 @@ static int run_regression(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
                                    path, cur_pc, r_arr[0],
                                    (unsigned long long)cycle);
                         }
+                        t.fired++;
                     }
+                    if (snap_limit > 0 && t.fired < snap_limit) all_done = 0;
+                }
+                /* CHIPRAM_SNAP_HALT: when every trigger has fired its
+                 * limit, stop the simulation. */
+                if (snap_halt && snap_limit > 0 && all_done) {
+                    printf("[sim] CHIPRAM_SNAP_HALT — all triggers fired, halting\n");
+                    break;
                 }
             }
             last_core0_pc = cur_pc;

@@ -162,6 +162,8 @@ def verilator_capture(pc, snap_dir):
     env = os.environ.copy()
     env["CHIPRAM_SNAP_PCS"] = f"{pc:06X}:diff"
     env["CHIPRAM_SNAP_DIR"] = os.path.abspath(out_dir)
+    env["CHIPRAM_SNAP_LIMIT"] = "1"   # only first hit
+    env["CHIPRAM_SNAP_HALT"] = "1"    # exit sim as soon as snap fires
     # Bound simulation
     cycles = "50000000"
     log_path = os.path.join(snap_dir, "veri.log")
