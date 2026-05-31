@@ -87,6 +87,52 @@ Render K1.3 chipram into a PPM (post-OpenScreen Copper-list walker)
 and list resident structs.  Less frequently used but documented in
 the source headers.
 
+### `tools/fsuae_state.py` — FS-UAE save-state diff against our snapshots
+
+When internal traces don't pinpoint *where* K1.3 diverged from the
+canonical Amiga boot, fetch a known-good state from a software
+emulator and compare byte-for-byte.
+
+```
+python3 tools/fsuae_state.py <input.uss> <output_dir>
+```
+
+Parses an FS-UAE `.uss` save state (FOURCC chunks; `CRAM`/`BRAM` are
+zlib-compressed with a small flag+size header).  Writes the same
+`regs.txt` + `mem.hex` + `slow.hex` format our `build_cosim_window/snap/`
+uses, plus extracts `DMACON` / `INTENA` / `INTREQ` from the `CHIP`
+chunk.
+
+**Two quirks the source comments in `fsuae-src/` don't mention** —
+both discovered empirically by searching for known register values:
+
+- `CPU` chunk has +4 bytes between FLAGS and D0 (vs. textbook
+  `save_cpu()` in `newcpu.cpp`).  Layout in FS-UAE 3.x: `+$0C` D0,
+  `+$2C` A0, `+$48` PC, `+$54` ISP/SSP, `+$58` SR (in high half of
+  the longword).
+- `CHIP` chunk has the same +4 prefix before `chipset_mask`.  So
+  `DMACONR` is at `+$0A`, `INTENAR` at `+$24`, `INTREQR` at `+$26`.
+
+Usage pattern for boot-divergence bisection:
+
+1. Boot WB1.3 in FS-UAE GUI, F12 → Save state at the moment of
+   interest (idle desktop is a good choice).
+2. `python3 tools/fsuae_state.py "<path>.uss" /tmp/fsuae_snap`
+3. Snapshot our Verilator at the matching PC with
+   `make cosim-window SNAP_PC=00FC0F90 SNAP_AFTER=N WINDOW=10 ...`
+4. `cmp` chip RAM, slow RAM, and `regs.txt`.  The matching
+   long-lived pointers (ExecBase, lib bases) confirm the bisection
+   is anchored at the same boot moment; the diverging working
+   state pinpoints which K1.3 data structures took a different
+   branch.
+
+This is what unblocked the WB1.3-corruption investigation —
+see WB13_DEBUG_JOURNAL.md §12-§13.  The single most useful diff was
+chip RAM `$C0-$FF` (16 zero longwords on us vs. 16 pointers into a
+slow-RAM IRQ-dispatcher trampoline on FS-UAE) — which finally
+identified K1.3 skipping its IRQ-server install as the upstream
+cause of the bitplane-DMA-never-enabled symptom.
+
 ## 2. In-RTL `$display` traces
 
 All traces in `rtl/m68k_core.v` are wrapped in
@@ -142,9 +188,14 @@ in `rtl/m68k_core.v` and shows up in `run.log` as `[NAME] r=…`.
 **Memory pattern watches**
 | `[CACA-WR]` | any write where high or low half = `$CACA` |
 | `[5D80-WR]` | any write in chip-RAM `$5D80..$5E00` |
+| `[5E40-WR]` | CPU writes to chip-RAM `$5E3E..$5E43` (BCPL DOS table entry) |
+| `[5E40-BUS-WR]` | bus-arbiter watch: ALL writers (CPU + blitter + DMA) to `$5E3C..$5E47`.  Pairs with [5E40-WR] to localise the corrupting writer's `src_id` |
+| `[INTVECS-WR]` | bus-arbiter watch on chip-RAM `$C0..$FF` (68k user-defined interrupt vectors / K1.3 IRQ-server `IntVects[]`).  FS-UAE has these populated with pointers into a slow-RAM BSR-trampoline dispatcher; ours stays zero post-boot.  Confirms K1.3 skips the dispatcher-install code path |
 | `[WB-FLAGS-WR]` | any write in chip-RAM `$C128..$C140` (intuition Gadget struct) |
 | `[INTU-STRUCT-WR]` | any write in `$BE80..$BF20` (Workbench Screen area) |
 | `[SIGWAIT-WR]` | any write to input.device's tc_SigWait field |
+| `[WBPC-WR-C04A8E]` | CPU writes to slow-RAM `$C04A8C..$C04A91` (LINK frame for the WB1.3 routine at $FEA932) |
+| `[PUTMSG-PKT]` | dp_Type capture at `$FC1B70` PutMsg entry — **dp_Type lives at offset $28 from msg start in K1.3/V33, NOT the textbook $1C** |
 
 **Exec primitive entry hooks**
 | `[OBTSEM]` | ObtainSemaphore body entry (`$FC2DF0`) |

@@ -456,3 +456,204 @@ Significant DOS-internals work; deferred.
 
 Without those hooks, "why doesn't the title bar draw?" is the kind
 of question that takes a full session of K1.3 disassembly to answer.
+
+## §11. Cosim window — eliminating the CPU as a hypothesis
+
+After two sessions of suspecting our MOVEM at `$FEA936` (the visible
+write of `0` to `$C04A8E` right before the bad blit), we finally
+proved the CPU is byte-identical to Musashi by running a 100K-instruction
+cosim window over the corruption point:
+
+```
+make cosim-window SNAP_PC=00FEA932 SNAP_AFTER=4437000 WINDOW=100000 \
+     ADFFILE=kickstart/wb13.adf ROMFILE=kickstart/kick_13.bin
+```
+
+Result: **2 diff hunks in 100,001 lines**, both at MOVEM-load
+instructions, both immediately re-converging on the next line. The
+divergences are a trace-emission-semantics artifact (Verilator's
+`is_settled_after_movem` fires at end-of-MOVEM = post-load state;
+Musashi's `instr_hook` fires at start-of-instruction = pre-load state).
+Same retired count, different snapshot point in the multi-cycle
+instruction. By the next single-cycle instruction, both CPUs show
+identical state.
+
+Two sessions of "MOVEM is the bug" diagnosis dissolved in 30 minutes
+of cosim. The previous diagnoses had assumed the `MOVEM.L D0/A0/A1,
+$FFEA(A2)` was predec mode (so D0 would land at $C04A8E). The actual
+instruction is `48EA 0301 FFEA` = d16(An) mode; D0 lands at $C04A8A
+and A0 lands at $C04A8E. A0 was already 0 entering the routine.
+
+**Technique:** when stuck on a multi-session "CPU bug" hypothesis,
+the cosim window is the definitive test. Use a SNAP_PC that's actively
+executing (not a STOP), and a window large enough to cover the
+suspected divergence. The two MOVEM-load hunks always appear in
+diffs — they're trace-format artifacts and can be ignored.
+
+## §12. FS-UAE state diff — the real ground truth
+
+The cosim cleared the CPU but didn't tell us *why* K1.3 takes a
+different path on us. The next breakthrough: FS-UAE has a save state
+(`.uss`) format that captures full chip RAM + slow RAM + CPU regs +
+chipset registers. Booted WB1.3 in FS-UAE 3.2.35 with the exact same
+hardware config (A500 + 68000 + 512 KB chip + 512 KB slow + our
+unencrypted K1.3 ROM + WB1.3 ADF), got to the idle desktop, saved
+state.
+
+Wrote `tools/fsuae_state.py` to parse the .uss:
+- FOURCC chunk walker
+- `CRAM`/`BRAM` chunks are zlib-compressed (8-byte header: flags + size, then `78 9c`-prefixed zlib)
+- `CPU ` chunk has a +4-byte offset between FLAGS and D0 vs the textbook `save_cpu()` order in `fsuae-src/newcpu.cpp` (discovered empirically by searching for known register $C0040C)
+- `CHIP` chunk has the same +4 prefix before chipset_mask; chipset_mask at +$04, BLTDDAT at +$08, DMACONR at +$0A, INTENAR at +$24, INTREQR at +$26
+
+Output is `regs.txt` + `mem.hex` + `slow.hex` in the format our existing
+`cosim-window` snap directory uses.
+
+Side-by-side regs at IDLE STOP showed a striking pattern:
+
+| reg | matches? |
+|---|---|
+| A0/A3/A4/A6/A7 + INTENA | ✓ exactly |
+| D2-D7, A1/A2/A5, USP, INTREQ, DMACON, SR | divergent |
+
+The MATCHING values are the long-lived system pointers (ExecBase,
+IntVect base, library bases). The DIVERGING values are working state
+(task pointers, BCPL globals, stack frames). That alone is a sharp
+clue: K1.3 has taken a different control-flow path through IRQ
+servicing or task dispatch.
+
+## §13. The smoking gun — IRQ dispatcher never installed
+
+Two specific findings nailed the upstream cause:
+
+**1. DMACON BPLEN+SPREN bits.** Ours $02D0, FS-UAE $03F0. The
+divergent bits are bit 8 (BPLEN = bitplane DMA) and bit 5 (SPREN =
+sprite DMA). FS-UAE has Workbench's display DMA active; we don't.
+A grep through our 30 M-cycle trace for any CPU write to `$DFF096`
+with the BPLEN bit set returns **zero matches**. Our K1.3 never even
+*attempts* to turn on bitplane DMA.
+
+**2. Chip RAM $C0-$FF and slow RAM $C096DC.** A diff of chip RAM
+between us and FS-UAE shows 96.3% of longwords match. The first
+divergent region is $C0-$FF (the 68k user-defined interrupt vector
+table area, vectors 48-63). On FS-UAE, this holds 16 consecutive
+pointers `$00C096DC, $00C096DE, $00C096E0, ... $00C096FA` — each 2
+bytes apart. On us, all 16 entries are `$00000000`.
+
+Looking at slow RAM $C096DC on FS-UAE:
+
+```
+$C096dc: $6120 $611e  ; BSR.B +$20, BSR.B +$1E
+$C096e0: $611c $611a  ; BSR.B +$1C, BSR.B +$1A
+... (continuing pattern, each BSR.B with decrementing displacement)
+$C096fa: $6102        ; BSR.B +$02 (last entry)
+$C096fc: $4e71        ; NOP (end marker)
+```
+
+These ARE 68k instructions. A series of `BSR.B +disp` with
+decrementing displacement — classic 16-entry IRQ-server dispatcher
+table. Each chip-RAM $C0+4N pointer points at the Nth `BSR.B`,
+which jumps to a common handler tail.
+
+On us, slow RAM $C096DC area is all zeros. K1.3 never builds the
+dispatcher.
+
+Added the `[INTVECS-WR]` hw_watch to `rtl/m68k_bus.v` for chip RAM
+$C0-$FF. Confirmed: our K1.3 issues exactly 16 writes to that range
+at boot start, all `wdata=$0` (exec.library zero-clear), then never
+writes back. Zero writes to slow RAM $C096DC ever.
+
+**The K1.3 IRQ-server dispatcher install code path is entirely
+skipped on our system.** That's why BPLEN never enables (the IRQ-driven
+graphics.library / intuition.library bootstrap can't progress past
+the point where it needs the dispatcher), and consequently why K1.3
+hits the fallback branch that issues the corrupting line-blit.
+
+This unifies several previously-deferred mysteries:
+- Task #51 (framebuffer black, BPLEN=0)
+- Task #56 (Intuition screen never opens)
+- Task #87 (Copper not executing Workbench list)
+- The corrupting blit chain ending at $5E40
+
+They were all downstream symptoms of one upstream cause: the IRQ
+dispatcher install routine is gated by a check that fails on our
+emulator and silently bypasses the install. Until that check is
+identified and unblocked, none of the downstream issues can be
+fixed at their actual source.
+
+## §14. Updated techniques (additions to §7)
+
+K. **Real-emulator state diff is the bisection of last resort.** When
+   internal traces don't pinpoint a divergence, dump full state from
+   a known-good emulator (FS-UAE/WinUAE save state is the easiest)
+   and diff against ours at a comparable moment. Most chip RAM will
+   match; the small divergent regions are where the K1.3 state
+   machine took a different branch. The smallest, earliest divergence
+   (e.g. chip $C0-$FF) is often more telling than the biggest one
+   (e.g. the 14 KB BCPL-scratch difference).
+
+L. **Save-state binary formats are rarely documented; reverse them
+   empirically.** When `tools/fsuae_state.py` first ran with the
+   textbook `save_cpu()` offsets, the parsed register values were all
+   off by one slot. The fix was to grep the raw chunk bytes for a
+   known register value (`$00C0040C` for A0) and back-calculate the
+   offset. The +4 prefix this revealed is a FS-UAE 3.x quirk that
+   isn't in the source comments. Once one offset is known, the rest
+   follow by structure.
+
+M. **A line-mode blit's address generation depends on more than
+   bltdpt + bltdmod.** When we saw 80 blitter writes to $5E40 on
+   our system and zero on FS-UAE for the same K1.3 ROM, the
+   first instinct was "blitter address bug." Wrong: the cosim and
+   the FS-UAE state proved the blit *parameters* differ between
+   us and FS-UAE — K1.3 never issues this blit on FS-UAE at all.
+   The blitter is correct; K1.3 is taking a different branch.
+
+N. **Workarounds buy diagnostic time but mask the real problem.**
+   `+define+BLT_VECTABLE_GUARD` neutralizes the LINEF storm from the
+   secondary bad blit at $1FF, letting WB1.3 boot reach productive
+   idle. That's *valuable* — without it, half our trace is LINEF
+   churn. But every time we say "the boot reaches productive idle
+   now" we should be ready to say "yes, with this specific symptom
+   masked, and the actual cause still pending." The guard helps us
+   see further, not work better.
+
+O. **D-pipeline (1-cycle delay) is real Amiga blitter behavior we
+   were missing.** FS-UAE's `blitter_dofast()` (lines 546-563)
+   latches the D destination pointer into a local, then issues the
+   actual bus write on the NEXT inner-loop iteration. Final word's
+   write deferred to post-loop. We didn't model this. Now landed
+   in `rtl/chipset/blitter.v` via `d_pipe_valid` + `d_pipe_addr`
+   + `d_pipe_data` registers; 141/141 unit tests still pass. The
+   pipeline didn't fix the $5E40 corruption (source and dest in
+   that specific blit don't overlap in a way the pipeline timing
+   affects), but it's correct behavior we should have had from the
+   start.
+
+## §15. Suggested next steps (revising §10)
+
+The §10 list of UI-side hooks is now superseded by the upstream
+finding. The right next move:
+
+1. **Disassemble K1.3 ROM for the IRQ-dispatcher install routine.**
+   Search for `MOVE.L An, $C0.L`-style writes (= installs into the
+   chip-RAM $C0-$FF table) or for the AllocMem-then-write-BSRs
+   routine that creates the dispatcher trampoline at slow RAM
+   $C096DC. The install instruction's PC reveals which code path
+   is being skipped.
+
+2. **Identify the gate.** The install routine is almost certainly
+   conditional on a chipset probe, a resource RESINIT call, or a
+   memory probe. Whatever returns a different value on us vs FS-UAE
+   is the actual bug to fix.
+
+3. **Possible quick-bypass test:** synthetically pre-populate chip
+   $C0-$FF + slow $C096DC at boot via a forced write before K1.3
+   runs (similar to how OVL_RESET=1 seeds reset vectors). If the
+   downstream Workbench-init then proceeds and BPLEN gets enabled,
+   the dispatcher being absent IS the root cause. If not, there's
+   another gate we still haven't found.
+
+The pieces of the puzzle now fit. The exact ROM disassembly is the
+work that's left.
+

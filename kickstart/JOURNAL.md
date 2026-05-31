@@ -2845,3 +2845,104 @@ plateau, the symptom looks like a CPU bug deep in K1.3 code, but
 the actual root cause is a bus-translation or exception-state
 edge case that wasn't exercised before because earlier walls
 masked it.
+
+### S45: WB1.3 corruption traced to a skipped K1.3 IRQ-dispatcher install
+
+Goal: localise the cause of the screen-fill blit at $6438 that
+walks back into the BCPL DOS data at $5E40, eventually triggering
+the LINEF storm.  Previous sessions chased it as a MOVEM CPU bug,
+then as a memory-layout overlap.  This session disposed of both
+hypotheses and found the actual upstream cause.
+
+**Disproof #1: MOVEM is correct.**  Probes (`STKSET-932`,
+`MOVEM-A936-ISSUE`, `MOVEM-A936-ACK`) showed the routine entry at
+$FEA932 has A0=0 at the cycle the bad blit fires.  The MOVEM at
+$FEA936 is `48EA 0301 FFEA` = `MOVEM.L D0/A0/A1, $FFEA(A2)` — d16(An)
+mode, NOT predec.  D0 lands at $C04A8A, A0 lands at $C04A8E.  Prior
+sessions had read it as predec mode (so they thought D0 was at
+$C04A8E and "MOVEM stored 0 instead of D0=$200").  The actual fact
+is A0 was already 0; MOVEM correctly stored A0's value at $C04A8E.
+
+**Disproof #2: CPU matches Musashi.**  100K-instruction cosim
+window from r=4437000 over PC=$FEA932:
+```
+make cosim-window SNAP_PC=00FEA932 SNAP_AFTER=4437000 WINDOW=100000 \
+     ADFFILE=kickstart/wb13.adf ROMFILE=kickstart/kick_13.bin
+```
+2 diff hunks in 100,001 lines, both MOVEM-load trace-emission
+artifacts (Verilator emits post-state, Musashi pre-state for
+multi-cycle instructions).  Both converge on the next line.  Our
+CPU is byte-identical to Musashi.
+
+**Disproof #3: chip-RAM layout matches.**  FS-UAE 3.2.35 booted
+WB1.3 with the same config (A500/68000/512KB chip/512KB slow/our
+K1.3 ROM/wb13.adf).  Wrote `tools/fsuae_state.py` to parse the
+.uss save state into our snapshot format.  Chip RAM at the IDLE
+STOP matches us at 96.3% of longwords.  mem[$5E40] = $00001791 on
+FS-UAE — intact — same value our trace shows BEFORE the corruption
+fires.  Same physical layout, FS-UAE never zeros it.
+
+**Discovery — the actionable diff.**  Three signals together
+revealed the upstream cause:
+1. DMACON: ours $02D0, FS-UAE $03F0.  BPLEN(8) + SPREN(5) bits
+   differ.  Our system never enables bitplane or sprite DMA.
+2. Zero CPU writes to $DFF096 with BPLEN bit set across the entire
+   30M-cycle trace.  K1.3 never even *attempts* to enable bitplane
+   DMA.
+3. Chip RAM $C0-$FC: FS-UAE has 16 consecutive pointers ($00C096DC,
+   $00C096DE, $00C096E0, ..., $00C096FA — each 2 bytes apart).
+   Ours: 16 × $00000000.  Slow RAM at $C096DC on FS-UAE contains
+   `$6120 $611E $611C ... $6102 $4E71` — a chain of `BSR.B +disp`
+   instructions with decrementing displacement, classic 16-entry
+   IRQ-server dispatcher.  Ours: all zeros.
+
+Added `[INTVECS-WR]` hw_watch to `rtl/m68k_bus.v`.  Confirmed: our
+K1.3 issues exactly 16 writes to chip $C0-$FC at boot start, all
+`wdata=$0` (exec.library zero-clear), then NEVER writes back.
+Zero writes to slow RAM $C096DC ever.
+
+**Conclusion.**  K1.3 builds an IRQ-server dispatcher trampoline
+in slow RAM on real Amiga / FS-UAE, then points chip-RAM $C0-$FC
+(68k user-defined interrupt vectors 48-63) at the trampoline
+entries.  Our K1.3 skips the install entirely.  Without the
+dispatcher, the IRQ-driven graphics.library / intuition.library
+bootstrap can't reach the point where DMACON gets BPLEN+SPREN
+enabled.  K1.3 hits a fallback branch — which is the branch that
+issues the corrupting line-blit at $6438.
+
+The line-blit isn't a bug in itself; it's K1.3 doing whatever its
+fallback path does when Workbench-display init can't proceed.
+Our blitter walks the dst exactly where the math says it should.
+On real Amiga K1.3 never gets into the fallback because the IRQ
+dispatcher install succeeds.
+
+**Other landed work.**
+- D-pipeline added to blitter (mirrors FS-UAE's `blitter_dofast()`
+  lines 546-563).  `rtl/chipset/blitter.v` now has `d_pipe_valid`,
+  `d_pipe_addr`, `d_pipe_data` registers; S_WRD writes the
+  previously-latched pair then latches the current one; S_DONE
+  flushes pending.  Correct Amiga behavior, 141/141 tests pass.
+  Doesn't fix the $5E40 corruption (proved by analysis: source
+  and dest don't overlap in a way the pipeline timing affects),
+  but it's correct.
+- `BLT_VECTABLE_GUARD` already in place neutralises the
+  downstream LINEF storm.  Boot now reaches productive idle at
+  retired=24M+ with 0 LINEF events.
+- New probes: `[5E40-BUS-WR]` (chip RAM $5E3C-$5E47 — captured
+  80 blitter writes), `[INTVECS-WR]` (chip RAM $C0-$FF — confirmed
+  K1.3 never reinstalls), `[PUTMSG-PKT]` (dp_Type capture at
+  $FC1B70 with verified offset $28 from msg start, not the
+  textbook $1C).
+- New tool: `tools/fsuae_state.py` — converts FS-UAE .uss save
+  states to our snapshot format.  Discovered FS-UAE 3.x CPU chunk
+  has +4 prefix between FLAGS and D0; CHIP chunk has +4 prefix
+  before chipset_mask.  Documented in
+  `~/.claude/.../project_wb13_fsuae_state_tool.md`.
+
+**Next session.**  Disassemble K1.3 ROM looking for `MOVE.L An,
+$C0.L`-style writes (= installs into IntVects) or the AllocMem +
+write-BSRs sequence that creates the dispatcher trampoline.
+That instruction's PC is the install routine.  The gate that
+fails on us is upstream of that PC.
+
+Tests: 141/141.  Tasks #95-#98 capture the FS-UAE trail.

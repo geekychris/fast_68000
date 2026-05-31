@@ -40,10 +40,31 @@ Cosim is *not* the right tool when:
 |---|---|---|
 | `make crosscheck-minimig` | Paula INTENA / INTREQ / INTENAR / INTREQR semantics | `tb/minimig_xcheck_top.sv`, `tb/minimig_xcheck.cpp` |
 | `make crosscheck-minimig-blt` | Blitter memory writes for a fixed sequence of `BLTCON0/1`, pointer, modulo, and `BLTSIZE` programs | `tb/minimig_blt_xcheck_top.sv`, `tb/minimig_blt_xcheck.cpp` |
+| `make cosim-window SNAP_PC=...` | 68k CPU lockstep vs Musashi across a snapshot window | `tools/musashi_kick`, `tools/cosim_diff.py` |
+| `python3 tools/fsuae_state.py …` | Full chip+slow+CPU+chipset state vs an FS-UAE save state | `tools/fsuae_state.py` (no harness — diff via `cmp`) |
+
+The first two prove individual sub-modules byte-match.  `cosim-window`
+proves the CPU runs the same code path Musashi does over a window
+(useful for ruling the CPU out of a multi-session corruption hunt —
+see WB13_DEBUG_JOURNAL.md §11).  The FS-UAE state diff is the
+end-to-end ground truth: same K1.3 ROM + WB1.3 ADF on a software
+emulator that's been hardened over decades against real hardware
+behavior.  Diff our snapshot at any matched PC against an FS-UAE
+save state and the long-lived pointers will match while the
+working state diverges, pinpointing which K1.3 data structures
+took a different branch.  WB13_DEBUG_JOURNAL.md §12–13 walks the
+full discovery path.
 
 Both pass at the time of writing. The Paula one has 2 documented soft
 differences around `INTREQ` bit-14 writability (MiniMig keeps it
 writable, HRM-correct behaviour reserves it).
+
+**Known cosim-window trace-format quirk:** for MOVEM-load instructions
+the Verilator and Musashi traces differ by one row at the MOVEM
+line itself (Verilator emits post-load state, Musashi emits
+pre-load).  Both converge on the next single-cycle instruction.
+Always 2 diff hunks per MOVEM-load in the window — they're
+emission-timing artifacts, not CPU divergences.  Ignore them.
 
 ## How to fetch MiniMig
 

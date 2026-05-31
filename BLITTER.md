@@ -211,9 +211,56 @@ Intentional deviations for fit with our design:
 | 4-cycle slot DMA arbitration          | Round-robin arbiter (whatever wins, runs)       |
 | 16 max addressable lines via copper   | No copper yet — CPU programs directly           |
 | Fill mode (FCI/IFE/EFE)               | **NOT implemented** (deferred to a later pass)  |
-| Descending mode (DESC)                | **NOT implemented**                             |
+| Descending mode (DESC)                | Implemented (since the K1.3 boot work)          |
+| D-channel pipelined 1-cycle behind C  | Now implemented — see "D-write pipeline" below  |
 | Blitter interrupt to CPU (INT6)       | Polled BUSY only (interrupt wiring is future)   |
 | BLTBYP / blitter-priority registers   | Not modeled                                     |
+
+### D-write pipeline (real-Amiga semantic, landed for WB1.3 work)
+
+The real Amiga blitter's D channel is pipelined one word behind the
+C read.  Sequence per inner-loop iteration: read A/B/C → **write the
+PREVIOUSLY latched D pair** → compute current `final_w` from just-read
+A/B/C → latch current `(bltdpt, final_w)` as the new pending pair →
+advance bltdpt by ±2.  At blit completion the final pending pair is
+flushed to the bus.
+
+Implemented via three registers in `rtl/chipset/blitter.v`:
+- `d_pipe_valid` — set on first D-iteration of each blit, cleared at
+  blit start
+- `d_pipe_addr` — the address of the pending write
+- `d_pipe_data` — the data word to write
+
+S_WRD's `use_d` branch:
+1. If `!d_pipe_valid` (first word): latch the pair, advance bltdpt,
+   move on.  No bus write.
+2. If `d_pipe_valid`: issue bus write of the pending pair; on ack,
+   latch the new pair, advance bltdpt, move on.
+
+S_DONE flushes any remaining pending pair before raising the BLITZ
+interrupt.
+
+This mirrors FS-UAE's `blitter_dofast()` in `blitter.cpp` lines
+546-563 + 574-575.  Without the delay, our blitter wrote D in the
+same cycle as the C read; in most blits the visible memory state
+is identical either way, but for self-overlapping or mod-asymmetric
+blits the timing matters for fidelity against real-Amiga behavior.
+
+### `BLT_VECTABLE_GUARD` (debug aid)
+
+Compile-time define that gates the blitter D-write when bltdpt (or
+the pipelined `d_pipe_addr`) is less than `$0000_0400`.  K1.3 only
+writes to the 68k vector table during exec.library init via CPU
+MOVEs; any blit hitting `$0..$3FF` at runtime is a symptom of
+upstream data corruption (e.g. an A0=0 propagating through a BCPL
+DOS chain).  The guard skips the bus write but advances the state
+machine normally so the BLITZ interrupt still fires and the CPU
+isn't deadlocked polling BLTBUSY.
+
+Use when investigating WB1.3 boot symptoms downstream of a known
+"bad blit walks vector table" event.  See
+`WB13_DEBUG_JOURNAL.md` §13 for the upstream cause this guard
+masks (= K1.3 IRQ-dispatcher install skipped).
 
 What **is** identical: register layout, BLTCON field meanings, channel
 enable bits, minterm Logic Function semantics, barrel shifts, first/last
