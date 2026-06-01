@@ -2493,6 +2493,31 @@ module m68k_bus #(
         .hit_o   ()
     );
 
+    // [RELOC-IMG-WR]: chip RAM $10EB0..$10F1F — the relocatable image
+    // that K1.3 CopyMems to slow $C094D4+ to build the IRQ-dispatcher
+    // install routine.  On FS-UAE this region gets populated during
+    // exec init; on us it stays zero (project_wb13_intvecs_skipped.md).
+    // Any write here means the upstream producer ran — log it.
+    hw_watch #(
+        .LABEL      ("RELOC-IMG-WR"),
+        .ADDR_LO    (32'h0001_0EB0),
+        .ADDR_HI    (32'h0001_0F1F),
+        .MATCH_WE   (1),
+        .MATCH_RE   (0)
+    ) u_w_reloc_img (
+        .clk     (clk),
+        .rst_n   (rst_n),
+        .valid   (bus_we_now),
+        .we      (1'b1),
+        .addr    (addr[winner]),
+        .wdata   (wdata[winner]),
+        .be      (be[winner]),
+        .src_id  (bus_src),
+        .pc      (32'd0),
+        .retired (32'd0),
+        .hit_o   ()
+    );
+
 `ifdef KICKSTART_BOOT_TRACE
     // [BB-BLT-SRC]: snapshot of chip RAM at $20A0 + $22A0 (the sector
     // copy blit's A and B source starts) at every BLTSIZE write.  Lets
