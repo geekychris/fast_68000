@@ -2438,6 +2438,103 @@ module m68k_bus #(
         .hit_o   ()
     );
 
+    // [DMACON-WR]: every CPU/Copper write to DMACON ($DFF096).  Each
+    // write is SET/CLR semantics: bit 15 = mode, bits 0-14 = mask.
+    // Use the distribution of writes to confirm BPLEN+DMAEN are
+    // simultaneously enabled while the Workbench Copper list is also
+    // setting BPU>0 in BPLCON0.
+    hw_watch #(
+        .LABEL      ("DMACON-WR"),
+        .ADDR_LO    (32'h00DF_F096),
+        .ADDR_HI    (32'h00DF_F097),
+        .MATCH_WE   (1),
+        .MATCH_RE   (0)
+    ) u_w_dmacon (
+        .clk     (clk),
+        .rst_n   (rst_n),
+        .valid   (bus_we_now),
+        .we      (1'b1),
+        .addr    (addr[winner]),
+        .wdata   (wdata[winner]),
+        .be      (be[winner]),
+        .src_id  (bus_src),
+        .pc      (32'd0),
+        .retired (32'd0),
+        .hit_o   ()
+    );
+
+    // [BPLCON0-WR]: every write to BPLCON0 ($DFF100), CPU or Copper.
+    // If Workbench renders, Intuition's Copper list MOVEs $A302 to
+    // BPLCON0 once per frame (after BPU-up transition).  If we see
+    // zero writes, the Copper isn't executing Intuition's list.
+    hw_watch #(
+        .LABEL      ("BPLCON0-WR"),
+        .ADDR_LO    (32'h00DF_F100),
+        .ADDR_HI    (32'h00DF_F101),
+        .MATCH_WE   (1),
+        .MATCH_RE   (0)
+    ) u_w_bplcon0 (
+        .clk     (clk),
+        .rst_n   (rst_n),
+        .valid   (bus_we_now),
+        .we      (1'b1),
+        .addr    (addr[winner]),
+        .wdata   (wdata[winner]),
+        .be      (be[winner]),
+        .src_id  (bus_src),
+        .pc      (32'd0),
+        .retired (32'd0),
+        .hit_o   ()
+    );
+
+    // [BPL1PT-WR]: every write to BPL1PTH/L ($DFF0E0-3).  Used same way
+    // as BPLCON0-WR to track Copper-driven bitplane setup.
+    hw_watch #(
+        .LABEL      ("BPL1PT-WR"),
+        .ADDR_LO    (32'h00DF_F0E0),
+        .ADDR_HI    (32'h00DF_F0E3),
+        .MATCH_WE   (1),
+        .MATCH_RE   (0)
+    ) u_w_bpl1pt (
+        .clk     (clk),
+        .rst_n   (rst_n),
+        .valid   (bus_we_now),
+        .we      (1'b1),
+        .addr    (addr[winner]),
+        .wdata   (wdata[winner]),
+        .be      (be[winner]),
+        .src_id  (bus_src),
+        .pc      (32'd0),
+        .retired (32'd0),
+        .hit_o   ()
+    );
+
+    // [COP-LC-WR]: every CPU write to COP1LC/COP1LCH/COP1LCL/COP2LC.
+    // Covers $DFF080..$DFF087.  FS-UAE WP tracing shows K1.3 activates
+    // Workbench by chaining boot list -> COPJMP2 -> COP2LC at PC
+    // $FC6D6C every VBL.  If our system never writes COP2LC with the
+    // Intuition list address, Agnus dead-ends at the COPJMP2 and the
+    // Workbench display never goes live.
+    hw_watch #(
+        .LABEL      ("COP-LC-WR"),
+        .ADDR_LO    (32'h00DF_F080),
+        .ADDR_HI    (32'h00DF_F087),
+        .MATCH_WE   (1),
+        .MATCH_RE   (0)
+    ) u_w_cop_lc (
+        .clk     (clk),
+        .rst_n   (rst_n),
+        .valid   (bus_we_now),
+        .we      (1'b1),
+        .addr    (addr[winner]),
+        .wdata   (wdata[winner]),
+        .be      (be[winner]),
+        .src_id  (bus_src),
+        .pc      (32'd0),
+        .retired (32'd0),
+        .hit_o   ()
+    );
+
     // [INTVECS-WR]: chip RAM $C0..$FF — K1.3's IntVects[] array (16
     // pointers, one per IRQ source).  FS-UAE save state shows this
     // populated with 16 consecutive slow-RAM pointers $00C096DC,
