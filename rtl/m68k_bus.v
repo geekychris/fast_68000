@@ -2487,6 +2487,32 @@ module m68k_bus #(
         .hit_o   ()
     );
 
+    // [BPL1-AREA-WR]: every write into the Workbench BPL1 region at
+    // chip $60C8..$88C8 (10 KB = 2-plane HIRES bitplane).  If WB is
+    // actually drawing into the screen, we should see thousands of
+    // blitter writes here.  If we see zero, the drawing pipeline
+    // (graphics.library blits, layers.library drawing, console
+    // putchar) never reaches the bitmap.
+    hw_watch #(
+        .LABEL      ("BPL1-AREA-WR"),
+        .ADDR_LO    (32'h0000_60C8),
+        .ADDR_HI    (32'h0000_88C8),
+        .MATCH_WE   (1),
+        .MATCH_RE   (0)
+    ) u_w_bpl1_area (
+        .clk     (clk),
+        .rst_n   (rst_n),
+        .valid   (bus_we_now),
+        .we      (1'b1),
+        .addr    (addr[winner]),
+        .wdata   (wdata[winner]),
+        .be      (be[winner]),
+        .src_id  (bus_src),
+        .pc      (32'd0),
+        .retired (32'd0),
+        .hit_o   ()
+    );
+
     // [BPL1PT-WR]: every write to BPL1PTH/L ($DFF0E0-3).  Used same way
     // as BPLCON0-WR to track Copper-driven bitplane setup.
     hw_watch #(
