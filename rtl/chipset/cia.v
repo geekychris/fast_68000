@@ -130,17 +130,29 @@ module cia (
     assign pb_oe  = ddrb;
 
     // Interrupt line: any pending bit that the mask enables.
-    // Per-source rising-edge pulse: int_o = 1 for the host clock right
-    // after any masked pending bit transitions 0->1.
+    // Per-source rising-edge pulse on EITHER:
+    //   - a new pending bit becoming set while its mask is on, OR
+    //   - a new mask bit becoming set while its pending is already on
+    // This covers both ordering cases: keyboard byte arrives BEFORE
+    // exec enables SP mask (mask-rising-edge captures pending), or
+    // timer underflows AFTER mask is set (pending-rising-edge case).
+    // Without the second case, K1.3 boot stalls waiting for L2 IRQ
+    // that the keyboard self-test sequence already delivered.
+    // See WB13_DEBUG_JOURNAL §20.
     reg [4:0] icr_pending_d;
+    reg [4:0] icr_mask_d;
     wire [4:0] pending_new_rising = icr_pending & ~icr_pending_d;
+    wire [4:0] mask_new_rising    = icr_mask    & ~icr_mask_d;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             icr_pending_d <= 5'd0;
+            icr_mask_d    <= 5'd0;
             int_o         <= 1'b0;
         end else begin
             icr_pending_d <= icr_pending;
-            int_o <= |(pending_new_rising & icr_mask);
+            icr_mask_d    <= icr_mask;
+            int_o <= |((pending_new_rising & icr_mask) |
+                       (mask_new_rising    & icr_pending));
         end
     end
 
