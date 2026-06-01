@@ -253,8 +253,19 @@ static uint32_t k13_autodetect_cop1lc(Vm68k_top* top) {
 // Walk the Copper list rooted at cop1lc (chip-RAM byte address); update
 // the regs array (16-bit entries, indexed by chip-reg offset/2 in
 // $000..$1FE).  Stops at end-of-list (WAIT $FFFF) or instruction-budget.
+//
+// Intuition WB Copper lists set BPLCON0 multiple times per frame (e.g.
+// \$A302 for the display area, \$0302 in the blanking region).  A
+// last-write-wins walk ends with BPLCON0=\$0302 (BPU=0), losing the
+// display state.  We snapshot regs[] at the point where BPLCON0's BPU
+// field is at its peak, and return THAT snapshot as the "display
+// state."  Background and bitplane rendering then use the values
+// active during the visible portion of the frame.
 static void k13_walk_copper(Vm68k_top* top, uint32_t cop1lc,
                             uint16_t regs[256]) {
+    uint16_t regs_now[256] = {0};
+    int      max_bpu = 0;
+    bool     have_display = false;
     uint32_t pc = cop1lc & 0xFFFFFu;
     for (int n = 0; n < 4096; n++) {
         uint16_t ir1 = chip_word(top, pc);
@@ -271,20 +282,36 @@ static void k13_walk_copper(Vm68k_top* top, uint32_t cop1lc,
         } else {
             // MOVE: ir1[8:1] = chip-reg offset (low 9 bits, byte address).
             uint16_t reg = ir1 & 0x1FE;
-            regs[reg >> 1] = ir2;
+            regs_now[reg >> 1] = ir2;
+            // Snapshot regs[] whenever BPLCON0 BPU advances.  The display
+            // state is the one with the most planes — typically right
+            // after the top-blanking WAIT.
+            if (reg == 0x100) {
+                int bpu = (ir2 >> 12) & 0x7;
+                if (bpu > max_bpu) {
+                    max_bpu = bpu;
+                    for (int i = 0; i < 256; i++) regs[i] = regs_now[i];
+                    have_display = true;
+                }
+            }
             // COPJMP2 reloads PC from COP2LC.
             if (reg == 0x08A) {
-                uint32_t cop2lc = (uint32_t(regs[0x084 >> 1]) << 16) |
-                                  uint32_t(regs[0x086 >> 1]);
+                uint32_t cop2lc = (uint32_t(regs_now[0x084 >> 1]) << 16) |
+                                  uint32_t(regs_now[0x086 >> 1]);
                 pc = cop2lc & 0xFFFFFu;
             }
             // COPJMP1 reloads from COP1LC.
             if (reg == 0x088) {
-                uint32_t cop1 = (uint32_t(regs[0x080 >> 1]) << 16) |
-                                uint32_t(regs[0x082 >> 1]);
+                uint32_t cop1 = (uint32_t(regs_now[0x080 >> 1]) << 16) |
+                                uint32_t(regs_now[0x082 >> 1]);
                 pc = cop1 & 0xFFFFFu;
             }
         }
+    }
+    // If we never saw a non-trivial BPU, fall back to the final state
+    // (preserves background-only behaviour for K1.3's boot prompt list).
+    if (!have_display) {
+        for (int i = 0; i < 256; i++) regs[i] = regs_now[i];
     }
 }
 
@@ -339,23 +366,84 @@ static void k13_render_sprite(Vm68k_top* top, uint32_t sprpt,
 
 // Render K1.3's current chipram state into the pixel buffer.  Pixel layout
 // is ARGB8888.  buf must have w*h pixels.
+//
+// Three layers (back to front):
+//   1. Background = COLOR00 (palette index 0)
+//   2. Bitplanes — BPU planes from BPL1PT..BPLnPT, one byte per 8 pixels
+//                  per plane per row.  Pixel index = sum of plane bits.
+//   3. Sprite 0 — mouse cursor / pointer.
+//
+// Width handling: BPLCON0 bit 15 (HIRES) doubles the effective pixel
+// rate.  For the SDL window we treat HIRES as one Amiga pixel per SDL
+// pixel (so a 640-wide WB display is displayed truncated to FB_W=320
+// — gives the user something visible without forcing the renderer to
+// downscale).  LORES stays one-to-one.
 static void render_k13_chipram(Vm68k_top* top, uint32_t cop1lc,
                                uint32_t* buf, int w, int h) {
     uint16_t regs[256] = {0};
     k13_walk_copper(top, cop1lc, regs);
-    // Background = COLOR00.  K1.3's boot Copper list doesn't set COLOR00
-    // explicitly (Intuition would, post-OpenScreen); for the boot prompt
-    // state we hard-fill with the canonical Workbench light blue so the
-    // user sees the cursor sprite over the expected background.
+    uint16_t bplcon0 = regs[0x100 >> 1];
+    int  bpu   = (bplcon0 >> 12) & 0x7;
+    bool hires = (bplcon0 >> 15) & 1;
+    // Background COLOR00 fill.  K1.3's boot prompt list doesn't set
+    // COLOR00; fall back to the canonical WB light blue.
     uint16_t c00 = regs[0x180 >> 1];
-    if (c00 == 0) c00 = 0x0AAF;  // light blue Workbench background
+    if (c00 == 0) c00 = 0x0AAF;
     uint32_t bg = amiga4_to_argb(c00);
     for (int i = 0; i < w * h; i++) buf[i] = bg;
-    // Only render sprite 0 (the boot mouse cursor).  Sprites 1..7 in
-    // K1.3's idle state all share the same dummy pointer at \$23C0, which
-    // is end-of-Copper-list data — interpreting it as sprite POS/CTL
-    // gives a bogus 36-row sprite at (0,0).  The Python reference tool
-    // (tools/render_k13_screen.py) likewise renders SPR0 only.
+    // Bitplane render.  HIRES: 80 bytes/row/plane.  LORES: 40 bytes/row.
+    if (bpu > 0 && bpu <= 6) {
+        const int amiga_w = hires ? 640 : 320;
+        const int bpr     = amiga_w / 8;  // bytes per row per plane
+        uint32_t bplpt[6];
+        for (int p = 0; p < bpu; p++) {
+            uint16_t hi = regs[(0x0E0 + p * 4) >> 1];
+            uint16_t lo = regs[(0x0E2 + p * 4) >> 1];
+            bplpt[p] = ((uint32_t(hi) << 16) | uint32_t(lo)) & 0xFFFFFu;
+        }
+        // Build a 4-/16-/64-entry palette from COLOR00..n.
+        int npal = 1 << bpu;
+        if (npal > 32) npal = 32;
+        uint32_t pal[32];
+        for (int i = 0; i < npal; i++) {
+            uint16_t c = regs[(0x180 + i * 2) >> 1];
+            if (i == 0) c = c00;
+            pal[i] = amiga4_to_argb(c);
+        }
+        // Render scanlines.  Display rows are typically vstart..vstop
+        // around lines $2C..$F2 for NTSC; for the SDL window we just
+        // start at y=0 and walk until we hit FB_H.  Plane data is
+        // packed: byte_idx 0 covers pixels 0..7, MSB = leftmost.
+        for (int y = 0; y < h; y++) {
+            uint32_t row_off = uint32_t(y) * bpr;
+            for (int bx = 0; bx < bpr; bx++) {
+                uint8_t plane_byte[6] = {0};
+                for (int p = 0; p < bpu; p++) {
+                    uint32_t addr = bplpt[p] + row_off + bx;
+                    if (addr + 1 < 0x80000) {
+                        // Read chip RAM byte at addr.
+                        uint32_t w32 = mem_peek_word(top, addr & ~3u);
+                        plane_byte[p] = uint8_t((w32 >> ((3 - (addr & 3)) * 8)) & 0xFF);
+                    }
+                }
+                for (int b = 0; b < 8; b++) {
+                    int x_amiga = bx * 8 + b;
+                    // Show one Amiga pixel per SDL pixel; HIRES gets
+                    // truncated past x=FB_W.
+                    int x = x_amiga;
+                    if (x >= w) break;
+                    int idx = 0;
+                    for (int p = 0; p < bpu; p++) {
+                        if (plane_byte[p] & (0x80 >> b)) idx |= (1 << p);
+                    }
+                    if (idx > 0 && idx < npal) {
+                        buf[y * w + x] = pal[idx];
+                    }
+                }
+            }
+        }
+    }
+    // Sprite 0 last (overlays the bitmap layer).
     uint32_t sprpt = (uint32_t(regs[0x120 >> 1]) << 16) |
                      uint32_t(regs[0x122 >> 1]);
     sprpt &= 0xFFFFFu;
