@@ -775,7 +775,7 @@ kickstart-graphics:
 	@echo "Launching Kickstart 1.3 in graphics mode."
 	@echo "  Window shows K1.3's Copper-list-rendered screen (background + sprites)."
 	@echo "  Press ESC or close the window to quit."
-	@(cd build_kick_gfx && RENDER_K13_COP1LC=0x2368 ./Vm68k_top $${ROMCYCLES:-1500000000} --graphics)
+	@(cd build_kick_gfx && RENDER_K13_COP1LC=auto ./Vm68k_top $${ROMCYCLES:-1500000000} --graphics)
 
 # ---------------------------------------------------------------------------
 # Block-device DMA test.  Builds with a tiny disk image (tests/disk_test.hex)

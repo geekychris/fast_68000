@@ -218,6 +218,38 @@ static uint32_t amiga4_to_argb(uint16_t c12) {
            uint32_t((b << 4) | b);
 }
 
+// Scan chip RAM for an Intuition-style WB1.3 Copper list and return its
+// head address (chip byte offset).  The signature is the canonical WB
+// palette intro:
+//   MOVE \$005A -> COLOR00 ($0180)  =  word stream {$0180, $005A}
+//   MOVE \$0FFF -> COLOR01 ($0182)  =  word stream {$0182, $0FFF}
+// When that 4-word pattern is found, walk back up to 8 bytes to the
+// preceding WAIT (low bit of word 1 = 1, low bit of word 2 = 0) and
+// use that as the list head.  Returns 0 if no match.
+//
+// Mirrors tools/render_k13_screen.py::autodetect_intuition_copper().
+static uint32_t k13_autodetect_cop1lc(Vm68k_top* top) {
+    // Sweep chip RAM in word-aligned strides.  Chip RAM is 512 KB =
+    // 262144 16-bit words.  Cost: ~1M word reads per scan ≈ negligible.
+    for (uint32_t a = 0; a + 8 <= 0x80000u; a += 2) {
+        if (chip_word(top, a)       == 0x0180 &&
+            chip_word(top, a + 2)   == 0x005A &&
+            chip_word(top, a + 4)   == 0x0182 &&
+            chip_word(top, a + 6)   == 0x0FFF) {
+            // Found.  Walk back up to 8 bytes for a preceding WAIT.
+            for (int back = 4; back <= 8; back += 4) {
+                if (back > (int)a) break;
+                uint32_t cand = a - back;
+                uint16_t w1 = chip_word(top, cand);
+                uint16_t w2 = chip_word(top, cand + 2);
+                if ((w1 & 1) && !(w2 & 1)) return cand;
+            }
+            return a;
+        }
+    }
+    return 0;
+}
+
 // Walk the Copper list rooted at cop1lc (chip-RAM byte address); update
 // the regs array (16-bit entries, indexed by chip-reg offset/2 in
 // $000..$1FE).  Stops at end-of-list (WAIT $FFFF) or instruction-budget.
@@ -1021,9 +1053,25 @@ static int run_graphics(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
     // K1.3 chipram-render mode: when RENDER_K13_COP1LC is set, ignore the
     // chunky framebuffer and instead walk Kickstart's Copper list each
     // frame to produce the visible screen.  Used by `make kickstart-graphics`.
+    //
+    // RENDER_K13_COP1LC=auto enables per-frame autodetect of Intuition's
+    // active WB1.3 Copper list (by scanning chip RAM for the COLOR00=\$005A
+    // + COLOR01=\$0FFF signature).  Until the list appears, the screen
+    // stays blank.  This is the right default for live K1.3+WB1.3 boots
+    // because Intuition allocates the list wherever — \$2368 is the legacy
+    // chip layout and \$100C8 is what we've seen on a recent WB1.3 boot.
+    //
+    // Any other value (e.g. RENDER_K13_COP1LC=0x100C8) locks the renderer
+    // to that fixed address.
     uint32_t k13_cop1lc = 0;
+    bool     k13_auto   = false;
     if (const char* s = std::getenv("RENDER_K13_COP1LC")) {
-        k13_cop1lc = uint32_t(std::strtoul(s, nullptr, 0));
+        if (std::strcmp(s, "auto") == 0) {
+            k13_auto   = true;
+            k13_cop1lc = 0;   // populated each frame
+        } else {
+            k13_cop1lc = uint32_t(std::strtoul(s, nullptr, 0));
+        }
     }
 
     using clk_t = std::chrono::steady_clock;
@@ -1150,6 +1198,23 @@ static int run_graphics(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
         next_render = now + std::chrono::milliseconds(WALL_FRAME_MS);
 
         // K1.3 mode: walk the Copper list each frame; skip chunky-FB sampling.
+        // In autodetect mode, refresh k13_cop1lc each frame.  Once Intuition's
+        // list lands in chip RAM (typically at \$100C8 on a real K1.3+WB1.3
+        // boot), the scan finds it and the renderer starts producing the
+        // Workbench screen.  Until then, the screen stays at whatever the
+        // last render produced (initially the SDL clear color).
+        if (k13_auto) {
+            static uint32_t last_found = 0;
+            uint32_t found = k13_autodetect_cop1lc(top);
+            if (found) {
+                if (found != last_found) {
+                    std::printf("[sim] RENDER_K13_COP1LC=auto: locked onto "
+                                "Intuition Copper list at $%X\n", found);
+                    last_found = found;
+                }
+                k13_cop1lc = found;
+            }
+        }
         if (k13_cop1lc) {
             render_k13_chipram(top, k13_cop1lc, pixel_buf, FB_W, FB_H);
             top->fb_peek_addr = 0;
