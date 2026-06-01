@@ -716,6 +716,27 @@ test-kickstart-boot:
 	fi
 
 # ---------------------------------------------------------------------------
+# wb-screenshot: boot K1.3 + WB1.3 with BOOT_TRACE=0 (fast), dump chip RAM
+# at the end, and render the Workbench display to a PNG.  The render tool
+# autodetects Intuition's active Copper list (no manual --cop1lc needed).
+# ---------------------------------------------------------------------------
+.PHONY: wb-screenshot
+wb-screenshot:
+	@echo "Booting K1.3 + WB1.3 (BOOT_TRACE=0 for speed)..."
+	BOOT_TRACE=0 \
+	    CHIPRAM_DUMP=/tmp/wb_chipram.bin \
+	    SLOWRAM_DUMP=/tmp/wb_slowram.bin \
+	    $(MAKE) --no-print-directory test-kickstart-boot \
+	    ADFFILE=kickstart/wb13.adf 2>&1 | tail -8 || true
+	@echo "Rendering Workbench screen..."
+	$(PYTHON) tools/render_k13_screen.py \
+	    --chipram /tmp/wb_chipram.bin \
+	    --slowram /tmp/wb_slowram.bin \
+	    --out /tmp/wb_screen.png
+	@echo "Saved /tmp/wb_screen.png"
+	@if command -v open >/dev/null 2>&1; then open /tmp/wb_screen.png; fi
+
+# ---------------------------------------------------------------------------
 # kickstart-graphics: same build pipeline as test-kickstart-boot but with
 # WITH_SDL2=1 and FB_W=320 / FB_H=200 so we can see K1.3's screen live.
 # Pass --graphics and RENDER_K13_COP1LC=$$0x2368 to sim_main so the SDL
