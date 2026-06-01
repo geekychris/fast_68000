@@ -1108,7 +1108,22 @@ static int run_graphics(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
 
     uint64_t cycle = 0;
     bool quit = false;
+    // Periodic heartbeat so a long quiet boot (BOOT_TRACE=0 silences all
+    // RESINIT / STOP traces) doesn't look hung.
+    auto last_heartbeat = clk_t::now();
     while (!quit && cycle < max_cycles && !all_halted()) {
+        {
+            auto now2 = clk_t::now();
+            if (now2 - last_heartbeat > std::chrono::seconds(15)) {
+                last_heartbeat = now2;
+                const uint32_t* rarr =
+                    reinterpret_cast<const uint32_t*>(&top->retired_flat);
+                std::printf("[sim] heartbeat: cycle=%llu retired=%u "
+                            "k13_cop1lc=$%X\n",
+                            (unsigned long long)cycle, rarr[0], k13_cop1lc);
+                std::fflush(stdout);
+            }
+        }
         // Push mouse state every batch.  These are level signals — the bus
         // samples them whenever JOY0DAT / POTGOR is read.  CIA-A's PRA
         // input is similarly level-sensitive (Workbench polls it via the
