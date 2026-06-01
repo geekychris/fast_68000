@@ -303,6 +303,42 @@ def try_render_sprite(img, chip, sprpt, sim, idx, palette):
         safety -= 1
 
 
+def autodetect_intuition_copper(chip):
+    """Scan chip RAM for an Intuition-style WB Copper list.
+
+    The Intuition WB1.3 Copper list always sets COLOR00=$005A (dark
+    blue WB background) early.  Look for the MOVE-instruction
+    signature 01 80 00 5A in chip RAM, then walk back to the first
+    WAIT before it — that's the list head.
+
+    Returns the address (chip offset) of the discovered list, or
+    None if no match.
+    """
+    # Prefer the longer signature COLOR00=\$005A + COLOR01=\$0FFF (8 bytes)
+    # which uniquely matches the Intuition WB palette intro.  Fall back to
+    # the 4-byte COLOR00 signature if the longer one isn't found (e.g. the
+    # boot-default Copper list at \$0420 only sets COLOR00).
+    long_sig  = b'\x01\x80\x00\x5A\x01\x82\x0F\xFF'
+    short_sig = b'\x01\x80\x00\x5A'
+    idx = chip.find(long_sig)
+    if idx < 0:
+        idx = chip.find(short_sig)
+    if idx < 0:
+        return None
+    # Walk back up to 32 bytes to find a WAIT (low bit of first word
+    # of a Copper instruction = 1, and the second word's low bit = 0
+    # for WAIT, =1 for SKIP).
+    for back in range(0, 33, 4):
+        a = idx - back
+        if a < 0: break
+        w1 = (chip[a] << 8) | chip[a+1]
+        w2 = (chip[a+2] << 8) | chip[a+3]
+        if (w1 & 1) and not (w2 & 1):
+            return a
+    # No WAIT found; just return the MOVE address.
+    return idx
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--chipram', default='build_kick_boot/chipram.bin')
@@ -311,10 +347,11 @@ def main():
                          'When set, the Copper list and bitplanes can live in '
                          'slow RAM (the post-26f2f86 K1.3 boot layout).')
     ap.add_argument('--out',     default='build_kick_boot/k13_render.png')
-    ap.add_argument('--cop1lc',  default='0x2368',
-                    help='Address of K1.3 Copper list. Defaults to \$2368 '
-                         '(chip-RAM layout); with --slowram set, try '
-                         '\$00C00276 for the slow-RAM boot copper list.')
+    ap.add_argument('--cop1lc',  default=None,
+                    help='Address of K1.3 Copper list. If omitted, auto-detect '
+                         'Intuition\'s active list by scanning for the '
+                         'COLOR00=\$005A signature.  Override with --cop1lc '
+                         '\$2368 (legacy chip layout) or \$00C00276 (slow RAM).')
     ap.add_argument('--cop2lc',  default='0x23bc')
     ap.add_argument('--width',   type=int, default=320)
     ap.add_argument('--height',  type=int, default=200)
@@ -329,7 +366,17 @@ def main():
     else:
         mem = chip
 
-    cop1lc = int(args.cop1lc, 0)
+    if args.cop1lc is None:
+        cop1lc = autodetect_intuition_copper(chip)
+        if cop1lc is None:
+            print('autodetect: no Intuition Copper list found '
+                  '(no COLOR00=\$005A signature in chip RAM).  '
+                  'Falling back to \$2368.')
+            cop1lc = 0x2368
+        else:
+            print(f'autodetect: found Intuition Copper list at \${cop1lc:X}')
+    else:
+        cop1lc = int(args.cop1lc, 0)
     cop2lc = int(args.cop2lc, 0)
     print(f"Rendering K1.3 screen: chipram={args.chipram} "
           f"slowram={args.slowram} cop1lc=${cop1lc:X}")
