@@ -768,12 +768,17 @@ kickstart-graphics:
 	    MEM_WORDS=131072 ROM_WORDS=$(ROMSIZE_WORDS) ROM_HEXFILE=rom.hex OVL_RESET=1 \
 	    DISK_WORDS=$$DISK_WORDS_USED DISK_HEXFILE=disk.hex \
 	    WITH_SDL2=1 FB_W=320 \
-	    VERI_DEFS='+define+KICKSTART_BOOT +define+KICKSTART_FAST_BOOT +define+KICKSTART_BOOT_TRACE $(EXTRA_VERI_DEFS)' \
+	    VERI_DEFS='+define+KICKSTART_BOOT +define+KICKSTART_FAST_BOOT $(BOOT_TRACE_DEF) $(EXTRA_VERI_DEFS)' \
 	    >build_kick_gfx/_build.log 2>&1
 	$(PYTHON) $(TB_DIR)/asm68k.py tests/t63_boot_rom.s build_kick_gfx/program.hex
 	@echo
 	@echo "Launching Kickstart 1.3 in graphics mode."
 	@echo "  Window shows K1.3's Copper-list-rendered screen (background + sprites)."
+	@echo "  Renderer autodetects Intuition's WB1.3 Copper list each frame."
+	@echo "  Until that list lands in chip RAM the window stays black."
+	@echo "  Console will print '[sim] RENDER_K13_COP1LC=auto: locked onto'"
+	@echo "  when the WB screen goes live."
+	@echo "  BOOT_TRACE=$(BOOT_TRACE) — set BOOT_TRACE=0 for faster (no debug \$$display) sim."
 	@echo "  Press ESC or close the window to quit."
 	@(cd build_kick_gfx && RENDER_K13_COP1LC=auto ./Vm68k_top $${ROMCYCLES:-1500000000} --graphics)
 
