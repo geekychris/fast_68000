@@ -3036,6 +3036,20 @@ module m68k_core #(
                     retired, ex_pc, dc_addr, dc_wdata, dc_be, dc_is_long);
             end
 `endif
+`ifdef BLT_DAT_2AAA_PC_TRACE
+            // CPU-side companion to bus-side [BLT_DAT_2AAA]: fires on the
+            // CPU write to BLTADAT/BLTBDAT/BLTCDAT with $2AAA, printing PC.
+            // Note: dc_addr is the longword-aligned address, so $DFF070
+            // matches both 16-bit halves; we filter on the wdata word
+            // matching $2AAA in either half.
+            if (dc_we &&
+                (dc_addr == 32'h00DF_F070 || dc_addr == 32'h00DF_F074) &&
+                (dc_wdata[31:16] == 16'h2AAA ||
+                 dc_wdata[15:0]  == 16'h2AAA)) begin
+                $display("[BLT_DAT_2AAA_PC] r=%d pc=%h dc_addr=%h dc_wdata=%h dc_be=%b",
+                    retired, ex_pc, dc_addr, dc_wdata, dc_be);
+            end
+`endif
 `ifdef KICKSTART_TRACKDISK_TRACE
             // Wider window trace: K1.3 trackdisk decoder PCs during the
             // validation window.  Open r=2.0M..5.0M after the snoop fix

@@ -1457,6 +1457,26 @@ module m68k_bus #(
 
             // Snoop BPLCON0 writes (at canonical $DFF100) so the DMA
             // engine sees the BPU bits.  Denise owns the same address
+`ifdef BLT_DAT_2AAA_TRACE
+            // Trace any CPU write to a blitter data register where data
+            // half == $2AAA (Intuition's inactive-window 50% gray fill
+            // pattern, per WB13_DEBUG_JOURNAL §29).
+            //   $DFF070 = BLTCDAT
+            //   $DFF072 = BLTBDAT
+            //   $DFF074 = BLTADAT
+            // Whoever writes $2AAA here picked "draw inactive" — finding
+            // their K1.3 ROM PC is the next step toward identifying the
+            // active/inactive predicate.
+            if (winner_valid && we[winner] &&
+                (addr[winner] == 32'h00DF_F070 ||
+                 addr[winner] == 32'h00DF_F072 ||
+                 addr[winner] == 32'h00DF_F074) &&
+                (wdata[winner][31:16] == 16'h2AAA ||
+                 wdata[winner][15:0]  == 16'h2AAA)) begin
+                $display("[BLT_DAT_2AAA] port=%0d addr=%h wdata=%h be=%b is_long=%b",
+                    winner, addr[winner], wdata[winner], be[winner], is_long[winner]);
+            end
+`endif
             // for its own register file; this snoop is in parallel.
             if (winner_valid && we[winner] && (addr[winner] == 32'h00DF_F100)) begin
                 // 16-bit BPLCON0 lives in the high half of the long
