@@ -1888,6 +1888,18 @@ module m68k_bus #(
                     $display("[SLOW-WR] addr=%h be=%b wdata=%h port=%0d",
                         addr[winner], be[winner], wdata[winner], winner);
 `endif
+`ifdef ACTIVE_SCREEN_SLOT_TRACE
+                // Trace any slow-RAM write landing at $C0605C..$C06063 — the
+                // IntuitionBase (ActiveWindow, ActiveScreen) slot pair per
+                // WB13_DEBUG_JOURNAL §30.  Tells us:
+                //   (a) does anything ever write to the ActiveScreen slot
+                //       at $C06060? (we end up with NULL there)
+                //   (b) if so, what value + what writer?
+                if (addr[winner] >= 32'h00C0_605C && addr[winner] <= 32'h00C0_6063) begin
+                    $display("[ACT_SLOT_WR] port=%0d addr=%h be=%b wdata=%h is_long=%b",
+                        winner, addr[winner], be[winner], wdata[winner], is_long[winner]);
+                end
+`endif
 `ifdef KICKSTART_BOOT
             end else if (winner_valid && we[winner] &&
                         (addr[winner] >= (MEM_WORDS << 2))) begin
