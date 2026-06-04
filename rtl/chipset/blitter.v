@@ -978,7 +978,13 @@ module blitter (
 
                         step_sub = ~bltapt[31];
 
-                        // Decide axis activation per octant.
+                        // Decide axis activation per octant.  Internal
+                        // convention: aul=0 → X dominant, aul=1 → Y dominant.
+                        // The m68k_bus.v translation INVERTS the real-Amiga
+                        // BLTCON1[4] = AUL bit (which has the opposite sense:
+                        // 1 = X dominant per FS-UAE blitter.cpp).  Tests that
+                        // write the blitter's internal format directly
+                        // (t22_blt_line) use this convention as-is.
                         if (!aul) begin
                             do_x   = 1'b1;
                             do_y   = step_sub;

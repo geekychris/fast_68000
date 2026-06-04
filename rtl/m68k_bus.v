@@ -987,6 +987,13 @@ module m68k_bus #(
             5'd0: begin                       // BLTCON0 ($DFF040)
                 blt_xlat_valid = 1'b1;
                 blt_xlat_addr  = 6'h00;
+                // Line-mode oct[2:0] = {SUD, SUL, AUL} maps to real-Amiga
+                // BLTCON1 bits {[2], [3], ~[4]} per FS-UAE blitter.cpp and
+                // minimig agnus_blitter.v.  Pre-fix mapping used
+                // canon_bltcon1[3:1] which read SUL/SUD swapped + AUL=SING.
+                // The ~[4] inversion converts FS-UAE's AUL convention
+                // (1=X dominant) to our internal aul convention
+                // (0=X dominant).  See tests/t160_line_vertical.s.
                 blt_xlat_wdata = {
                     amiga_wdata_half[7:0],       // LF       [31:24]
                     amiga_wdata_half[15:12],     // ASH      [23:20]
@@ -996,7 +1003,9 @@ module m68k_bus #(
                     canon_bltcon1[4],            // EFE      [13]
                     canon_bltcon1[2],            // FCI      [12]
                     canon_bltcon1[0],            // LINE     [11]
-                    canon_bltcon1[3:1],          // oct      [10:8]
+                    canon_bltcon1[2],            // SUD      [10]  (was [3])
+                    canon_bltcon1[3],            // SUL      [9]   (was [2])
+                    ~canon_bltcon1[4],           // AUL      [8]   (was [1], now inverted)
                     4'd0,                        //          [7:4]
                     amiga_wdata_half[11:8]       // USEA-D   [3:0]
                 };
@@ -1013,7 +1022,9 @@ module m68k_bus #(
                     amiga_wdata_half[4],
                     amiga_wdata_half[2],
                     amiga_wdata_half[0],
-                    amiga_wdata_half[3:1],
+                    amiga_wdata_half[2],         // SUD  (was [3])
+                    amiga_wdata_half[3],         // SUL  (was [2])
+                    ~amiga_wdata_half[4],        // AUL  (was [1], now inverted)
                     4'd0,
                     canon_bltcon0[11:8]
                 };
