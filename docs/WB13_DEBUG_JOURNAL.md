@@ -3386,3 +3386,50 @@ field that doesn't exist.
 The pristine target in §33-§35 (via MEM_POKE) was the visual
 goalpost.  This §38d render achieves it for real, with no patches.
 
+
+---
+
+## §39. Post-fix coverage analysis + CLI banner remains the gap (2026-06-04)
+
+Inspected the post-USE_A-fix chip-RAM dump:
+
+| BPL1 region                    | Nonzero bytes | Notes |
+| ------------------------------ | ------------- | ----- |
+| Title bar (rows 0–9, 800 B)    | 792/800       | ~Solid white with text-glyph cutouts |
+| CLI banner (rows 11–32, 1760 B)| 63/1760       | **Empty** — same as pre-fix |
+| Mid-screen (rows 50–100, 4000B)| 94/4000       | Disk-icon glyphs + labels |
+| Lower screen (rows 150–199)    | 0/4000        | Backdrop |
+| Runs of 8×`$FF`                | 81            | vs 0 pre-fix |
+
+So the USE_A=0 fix bumped solid-white runs from 0 to 81 — visible
+as the solid title bar + disk-icon label backgrounds + WB Backdrop
+borders.  Big improvement.
+
+But the CLI banner area (rows 11–32) is still essentially empty.
+That's a *separate* boot gap from the title-bar fill one — CLI's
+DOS `Write()` → console.device → `Text()` glyph-paint pipeline.
+Either:
+1. The Text() glyph blits never fire (CLI process stalled before
+   reaching Write or console.device didn't map the file handle)
+2. They fire but write to a different destination than $6168
+3. They fire to $6168 but with a buggy LF/USE setup that produces
+   empty output
+
+To pick between (1)/(2)/(3), added a sibling probe `BLT_START_BANNER_TRACE`
+in `rtl/chipset/blitter.v` that fires for any blit whose `bltdpt`
+∈ [$6168, $7158] (CLI banner rows).  Result lands in §40.
+
+### §39a. The Workbench desktop side already looks correct
+
+The disk-icon area (RAM DISK, Workbench1.3, trash cans) renders
+correctly now — the icon graphics, the icon labels, even the
+title bar text "Workbench release. 888272 free bytes".  That's
+because the WB Backdrop window is the active/front window and
+Intuition is correctly painting it (via the USE_A=0 LF=$CA blits
+that the fix unblocked).  See
+`screenshots/20260604_125444_wb13_NATURAL_no_mempoke_post_usea_fix.png`.
+
+The remaining "CLI banner missing" gap is fundamentally a
+different code path (CLI process state vs Intuition frame
+draw), so it gets its own diary thread.
+

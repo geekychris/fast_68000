@@ -514,6 +514,19 @@ module blitter (
                                     bltafwm[15:0], bltalwm[15:0]);
                             end
 `endif
+`ifdef BLT_START_BANNER_TRACE
+                            // Same shape but for the CLI banner text area:
+                            // BPL1 rows 11..32 = $6168..$7158.  Tells us
+                            // whether Intuition's Text() ever issues glyph
+                            // blits for the CLI "Release 1.3 ..." banner.
+                            if (bltdpt[23:0] >= 24'h00_6168 &&
+                                bltdpt[23:0] <= 24'h00_7158) begin
+                                $display("[BLT_START_BANNER] bltcon=%h bltapt=%h bltbpt=%h bltcpt=%h bltdpt=%h bltsize=%h adat_pre=%h bdat_pre=%h cdat_pre=%h afwm=%h alwm=%h",
+                                    bltcon, bltapt, bltbpt, bltcpt, bltdpt, slv_wdata[15:0],
+                                    bltadat_pre[15:0], bltbdat_pre[15:0], bltcdat_pre[15:0],
+                                    bltafwm[15:0], bltalwm[15:0]);
+                            end
+`endif
 `ifdef KICKSTART_BOOT_TRACE
                             $display("[BLT_START] bltcon=%h bltapt=%h bltbpt=%h bltcpt=%h bltdpt=%h bltsize=%h bltamod=%h bltbmod=%h bltcmod=%h bltdmod=%h",
                                 bltcon, bltapt, bltbpt, bltcpt, bltdpt, slv_wdata[15:0],
