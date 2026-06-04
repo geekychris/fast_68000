@@ -104,6 +104,8 @@ def dump_window(addr, r8, r16, r32, rstr):
             t_str = rstr(t_str_ptr) if t_str_ptr else None
             left = r16(req_text + 0x04)
             top = r16(req_text + 0x06)
+            if t_str_ptr is None or left is None or top is None:
+                break
             print(f"      @({left:>3},{top:>3}) [{t_str_ptr:08X}] {t_str!r}")
             req_text = r32(req_text + 0x10)  # NextText
             if req_text == 0:
@@ -147,7 +149,12 @@ def main():
     for buf_name, buf, base in [('chip', chip, 0), ('slow', slow, SLOW_BASE)]:
         for off in range(0, len(buf) - 0x60, 2):
             t = struct.unpack('>I', buf[off + 0x20:off + 0x24])[0]
-            if ROM_BASE <= t < ROM_BASE + len(rom):
+            # Window.Title can live in ROM (Kickstart-supplied titles like
+            # "Workbench") or in slow RAM (titles from disk-loaded DOS
+            # commands like CON: "AmigaDOS").  Accept both.
+            in_rom  = ROM_BASE <= t < ROM_BASE + len(rom)
+            in_slow = SLOW_BASE <= t < SLOW_BASE + len(slow)
+            if in_rom or in_slow:
                 s = rstr(t)
                 if s and len(s) >= 3 and len(s) <= 40:
                     # Verify width/height look like reasonable Intuition values

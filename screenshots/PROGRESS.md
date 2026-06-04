@@ -147,27 +147,41 @@ Side-by-side at the same idle point:
 | ------------------------------------------------------ | ------------------------------------------------------ |
 | ![](20260604_102517_wb13_autodetect_640.png) | ![](20260604_102517_fsuae_reference_640.png) |
 
-Visible gaps:
+### Structural state: identical to FS-UAE
 
-- **Solid title bar with "AmigaDOS"** missing. Top-row bitplane bytes
-  are `$2A AA $2A AA …` (50% stipple — Workbench Screen depth-bar
-  pattern, indicating CLI window is INACTIVE and depth-arranged
-  behind WB Backdrop). FS-UAE shows `$FF FF $FF FF …` solid (CLI
-  active, front).
-- **CLI banner text** missing. FS-UAE has 1908 nonzero bytes in BPL1
-  vs our 922 — chip RAM positively does not contain the rendered
-  "Release 1.3" glyphs; CLI's `Write()` path emits the bytes to
-  console.device but Text() never paints them into the screen bitmap.
-- **Lower screen** mostly empty in both, which is correct (WB1.3 has
-  empty backdrop until user opens windows or DF0 mounts).
+`tools/dump_intui_windows.py` (extended this session to also walk
+slow-RAM titles) finds the same `Window @ $C05E90 Title='AmigaDOS'
+Size=640×200 Flags=$00023007 UserPort=$00000000` in both systems.
+Workbench Backdrop window at $C0BBB8, icon.library structures, all
+present. The CLI Window struct exists and matches FS-UAE byte-for-byte
+in the fields that matter.
+
+### Visible gap: Intuition's title-bar/text render never ran
+
+The chip RAM **does not contain** the pixels that should be there:
+
+- Zero runs of 6+ bytes of `$FF` anywhere in our chip RAM. FS-UAE has
+  437 runs of 8+ bytes of `$FF` (the CLI title bar background and the
+  inside of every solid-text-glyph row).
+- BPL1 nonzero coverage: ours 922 bytes (5.8%) vs FS-UAE 1908 bytes
+  (11.9%). The ~1000-byte difference is exactly the "Copyright 1987"
+  banner block + "Monday 01-Jun-26 10:42:45" date line.
+- Top 10 rows are `$2A AA $2A AA …` (50% stipple, Intuition's Screen
+  depth-bar fill pattern) instead of FS-UAE's `$FF FF` (the CLI
+  window's title bar background rectangle that Intuition's window-open
+  routine would have filled).
+
+So Intuition never executed the title-bar background fill / glyph
+blit for the CLI window even though the Window struct is fully
+initialized. The boot reaches Workbench-idle with all OS data
+structures wired correctly, but the visible pixels for the CLI window
+were never painted into the screen bitmap. This is the actual next
+boot wall.
 
 The icons + RAM DISK area in our top-right matches FS-UAE — that's
-Workbench drawing its disk icons (BCPL routine succeeded). Confirmed
-end-of-boot reach with chip-RAM structures: Workbench Window @
-$C0BBB8, Workbench Screen open, msgs empty, sleeping on Wait — same
-final state as FS-UAE.
-
-The remaining work is depth-arranging the CLI window to front
-(activates title bar + redraws banner). MOUSE_AUTO_CLICK demonstrated
-the input path; making it click the CLI window's depth gadget is the
-next step.
+Workbench drawing its disk icons (BCPL routine succeeded).
+MOUSE_AUTO_CLICK was tried to activate the CLI window; the 8-bit
+quadrature counter wraps gracefully so 624 px is reachable, but
+clicking a struct whose pixels were never painted doesn't bring
+content back — Intuition has no refresh path that re-emits the title
+bar glyphs out of thin air.
