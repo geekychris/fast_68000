@@ -4283,3 +4283,115 @@ Re-labelling the open items based on §53:
 Net: the WB1.3 desktop rendering is **substantively correct**.
 Remaining gaps are CLI/Intuition-side, not blitter.
 
+
+---
+
+## §54. Real RTL bug found: line-mode BLTCON1 bit mapping (2026-06-04)
+
+User pushback: "however the os works fine on real hardware.  These
+issues must be with the RTL".  That sharper framing motivated a
+re-examination of the line-mode code path.
+
+### §54a. The bug
+
+`rtl/m68k_bus.v` translates canonical Amiga BLTCON1 ($DFF042) writes
+into the blitter's internal 32-bit `bltcon` register.  Pre-fix mapping:
+
+```verilog
+canon_bltcon1[3:1]   →  oct[10:8] = {SUD, SUL, AUL}
+```
+
+Per FS-UAE `blitter.cpp` lines 725-747 and minimig
+`agnus_blitter.v`, the canonical Amiga BLTCON1 bits are:
+
+| Bit | Meaning                          |
+| --- | -------------------------------- |
+| 4   | AUL (1 = X dominant, FS-UAE convention) |
+| 3   | SUL (sign of subordinate)        |
+| 2   | SUD (sign of dominant)           |
+| 1   | SING (single-pixel-per-line)     |
+| 0   | LINE (1 = line mode)             |
+
+Our `[3:1]` mapping was off-by-one + had AUL swapped with SING:
+
+| Slot       | Read from              | Should be              |
+| ---------- | ---------------------- | ---------------------- |
+| `sud` (10) | `canon_bltcon1[3]`     | `canon_bltcon1[2]`     |
+| `sul` (9)  | `canon_bltcon1[2]`     | `canon_bltcon1[3]`     |
+| `aul` (8)  | `canon_bltcon1[1]`     | `~canon_bltcon1[4]`    |
+
+The `~` inversion handles the convention difference: FS-UAE / HRM use
+AUL=1 → X dominant; our internal S_LSTEP uses aul=0 → X dominant.
+Since legacy register-window tests (t22_blt_line) write the internal
+format directly through `$00FE0000` and bypass the translation, the
+S_LSTEP convention has to stay as-is — the inversion lives in the
+bus adapter only.
+
+### §54b. Effect on K1.3 / WB1.3
+
+The OS issues blits for window borders, line draws, etc.  With the
+bit-mapping bug, vertical lines (AUL=0 in FS-UAE → real AUL bit clear)
+were misread as our `aul = SING = 0` which we treat as X-dominant.
+So a "draw a vertical line down" command became "draw a horizontal
+line right" — the destination pointer walked off the intended scanline
+and ended up off-bitmap.
+
+Task #130 in the journal ("Find why K1.3 line-draw bltdpt=$762C maps
+off-bitmap") was a symptom of THIS bug.  The
+`BLT_MFM_BUFFER_GUARD` `+define` (also still alive in the code) caught
+the bad-destination line writes mid-flight and let the blit complete
+without corrupting MFM buffer state — but that was a symptom-mask,
+not a real fix.
+
+### §54c. The fix
+
+`rtl/m68k_bus.v` BLTCON0 + BLTCON1 write paths (lines 990-1019):
+```verilog
+// SUD = canon_bltcon1[2] (was [3])
+// SUL = canon_bltcon1[3] (was [2])
+// AUL = ~canon_bltcon1[4] (was [1], now inverted)
+```
+
+S_LSTEP in `rtl/chipset/blitter.v` keeps its existing
+"aul=0 → X dominant" convention — the inversion in the bus adapter
+makes the FS-UAE/HRM external convention compatible with that.
+
+### §54d. Regression test
+
+`tests/t160_line_vertical.s`: pure-vertical 8-pixel line down at
+column 8 of a 1-word-wide bitmap.  Pre-fix produced a single pixel at
+$1000 plus 7 wrong pixels at line_pos=6 marching across columns.
+Post-fix produces $0080 at each of $1000, $1002, ..., $100E.
+
+Full suite: **152 / 152**.
+
+### §54e. WB1.3 visible-state change
+
+`make wb-screenshot` post-fix produces the same visible desktop as
+pre-fix — title bar, RAM Disk, Workbench1.3, Trashcan, mouse cursor
+all rendering correctly.  The WB Backdrop right border (the 2-pixel
+$0003 vertical line down the right edge in FS-UAE's chip RAM at byte
+[78:80] of every row) is **still empty** in ours.
+
+That means either:
+1. K1.3/Intuition draws the right border via `RectFill` (1-word-wide
+   solid bar), not line mode — so this fix doesn't reach it
+2. The border draw is line mode but doesn't fire at all in our boot
+   (some upstream gate)
+
+Future investigation can probe the BLT_BASE address writes during
+the WB Backdrop "open" path and see which fires.  The §54 fix is
+landed regardless — it's correct per FS-UAE/minimig and unblocks
+any future line-mode work.
+
+### §54f. The user's framing was right
+
+"If the OS works on real hardware, divergence is RTL."  The §53
+correction had concluded the remaining gaps were OS-side; that was
+not the right conclusion.  Same ROM, same instruction stream — if
+pixels differ, RTL differs.  This §54 fix proves it: a real line-mode
+bug was hiding behind the §53 "OS-side" framing.
+
+There are likely more such bugs.  Each visible pixel-level divergence
+between our boot and FS-UAE/real-Amiga is a candidate.
+
