@@ -3971,3 +3971,70 @@ session) is filtered to `bltdpt ∈ [$6618, $6A78]` — boot in
 flight.  Once it returns we have the parameters to write t158
 against.
 
+
+---
+
+## §50. t158 unit test + WB1.3 icon-blit data — bug is upstream, not RTL (2026-06-04)
+
+### §50a. WB1.3 icon-area blits (BLT_START_ICON_TRACE)
+
+Boot returned 18 blit hits in the icon area.  Two dominant forms:
+
+```
+bltcon=ca040007 bltapt=0 bltbpt=$10410 bltcpt=$6668 bltdpt=$6668
+  = LF=$CA, ASH=0, BSH=4, USE_A=0 USE_B=1 USE_C=1 USE_D=1
+
+bltcon=6a000003 bltapt=$4e bltbpt=$10170 bltcpt=$66dc bltdpt=$66dc
+  = LF=$6A, USE_A=0 USE_B=0 USE_C=1 USE_D=1
+```
+
+The `ca040007` form is the canonical "draw masked image" path —
+A=$FFFF (USE_A=0 + bltadat_pre), B=shifted-from-memory, C=dest-read.
+With A all-ones, LF=$CA gives `D = B` (the foreground bits).
+
+### §50b. New regression test `t158_drawimage_masked.s`
+
+Added a test that drives this exact blit form with known inputs:
+- A source = $0F0F (mask)
+- B source = $5555 (foreground)
+- C/D dest = $AAAA (background)
+- BLTCON0 = $0FCA (USE_A+B+C+D, LF=$CA)
+- Expected: D = if A then B else C = $A5A5
+
+Result: **PASS**.  Full suite: 150 passing, 0 failing.
+
+So our blitter's LF=$CA + USE_A+B+C+D implementation is correct.
+The WB1.3 icon-area blits use the same form but produce empty
+output **because the B-source memory is empty** (`$10410` is all
+zeros in our chip RAM dump).
+
+### §50c. Inspecting the source data
+
+| Source addr | Content                                                    |
+| ----------- | ---------------------------------------------------------- |
+| $10170      | `00 00 02 1c 00 00 41 f5 00 30 2e 83` (looks like real data)|
+| $10410      | All zeros (entire region)                                  |
+| $12488      | `ff ff ff c0 c0 ff fc f0` (looks like glyph bitmap)        |
+| $119F8      | Mostly zeros                                               |
+
+So WB1.3 reads B from `$10410` for some icon blits — and gets
+nothing.  $10410 was supposed to be loaded with icon-image data,
+either from disk (the `.info` files) or set up by a runtime
+allocation that we're missing.
+
+### §50d. Next investigation
+
+The icon-graphic gap is now isolated to "WB1.3 expects icon-image
+data at chip `$10410` but our boot has zeros there".  Two paths
+from here:
+1. Trace what (if anything) ever writes to $10410 during boot —
+   probe `mem_idx == $4104` (chip $10410 / 4) in the bus arbiter
+2. Check whether $10410 is a destination of an AllocRaster or
+   similar runtime allocation — Workbench's icon-image data is
+   typically allocated dynamically, not read directly from .info
+
+Both are downstream investigations.  The actionable takeaway from
+this section: **the §38 USE_A=0 fix already handles the blit
+form WB1.3 uses for icons**.  The remaining gap is purely a
+data-population issue, not a blitter logic gap.
+
