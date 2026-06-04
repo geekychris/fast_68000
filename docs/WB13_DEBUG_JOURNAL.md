@@ -2679,3 +2679,92 @@ For future probes: trigger on the write event (`mem_idx == LITERAL`
 in the same always block that writes mem[mem_idx]), not on a
 post-write read-back comparison.
 
+
+---
+
+## §29. The smoking gun: blitter renders CLI title bar as INACTIVE (2026-06-04)
+
+`CLI_TITLE_BUS_WR_TRACE` (the working `mem_idx == LITERAL` pattern,
+landed in §28) immediately surfaced **9321 writes** to the CLI title
+bar region during the boot:
+
+```
+[CLI_TITLE_BUS_WR] port=2 addr=000060c8 mem_idx=01832 be=1100 wdata=2aaa0000 is_long=0
+[CLI_TITLE_BUS_WR] port=2 addr=000060ca mem_idx=01832 be=0011 wdata=00002aaa is_long=0
+[CLI_TITLE_BUS_WR] port=2 addr=000060cc mem_idx=01833 be=1100 wdata=2aaa0000 is_long=0
+...
+```
+
+`port=2` is the blitter (`localparam BLT_PORT = 2 * N_CORES` in
+m68k_top.v; with N_CORES=1, BLT_PORT=2).  So the blitter IS
+running a RectFill against the title bar — repeatedly, 41 times
+against mem_idx=$1832 alone — with **source pattern $2AAA**, not
+$FFFF.
+
+Cross-check: the LAST write to mem_idx=$1832 is `wdata=00002aaa
+be=0011`, leaving the bytes as `2A AA 2A AA` — exactly what we see
+in the chip RAM dump.
+
+### §29a. Why my BLT_CLI_TITLE_TRACE (in blitter.v) missed it
+
+My §26 probe gated on `mst_req_r && mst_we && mst_addr ∈ [$60C8, $63E8]`
+inside `rtl/chipset/blitter.v`.  It reported 0 hits despite the
+blitter ACTUALLY doing these writes.  Best guess: `mst_req_r` is
+the 1-cycle-delayed registered version of the request, and by the
+time it goes high the arbiter has already granted and `mst_addr`
+no longer reflects what was driven.  The bus-arbiter side sees the
+final committed write, which is what we needed.
+
+For future probes targeting blitter writes: probe in the bus
+arbiter's write-commit path (`mem_idx == LITERAL`), not in the
+blitter's master-request path.
+
+### §29b. $2AAA vs $FFFF — active vs inactive window title bar
+
+$2AAA in binary = `0010 1010 1010 1010` = the classic Intuition
+50% gray stipple, indicating an **inactive (non-front) window's
+title bar**.  $FFFF would be solid (active window).
+
+FS-UAE's chip RAM has `$FF FF` at $60C8.  Ours has `$2A AA`.
+
+This explains the entire visible-rendering gap.  The CLI window
+struct is fully built (identical to FS-UAE per §25c).  Intuition's
+frame-draw IS running (this section disproves §27's "the blits
+never fire" conclusion — they fire, the bus-write probe just
+needed a different pattern to catch them).  But the title bar is
+being painted with the **inactive-window stipple pattern**, not
+the active-window solid fill.
+
+FS-UAE's CLI title bar shows `$FF FF` because at *some point*
+during FS-UAE's boot history, CLI was the active window (clicked
+to front, or opened with WFLG_ACTIVATE actually realised by
+Intuition).  When Intuition redrew the frame in active state, it
+painted $FFFF.  When CLI was later depth-arranged behind, the
+pixels stayed.  Our boot: CLI never became "active enough" for
+Intuition to paint the active title bar, so it stayed at the
+inactive $2AAA stipple.
+
+### §29c. What to fix
+
+CLI Window's `Flags = $00023007` includes bit 13 (WINDOWACTIVE)
+in *both* our and FS-UAE's struct.  So the *flag* says active.
+But Intuition's draw decision must check something *else* — the
+current `Screen.FirstWindow` chain, or `IntuitionBase.ActiveWindow`,
+or a Layer.Flags bit.
+
+Two probable paths:
+1. **Find out the actual "draw as active" predicate Intuition uses
+   and verify which struct field is wrong on our side.**  Likely
+   `IntuitionBase.ActiveWindow` (a pointer) — if that doesn't point
+   to the CLI Window at the moment of RefreshWindowFrame, the
+   inactive stipple is what Intuition will paint.
+2. **Force CLI into the active state via input event injection.**
+   MOUSE_AUTO_CLICK was tried earlier, didn't work because we
+   clicked at the wrong screen coordinate.  The CLI window opens
+   at (0, 0, 640, 200) so any non-WB-Backdrop click inside that
+   area should activate it.  The mouse counter is 8-bit and wraps;
+   the previous MOUSE_AUTO_CLICK code ramps from 0 to target_x
+   without considering wrap-around; for x=300 we need to set
+   target_x=300 and let the cast roll over, with the integration
+   in Intuition adding up the deltas.
+
