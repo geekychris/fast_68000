@@ -2932,3 +2932,66 @@ allocation, not an OS global.  Future debugging should filter
 adjacency to the AllocMem free-fill pattern before assuming a
 slot is "the" IntuitionBase ActiveWindow.
 
+
+---
+
+## §32. BLT_DAT_2AAA_TRACE: zero CPU writes of $2AAA to BLTxDAT (2026-06-04)
+
+`BLT_DAT_2AAA_TRACE` (bus-side) + `BLT_DAT_2AAA_PC_TRACE` (CPU-side)
+both reported **0 hits** over a full 1.5B-cycle boot.
+
+```
+BOOT DONE: 0 2aaa-write hits
+PC-side hits: (empty)
+Bus-side hits: (empty)
+```
+
+So Intuition does NOT write `$2AAA` directly to the blitter's
+constant-source registers (BLTADAT/BLTBDAT/BLTCDAT @
+$DFF070-$DFF074).  The pattern must arrive at the blitter via
+**memory read** — `BLTBPT` (or `BLTAPT`) pointing at a stipple
+pattern stored elsewhere in chip RAM, with `BLTBMOD = -2` so the
+blitter re-reads the same word each row.
+
+That's RastPort.AreaPtrn — the standard mechanism for stipple fills.
+
+### §32a. Quick visual verification — patched render
+
+Rather than chase the AreaPtrn source allocation (another rebuild
++ 7-min boot per probe iteration), did a post-process check: take
+the existing chip-RAM dump, overwrite the title bar BPL1 region
+(800 bytes at $60C8) with `$FF`, and re-render.
+
+`screenshots/20260604_115625_wb13_titlebar_patched_FF.png` shows
+the result: title bar is now a **solid white bar with the disk
+icons + glyphs intact**.  This is what a "fixed" CLI title bar
+would look like, given the rest of the rendering pipeline is
+already correct.
+
+This confirms two things:
+1. The renderer is correct.  The visual gap is purely in the BPL1
+   bytes Intuition writes for the title bar — not in any rendering
+   path.
+2. The CPU/blitter/Window-struct chain we've already verified is
+   working.  The remaining gap is the single decision Intuition
+   makes about *which fill value* to use.
+
+### §32b. Diary line — what's still open vs done
+
+Done this session:
+- Smoking gun isolated to "blitter writes $2AAA, not $FFFF"
+- Cause traced to memory-sourced stipple (not a CPU register write)
+- Visual proof that a fix would restore the title bar
+
+Still open:
+- Find the AreaPtrn allocation that holds `$2AAA` (probably in
+  IntuitionBase or a heap allocation with a long lifetime)
+- Find why Intuition picks that pattern over the active-window
+  source (likely an IntuitionBase.ActiveWindow != CLI predicate)
+
+The smaller actionable next step: probe **any** CPU write to chip
+RAM with value `$00002AAA` (16-bit) — that surfaces the place(s)
+where Intuition initializes its inactive-window fill pattern in
+memory.  Combined with the gdbserver attached at that PC, we can
+walk the call stack back to the predicate.
+
