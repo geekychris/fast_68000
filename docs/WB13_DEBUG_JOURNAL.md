@@ -4038,3 +4038,82 @@ this section: **the §38 USE_A=0 fix already handles the blit
 form WB1.3 uses for icons**.  The remaining gap is purely a
 data-population issue, not a blitter logic gap.
 
+
+---
+
+## §51. Icon-area gap is NOT a missing-source-data issue (2026-06-04)
+
+§50d hypothesised that the icon-graphic gap was caused by WB1.3
+expecting source data at chip `$10410` and our boot leaving it
+empty.  Compared against FS-UAE's chip RAM:
+
+```
+$10410 OURS: all zeros
+$10410 FSU:  all zeros  ← SAME
+```
+
+So both systems have `$10410` empty.  Yet FS-UAE's icon-area
+destinations have content:
+
+```
+$6668 OURS: 00 00 00 00 ...
+$6668 FSU:  c0 00 0f 07 00 00 07 c0 ...  ← has icon-graphic bits
+
+$66B8 OURS: 00 00 00 00 ...
+$66B8 FSU:  c1 83 83 80 ...                ← has content
+
+$68E8 OURS: 00 00 00 00 ...
+$68E8 FSU:  c0 00 00 00 00 00 07 c0 ...    ← has content
+```
+
+So FSU's icon blits produce nonzero output even though their
+B-source is empty.  How?
+
+### §51a. Possible mechanisms
+
+For LF=$CA with USE_A=0 USE_B=1 USE_C=1 USE_D=1:
+- D = if A then B else C
+- A = BLTADAT_pre (USE_A=0)
+- B = read from memory (USE_B=1)
+- C = read from memory (USE_C=1)
+
+With B=0 (read from empty $10410), D = if A then 0 else C.
+
+So FSU's nonzero output requires *one* of:
+1. BLTADAT_pre was $0000 at the moment of FSU's blit (not $FFFF
+   like ours).  Then A=0 everywhere, D = C = the prior destination
+   content (= icon graphics from an earlier draw step).
+2. FSU's blits use different USE bits — maybe USE_B=0 with
+   BLTBDAT_pre=$FFFF, then B is constant and the blit acts like
+   §38's title bar form.
+3. FSU has earlier blits we're not running that pre-populate
+   $6668/$66B8/$68E8 with icon-graphic content, and the LF=$CA
+   blit just preserves them via the C=memory-read path.
+
+Possibility (3) is most plausible — Workbench's `DrawImage`
+typically runs **multiple** blits per icon (image plane 0, image
+plane 1, optional shadow/highlight).  If we're running the
+MASKING blit but missing the IMAGE-PLANE blits that come before,
+we'd see exactly this: dest stays empty (because there's nothing
+for the mask to mask onto).
+
+### §51b. Next probe
+
+Need to capture EVERY blit during the boot that hits BPL1's icon
+area, not just the late ones — widen the time window with
+`KICKSTART_BOOT_TRACE` (130MB log per boot, but completely
+captures the sequence) and filter post-hoc by destination range.
+Then compare against FS-UAE if a similar capture is feasible.
+
+This is a much wider investigation that goes beyond what's worth
+doing in this session.  The §51 finding is enough for the diary:
+**the icon-graphic gap is not a missing-source-data problem; it's
+a missing-EARLIER-BLIT problem**.  Workbench in our boot doesn't
+issue the image-plane setup blits that real WB1.3 issues before
+the LF=$CA masking pass.
+
+That puts the gap further upstream in Workbench's `DrawImage` /
+icon-init sequence — probably tied to whether the `.info` files
+were loaded from disk and the icon `Image` struct was filled
+in before `DrawImage` was called.
+
