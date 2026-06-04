@@ -664,11 +664,70 @@ static int run_regression(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
                (unsigned long long)pc_histogram_interval,
                pc_histogram_top, pc_histogram_bucket_bits);
 
+    // MOUSE_AUTO_CLICK: drive a one-shot mouse click at an absolute screen
+    // position in the headless regression path.  Format: "x,y,click_cycle"
+    // — cursor ramps from origin to (x,y) over the 30M cycles preceding
+    // click_cycle, then LMB pulses for ~500K cycles (about 7 VBL frames).
+    // K1.3 mouse counters are 8-bit so x and y must be <= 127.  Used to
+    // bring the AmigaDOS CLI window to front for the visual milestone.
+    int      mouse_target_x  = 0;
+    int      mouse_target_y  = 0;
+    uint64_t mouse_click_cyc = ~0ULL;
+    bool     mouse_click_enabled = false;
+    if (const char* s = std::getenv("MOUSE_AUTO_CLICK")) {
+        char* end = nullptr;
+        long x = std::strtol(s, &end, 0);
+        if (end && *end == ',') {
+            long y = std::strtol(end + 1, &end, 0);
+            if (end && *end == ',') {
+                uint64_t cc = std::strtoull(end + 1, nullptr, 0);
+                mouse_target_x  = (int)x;
+                mouse_target_y  = (int)y;
+                mouse_click_cyc = cc;
+                mouse_click_enabled = true;
+                printf("[sim] MOUSE_AUTO_CLICK target=(%d,%d) click_cycle=%llu\n",
+                    mouse_target_x, mouse_target_y,
+                    (unsigned long long)mouse_click_cyc);
+            }
+        }
+        if (!mouse_click_enabled)
+            printf("[sim] MOUSE_AUTO_CLICK='%s' — bad syntax, expected x,y,cycle\n", s);
+    }
+    // Cursor-move window: ramp the counters across this many cycles
+    // before click_cycle so Workbench's per-VBL delta read sees the
+    // motion as a smooth glide rather than one giant teleport step.
+    const uint64_t MOUSE_MOVE_DURATION = 30000000ULL;
+
     while (cycle < max_cycles && !all_halted()) {
         // Default ext_kbd_wr to 0; the injection block below pulses it
         // for exactly one cycle when a scancode is due.
         top->ext_kbd_wr = 0;
         top->mem_poke_strobe = 0;
+        // ---- MOUSE_AUTO_CLICK driver ----
+        if (mouse_click_enabled) {
+            uint64_t move_start = (mouse_click_cyc > MOUSE_MOVE_DURATION)
+                                  ? (mouse_click_cyc - MOUSE_MOVE_DURATION)
+                                  : 0;
+            if (cycle < move_start) {
+                top->mouse_x_count = 0;
+                top->mouse_y_count = 0;
+            } else if (cycle <= mouse_click_cyc) {
+                double progress = double(cycle - move_start) /
+                                  double(mouse_click_cyc - move_start);
+                top->mouse_x_count = (uint8_t)(mouse_target_x * progress);
+                top->mouse_y_count = (uint8_t)(mouse_target_y * progress);
+            } else {
+                // Hold at target after click
+                top->mouse_x_count = (uint8_t)mouse_target_x;
+                top->mouse_y_count = (uint8_t)mouse_target_y;
+            }
+            // LMB down for 500K cycles around click_cycle (covers several
+            // VBL polls so Workbench's PRA-read latch catches it).
+            const uint64_t CLICK_DURATION = 500000ULL;
+            top->mouse_btn_l = (cycle >= mouse_click_cyc &&
+                                cycle <  mouse_click_cyc + CLICK_DURATION)
+                               ? 1 : 0;
+        }
         if (!pokes.empty() && cycle >= poke_next_cycle) {
             top->mem_poke_addr   = pokes[poke_idx].first;
             top->mem_poke_data   = pokes[poke_idx].second;
