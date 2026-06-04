@@ -2768,3 +2768,93 @@ Two probable paths:
    target_x=300 and let the cast roll over, with the integration
    in Intuition adding up the deltas.
 
+
+---
+
+## §30. Where the "active window" pointers live (2026-06-04)
+
+Searched slow RAM for any longword equal to the CLI Window address
+($00C05E90).  Both systems have 5–6 such pointers, with one key
+difference:
+
+```
+$C03F16: CLI ptr — both
+$C03F2C: CLI ptr — both
+$C0605C: CLI ptr (OURS only); FSU has WB Backdrop ptr ($C0C0E0)
+$C06092: CLI ptr — both (Process.pr_WindowPtr)
+$C06A8C: CLI ptr — both (alongside literal "AmigaDOS" 12 bytes later)
+$C06B28: CLI ptr — both
+```
+
+The pair `($C0605C, $C06060)` is the divergent slot:
+
+```
+                 OURS                       FSU
+$C0605C  00 c0 5e 90  ← CLI Window     00 c0 c0 e0  ← WB Backdrop
+$C06060  00 00 00 00                    00 c0 13 58  ← Workbench Screen
+```
+
+The surrounding `ab ab ab ab` AllocMem-fill padding tells us this is
+inside a small allocated struct.  Layout looks like `(ActiveWindow,
+ActiveScreen)` — IntuitionBase's globals.
+
+So **our IntuitionBase has ActiveWindow=CLI, ActiveScreen=NULL**;
+FS-UAE has **ActiveWindow=WB Backdrop, ActiveScreen=Workbench
+Screen**.
+
+### §30a. The contradiction
+
+If our IntuitionBase has `ActiveWindow = CLI`, then Intuition's
+`RefreshWindowFrame` should be painting CLI's title bar as ACTIVE
+($FFFF).  But we measured (§29) that it paints $2AAA (inactive).
+
+Three possibilities:
+1. The struct at $C0605C is *not* IntuitionBase.ActiveWindow.  Some
+   other Intuition global.
+2. ActiveScreen=NULL invalidates the "this is the active window"
+   predicate — Intuition might require both Active{Window,Screen}
+   to be consistent before painting active.
+3. The active-window paint pass happened at one point and was later
+   re-painted as inactive (FS-UAE captures the active-paint
+   leftover; ours captures the inactive repaint).
+
+Looking at the wdata histogram (§29 follow-up):
+```
+6774 zeros
+2013 $2AAA halves
+   0 $FFFF  ← never any active-window solid pass
+```
+
+Zero $FFFF writes anywhere in the title bar region during the entire
+1.5B-cycle boot.  So our Intuition NEVER thought CLI was the active
+window at the moment of any frame draw.
+
+That rules out possibility 3.  Either the active-window slot is
+elsewhere (1), or ActiveScreen=NULL gates the active paint (2).
+
+### §30b. Diary line — what we know vs what's next
+
+What we know firmly:
+- CLI Window struct is fully built and byte-identical to FS-UAE in
+  every key field (W, H, RPort, Layer, BitMap.Planes[0], Border,
+  Flags incl. WINDOWACTIVE bit).
+- Intuition's RectFill *does* run against the CLI title bar.
+- The fill source value is $2AAA every single time (= inactive
+  window 50% stipple); never $FFFF (= active solid).
+- Slow RAM has an IntuitionBase-like struct at $C0605C that
+  differs from FS-UAE: ours holds (CLI, NULL); FS-UAE holds
+  (Backdrop, Screen).
+
+What we don't know:
+- Where exactly IntuitionBase lives (or whether $C0605C IS
+  IntuitionBase's ActiveWindow slot)
+- Why ActiveScreen is NULL on our side
+- Whether patching ActiveScreen to point at the Workbench Screen
+  via `mem_poke` would let the next Intuition refresh paint active
+
+Next experiment: poke `$00C01358` (WB Screen ptr) to slow $C06060
+at a mid-boot cycle.  If Intuition's next refresh sees a coherent
+(ActiveWindow, ActiveScreen) and paints active, we'll see $FFFF
+writes appear in the BUS_WR trace and the rendered output will
+finally have solid title bar.
+
