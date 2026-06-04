@@ -154,7 +154,24 @@ slow-RAM titles) finds the same `Window @ $C05E90 Title='AmigaDOS'
 Size=640×200 Flags=$00023007 UserPort=$00000000` in both systems.
 Workbench Backdrop window at $C0BBB8, icon.library structures, all
 present. The CLI Window struct exists and matches FS-UAE byte-for-byte
-in the fields that matter.
+in the fields that matter — verified at every level:
+
+| Field                                  | Ours      | FS-UAE     |
+| -------------------------------------- | --------- | ---------- |
+| `Window.WScreen`                       | $C01358   | $C01358    |
+| `Window.RPort`                         | $C05FA8   | $C05FA8    |
+| `RPort.Layer`                          | $C05DF0   | $C05DF0    |
+| `RPort.BitMap`                         | $C01410   | $C01410    |
+| `BitMap.Planes[0]`                     | $60C8     | $60C8      |
+| `BitMap.Planes[1]`                     | $B0C8     | $B0C8      |
+| `Window.Border (L,T,R,B)`              | 4,11,18,2 | 4,11,18,2  |
+| `Window.Flags`                         | $00023007 | $00023007  |
+
+Neither system has CLI in `Screen.FirstWindow` at the idle snapshot
+point — both have just the WB Backdrop. So FS-UAE's CLI banner pixels
+are *leftovers* from when CLI was depth-arranged to front and active;
+ours never had the title-bar/border/banner blits run at all, so when
+CLI was removed from the chain there were no pixels to leave behind.
 
 ### Visible gap: Intuition's title-bar/text render never ran
 
