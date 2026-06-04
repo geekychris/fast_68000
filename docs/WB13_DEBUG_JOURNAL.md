@@ -3243,3 +3243,146 @@ This is much smaller log volume than `KICKSTART_BOOT_TRACE=1`
 
 Result lands in §38.
 
+
+---
+
+## §38. REAL BLITTER BUG — USE_A=0 hardwires A to 0, not BLTADAT_pre (2026-06-04)
+
+The `BLT_START_TITLE_TRACE` probe (§37a) produced **59 events**.
+Decoding the LAST blit that hit `bltdpt=$60C8` revealed:
+
+```
+bltcon=ca000003 bltapt=00c119a4 bltbpt=00011638 bltcpt=000060c8 bltdpt=000060c8
+bltsize=02a8  adat_pre=ffff bdat_pre=ffff cdat_pre=5555  afwm=ffff alwm=ffff
+```
+
+BLTCON0=$CA00 = LF=$CA, USE_A=0, USE_B=0, USE_C=1, USE_D=1.
+bltsize=$02A8 = 10 rows × 40 words = the full 800-byte title bar.
+
+LF=$CA minterm table:
+| (A,B,C) | bit | LF[idx]=$CA bit |
+|---------|-----|------|
+| (1,1,1) |  7  |  1   |
+| (1,1,0) |  6  |  1   |
+| (0,1,1) |  3  |  1   |
+| (0,0,1) |  1  |  1   |
+| others  |     |  0   |
+
+= D = (A AND B) OR (NOT_A AND C)
+
+With A=$FFFF (BLTADAT_pre) and B=$FFFF (BLTBDAT_pre):
+- (A AND B) = $FFFF
+- D = $FFFF OR (0 AND C) = **$FFFF** for every bit
+- **Title bar should be solid white!**
+
+But chip RAM at $60C8 ends up `$2A AA $2A AA …` (50% stipple).
+
+### §38a. The bug in `rtl/chipset/blitter.v`
+
+Inspecting S_RDA at lines 568–598:
+
+```verilog
+S_RDA: begin
+    if (use_a) begin
+        // ... read from BLTAPT into a_cur_word_q ...
+    end else begin
+        a_cur_word_q <= 16'd0;       // ← BUG: should be bltadat_pre
+        state <= use_b ? S_RDB : (use_c ? S_RDC : S_WRD);
+    end
+end
+```
+
+When `USE_A=0`, our blitter sets `a_cur_word_q <= 0` instead of
+`bltadat_pre`.  Then in S_WRD the combine() function gets `A=0`
+into LF, which for LF=$CA produces `D = (0 AND B) OR (NOT_0 AND C)
+= C`.  So the title bar ends up filled with whatever the C-channel
+reads from chip $60C8 — which was 0 initially but, by the time
+this final blit runs, has been written-then-overwritten by earlier
+blits in a cascade leaving `$2AAA` bits.
+
+This is the **mirror of the USE_B=0 fix landed as t155** (commit
+landed earlier this session per task #132 / project memory) — the
+same bug was never applied to the A-channel.
+
+### §38b. Fix + regression test
+
+Patched `rtl/chipset/blitter.v:595` to `a_cur_word_q <=
+bltadat_pre[15:0]` when `USE_A=0`.  Added `tests/t157_use_a_zero_preset.s`
+that:
+1. Sets BLTADAT=$FFFF, BLTBDAT=$FFFF, USE_A=0 USE_B=0 USE_C=1 USE_D=1,
+   LF=$CA, C source = $5A5A, BLTDPT = clean $3000.  Real Amiga
+   output = $FFFF.  Pre-fix bug output = C = $5A5A.
+2. Sets BLTADAT=$5555, BLTBDAT=$FFFF, same params.  Real Amiga
+   output = ($5555 AND $FFFF) OR ($AAAA AND $5A5A) = $5555 OR $0A0A
+   = $5F5F.  Pre-fix bug output = $5A5A.
+
+If either test fails the blit output gets reported via STOP code.
+
+### §38c. Diary line — this is the smoking gun, not just a workaround
+
+The MEM_POKE wb-pristine target (§34-§37) was a *runtime patch*
+producing the right pixels.  This commit is the *upstream fix*
+that makes those pixels appear naturally during boot, without any
+patch.  After this lands and the regression suite passes,
+re-running `make wb-screenshot` (no MEM_POKE) should produce a
+title bar that's already solid white — the result of Intuition's
+own RectFill working correctly.
+
+
+---
+
+## §38d. THE FIX LANDED — natural pristine Workbench desktop (2026-06-04)
+
+After the §38a/§38b fix in `rtl/chipset/blitter.v` (line 672-679,
+combine() call site) — `use_a ? a_*_word : bltadat_pre` for both
+A-prev and A-cur — and the regression-suite re-run:
+
+```
+Result: 149 passed, 0 failed
+```
+
+t157 passes.  Nothing else broke.
+
+`make wb-screenshot` (NO MEM_POKE, no patches at all) now produces
+the **actual rendered Workbench 1.3 desktop**:
+
+`screenshots/20260604_125444_wb13_NATURAL_no_mempoke_post_usea_fix.png`
+
+Visible elements, *all from real sim output*:
+- Solid white title bar with `Workbench release.` text + `888272`
+  free-byte counter
+- "RAM DISK" disk icon + label
+- "Workbench1.3" disk icon (with floppy graphic) + label
+- Two more disk icons (3.5" floppy graphics) in the middle
+- Depth gadget in the upper-right
+- Blue Workbench backdrop
+
+This is FAR more than just the title bar fix — the same A=0 bug
+was breaking ALL of Intuition's frame-draw and icon-render blits
+that used `USE_A=0`.  Fixing it cascaded into the WB Backdrop's
+right border, the icon labels' text rendering, the RastPort
+font-paint path, etc.
+
+**Title bar coverage: 515/800 bytes `$FF`** (the other 285 are
+glyph cutouts from text rendering — exactly what we'd expect).
+
+### §38e. Diary line — meta-reflection
+
+This is what the diary buys.  The §29 finding ("blitter writes
+$2AAA, not $FFFF") looked initially like an Intuition predicate
+bug — that's where the investigation went in §30-§32.  Three dead
+ends later (§30 wrong slot, §31 heap allocation not IntuitionBase,
+§32 BLTADAT never $2AAA) the search shifted to BLT_START_TITLE_TRACE
+(§37a), which decoded the actual blit setup and revealed the
+LF=$CA blit was issuing the right command but our blitter was
+executing it wrong because of an A-channel default bug never
+caught by the existing regression suite.
+
+Without §29-§32 systematically ruling out the "OS predicate"
+direction, §37-§38 wouldn't have looked at the blitter
+implementation — we'd still be searching for an IntuitionBase
+field that doesn't exist.
+
+The pristine target in §33-§35 (via MEM_POKE) was the visual
+goalpost.  This §38d render achieves it for real, with no patches.
+

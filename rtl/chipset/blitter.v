@@ -593,7 +593,15 @@ module blitter (
                             state  <= use_b ? S_RDB : (use_c ? S_RDC : S_WRD);
                         end
                     end else begin
-                        a_cur_word_q <= 16'd0;
+                        // USE_A=0: per real-Amiga / minimig semantics, the
+                        // A-channel feeds BLTADAT (its CPU-pre-loaded value)
+                        // into the LF minterm generator as a constant.  Our
+                        // earlier impl set a_cur_word_q <= 0, which broke
+                        // any LF that consults A (e.g. LF=\$CA in Intuition's
+                        // title-bar fill, which expects A=\$FFFF for solid
+                        // output).  Mirror of the t155 USE_B=0 fix in S_RDB.
+                        // Per WB13_DEBUG_JOURNAL §38.
+                        a_cur_word_q <= bltadat_pre[15:0];
                         state <= use_b ? S_RDB : (use_c ? S_RDC : S_WRD);
                     end
                 end
@@ -661,8 +669,21 @@ module blitter (
                     // critical for LFs that consult C (e.g. LF=$D8 with
                     // BLTCDAT bit-mask in trackdisk's MFM data decoder).
                     // See tests/t139_blt_usec0_bltcdat.s.
+                    // When USE_A=0, the A-channel feeds BLTADAT preset into
+                    // the LF minterm generator as a constant (real-Amiga /
+                    // minimig semantics, mirror of the USE_B=0 arm just
+                    // below).  Without this, a_cur_word_q and a_prev_word
+                    // carry stale values from a prior blit and Intuition's
+                    // title-bar fill (LF=$CA USE_A=0 USE_C=1 USE_D=1, which
+                    // wants A=$FFFF for solid output) writes whatever C
+                    // had instead — producing the $2AAA inactive stipple
+                    // we observed in WB1.3 boots.  See WB13_DEBUG_JOURNAL
+                    // §38 + tests/t157_use_a_zero_preset.s.
                     combined_w = combine(lf,
-                                         shift_a(a_prev_word, a_cur_word_q, ash, desc),
+                                         shift_a(
+                                            use_a ? a_prev_word   : bltadat_pre[15:0],
+                                            use_a ? a_cur_word_q  : bltadat_pre[15:0],
+                                            ash, desc),
                                          shift_b(b_prev_word, use_b ? b_cur_word_q : bltbdat_pre[15:0], bsh, desc),
                                          use_c ? c_cur_word_q : bltcdat_pre[15:0]);
                     filled  = apply_fill(combined_w, fill_carry, ife, efe, desc);
