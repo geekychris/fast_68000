@@ -3860,3 +3860,54 @@ disproven* as well as *what was proven* — produced an
 investigation that future sessions can join at any point without
 re-walking the dead ends.
 
+
+---
+
+## §48. Honesty pass — the display is still garbled (2026-06-04)
+
+Per-row coverage analysis disagrees with the §47 framing of
+"natural Workbench desktop":
+
+| Region          | Rows    | BPL1 nonzero bytes/row | What's actually there       |
+| --------------- | ------- | ---------------------- | --------------------------- |
+| Title bar       | 0-9     | 78-80 / 80             | Solid white + text ✓        |
+| CLI banner area | 10-16   | 0 / 80                 | **Empty**                   |
+| Icon column     | 17-30   | **4 / 80**             | 32-px solid white strip at cols 72-75 |
+| Below icons     | 31-50   | 0-7 / 80               | Mostly empty + small marks  |
+| Mid/lower screen| 51-199  | 0 / 80                 | **All empty**               |
+
+A real WB1.3 icon is ~32-48 pixels wide AND has detailed
+graphics inside the box (floppy-disk drawing for "Workbench1.3",
+chip-RAM drawing for "RAM Disk", etc.).  Our render has 32-pixel
+**solid-white columns** where graphics should be — i.e. the icon
+*outlines* drew but the icon *contents* didn't.
+
+The §38 USE_A=0 fix is real:
+- Pre-fix: 0 runs of `$FF`×8 anywhere in chip RAM
+- Post-fix: 81 runs of `$FF`×8 + 78-80 nonzero/row title bar
+
+But the *visible-effect* claim in §47 of "Workbench renders
+correctly" was an overstatement.  Real Workbench would have:
+- Detailed icon graphics (not solid rectangles)
+- Right-edge Backdrop border (cols 630-633 across all 200 rows)
+- Disk-icon labels in normal text color (not the orange we see)
+
+The accurate framing: **§38 fixed title-bar fill; the icon-graphic
+drawing path remains broken.**  Icons render as solid outlines
+because the icon-image draw blits (Workbench's `DrawImage` /
+`DrawIconState` / equivalent) either don't fire or produce wrong
+output.
+
+### §48a. Next concrete step
+
+Add a probe targeting `bltdpt ∈ [$60C8 + 17*80, $60C8 + 31*80]`
+(= chip $6438-$66B8 — wait, that's rows 11-19; rows 17-30 are
+chip $6588-$6940).  Capture which blits hit that range and what
+their LF/USE bits + source data look like.  Then check whether
+the icon-image source data in chip RAM is populated; if not,
+the bug is upstream of the blitter (icon file load from disk).
+
+Until that probe lands, the visible UI is "garbled WB1.3 with
+title bar working but icons missing graphics", not "natural
+Workbench desktop".
+
