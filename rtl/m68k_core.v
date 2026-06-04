@@ -3364,6 +3364,15 @@ module m68k_core #(
                 dc_addr >= 32'h00DF_F048 && dc_addr <= 32'h00DF_F057)
                 $display("[CPUBLT] r=%d pc=%h addr=%h be=%b wdata=%h",
                     retired, ex_pc, dc_addr, dc_be, dc_wdata);
+            // [SPRPT-WR]: ANY CPU write to $DFF120..$DFF13F (8 sprite
+            // pointer pairs).  Tells us whether Intuition's sprite
+            // cursor renderer ever fires.  WB1.3 idle shows Workbench
+            // with no mouse cursor — confirm SPR*PT are never set.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h00DF_F120 && dc_addr <= 32'h00DF_F13F)
+                $display("[SPRPT-WR] r=%d pc=%h addr=%h be=%b wdata=%h",
+                    retired, ex_pc, dc_addr, dc_be, dc_wdata);
+
             // [BLTMOD-WR]: ALL CPU writes to BLTAMOD/BMOD/CMOD/DMOD
             // ($DFF060..$DFF067).  Filtered to the window around the
             // corrupting blit at r=4,196,883 to keep the log small.
