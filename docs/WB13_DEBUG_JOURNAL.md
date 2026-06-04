@@ -3705,3 +3705,71 @@ resume by finding what user code triggers the
 `JSR $-8A(GraphicsBase)` near $FE4960 and either filter it or
 ensure CLI's IDCMP path queues a banner re-emit.
 
+
+---
+
+## §45. The triggering code is CR-handling in CON:/CLI (2026-06-04)
+
+One more step back: disasm at `$FE4940..$FE4974` (just above the
+deepest visible frame `$FE496E`):
+
+```
+$FE4942:  LEA     $015E(A6), A0
+$FE4946:  BSR     $FE4976                    ; local helper
+$FE494E:  JSR     $FFE2(A5)                  ; library call via A5
+$FE4954:  BNE.S   $FE496A                    ; branch if helper returned non-zero
+$FE4956:  MOVEA.L $0114(A6), A0              ; A0 = some struct from A6+$114
+$FE495A:  CMPI.B  #$0D, $0008(A0)            ; **compare byte at A0+8 with $0D = '\r'**
+$FE4960:  BNE.S   $FE496A                    ; branch if NOT CR
+$FE4962:  MOVE.L  #$0067, $0094(A0)          ; CR path: store $67 at A0+$94
+$FE496A:  JSR     $FF76(A6)                  ; library call $-$8A — unconditional
+```
+
+The `CMPI.B #$0D, $0008(A0)` is the smoking gun: this code path
+runs on every character processed by CON:, and the **CR ('\r')
+branch goes through `JSR $FF76(A6)`** — which (per §44a) eventually
+triggers `Layer.Flags |= LAYERREFRESH` and the per-plane clear at
+`$FE2FFC`.
+
+### §45a. The full sequence (re-read top-to-bottom)
+
+1. CLI calls `Write("Release 1.3\n")` on its file handle
+2. CON: handler queues a Text() blit for "Release 1.3"
+3. Glyph blits *do* fire (51 banner-area events per §40)
+4. CON: handler processes the trailing `\n` (= CR in DOS terms,
+   since DOS strings get CR/LF normalised)
+5. CR-handling path at `$FE4962` sets a state flag, calls
+   `$FF76(A6)`
+6. That library call sets `Layer.Flags |= LAYERREFRESH`
+7. The per-plane clear loop at `$FE2FFC` zeros the CLI body
+8. Real Amiga at this point would have CON: re-emit a fresh
+   prompt or the cursor — our boot's CON: handler doesn't have
+   the right state to recover
+
+So the gap isn't an RTL bug like §38 — it's an **OS state/event
+flow mismatch** between our boot environment and real WB1.3.
+Possibly CON: handler not properly registering its REFRESHWINDOW
+IDCMP listener, or the CR-flag state at `$94(A0)` being wrong.
+
+### §45b. Diary line — actual final entry
+
+We've now traced the CLI banner gap from:
+- The visible symptom: empty rows 11-32 in chip RAM
+- The blit-level diagnosis: 51 paint blits + a late LF=$00 clear
+- The triggering CPU PC: `$FE301E`
+- The call chain: 6 saved return PCs
+- The smoking-gun instruction: `ORI.W #$80, $1E(A2)` at `$FE210C`
+- The root user-code path: CR-handling in CON: at `$FE4962`
+
+Whoever resumes can either:
+- Investigate why CON:'s after-CR state at A0+$94=$67 doesn't
+  recover (= look at $0114(A6) struct field — possibly CON:
+  input-event queue head)
+- Accept that the Workbench desktop is the milestone (§38d) and
+  the CLI banner is "cosmetic extra info"
+
+That's the *entire arc* of the WB1.3 visual investigation, §25
+through §45, from a "stippled title bar" symptom to the exact
+CR-handler PC issuing a refresh.  The natural Workbench desktop
+remains the deliverable.
+
