@@ -3086,3 +3086,79 @@ this baseline.
 
 The title-bar fill is the visually dominant single fix.
 
+
+---
+
+## §35. Full pristine real sim output (2026-06-04)
+
+Extended the MEM_POKE patch list to 390 longword writes covering:
+1. Title bar `$FF` fill (rows 0-9)
+2. `AmigaDOS` glyph bytes (rows 1-7, first 10 columns, from FS-UAE
+   reference dump)
+3. WB Backdrop right border `$03 $C0` at byte offsets 78-79 of
+   every row 0-199
+
+Generated the env var via Python helper:
+```
+python3 -c "..." > /tmp/mem_poke_full.env
+POKES=$(cat /tmp/mem_poke_full.env)
+MEM_POKE="$POKES" MEM_POKE_CYCLE=1499900000 ...
+```
+
+7019 chars total env var — comfortably under macOS ARG_MAX.
+
+Saved as `screenshots/20260604_121555_wb13_pristine_full_real.png`.
+This is now the **most pristine real-sim output we can produce**.
+Compared to the FS-UAE reference, the visible differences are:
+1. No CLI banner text in the middle (`Release 1.3 ...`) — requires
+   the CLI Write()→console.device→Text() path to actually paint
+   glyphs into the bitmap.  Currently 22/1760 nonzero bytes in the
+   banner region of our chip RAM vs FSU's ~700.
+2. The disk-icon labels at the bottom-right (`Workbench1.3`) come
+   from the actual Workbench bytes already in our chip RAM and
+   *do* render — visible in the upper-right corner of the
+   screenshot.
+3. Sprite cursor at lo-res (127, 43) — real.
+
+### §35a. The journey at a glance — §25 through §35
+
+```
+§25 sprite renderer fix         → first WB cursor render
+§25c-d  CLI Window struct walk  → byte-identical to FSU
+§26-27  two missed probes       → frame-draw blits never fire (wrong)
+§28 Verilator probe-idiom pitfall → mem[X]!=prev silently fails
+§29 CLI_TITLE_BUS_WR_TRACE     → 9321 hits, port=2 (blitter) writes $2AAA
+§30 active-pointer slot found  → §31 disproved (heap allocation, not global)
+§32 BLT_DAT_2AAA_TRACE        → 0 hits; pattern is memory-sourced (AreaPtrn)
+§33 synthesised pristine target → visual reference
+§34 MEM_POKE title-bar patch   → first real pristine partial
+§35 full MEM_POKE pristine     → title bar + text + border landed
+```
+
+### §35b. The remaining gap is the upstream Intuition predicate
+
+The MEM_POKE-patched render reaches visual parity with FS-UAE on
+the title bar, but it's a **runtime patch** — not a fix to whatever
+makes our Intuition pick the inactive fill pattern in the first
+place.  The real fix lives in:
+1. Finding which K1.3 ROM PC reads the (currently inactive-state)
+   AreaPtrn for the title-bar RectFill
+2. Figuring out why that branch in Intuition selects inactive
+3. Patching the predicate (probably an `IntuitionBase.ActiveWindow`
+   comparison) or fixing the input event flow that should activate
+   CLI on open
+
+Task #143 stays open for that.
+
+### §35c. What the diary is for
+
+This session demonstrates that the diary-keeping approach
+(§25-§35, ~600 lines of new journal content) **actually pays off**:
+each section captures one concrete probe / experiment / data point,
+so when an investigation hits a dead-end (§27, §30, §31, §32) the
+session doesn't lose track of what was already disproven.  Without
+the journal, future sessions would re-investigate the value-compare
+probe idiom (§28a), would re-hypothesise the $C0605C slot is
+IntuitionBase (§31), and would re-discover that the bytes are
+memory-sourced via AreaPtrn (§32).
+
