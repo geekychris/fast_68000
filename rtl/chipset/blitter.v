@@ -99,6 +99,22 @@ module blitter (
 );
     reg mst_req_r;
     assign mst_req = mst_req_r && !mst_ack;
+
+`ifdef BLT_MST_TRACE_2D24
+    // Catch every blitter master write attempt to $2D24..$2D27 — what
+    // actually appears on the bus.  Compares against state-machine
+    // d_pipe and S_LWRD probes to find which path is responsible
+    // for $0 writes that don't appear in those probes.
+    always @(posedge clk) begin
+        if (mst_req_r && mst_we &&
+            mst_addr >= 32'h0000_2D24 && mst_addr <= 32'h0000_2D27) begin
+            $display("[BLT_MST_2D24] addr=%h be=%b wdata=%h ack=%b state=%0d cur_word=%0d cur_row=%0d bltcon=%h bltdpt=%h",
+                mst_addr, mst_be, mst_wdata, mst_ack, state,
+                cur_word, cur_row, bltcon, bltdpt);
+        end
+    end
+`endif
+
     // ----- Register file -----
     reg [31:0] bltcon;
     reg [31:0] bltafwm;
@@ -414,20 +430,52 @@ module blitter (
                         end
                     end
                     4'h2: bltalwm      <= slv_wdata;
-                    4'h3: bltapt       <= slv_wdata;
-                    4'h4: bltbpt       <= slv_wdata;
-                    4'h5: bltcpt       <= slv_wdata;
+                    // Real Amiga BLTxPTL is wired with bit 0 = 0 (word-align),
+                    // so any CPU write of an odd byte address is silently
+                    // masked.  Our blitter must do the same — otherwise an
+                    // odd BLT*PT propagates through the iteration loop and
+                    // produces writes at odd byte addresses that land in
+                    // different mem[] longwords than the CPU expected.
+                    // Found via [BUF-2D24-WR]+[BPL1-AREA-WR] trace where
+                    // K1.3 set bltdpt=$762D (odd) and the resulting
+                    // descending blit corrupted chip $2D24 (WB1.3 cyl-53
+                    // sector 3 sync).
+                    4'h3: bltapt       <= slv_wdata & 32'hFFFF_FFFE;
+                    4'h4: bltbpt       <= slv_wdata & 32'hFFFF_FFFE;
+                    4'h5: bltcpt       <= slv_wdata & 32'hFFFF_FFFE;
                     4'h6: begin
 `ifdef HDRCHK_WATCH
                         if (blt_busy)
                             $display("[BLT_REG_WR] BLTDPT mid-blit! old=%h new=%h cur_word=%0d cur_row=%0d",
                                 bltdpt, slv_wdata, cur_word, cur_row);
 `endif
-                        bltdpt       <= slv_wdata;
+                        bltdpt       <= slv_wdata & 32'hFFFF_FFFE;
                     end
-                    4'h7: bltamod      <= slv_wdata;
+                    // BLTAMOD .L from CPU (MOVE.L to $DFF064) commits both
+                    // BLTAMOD (high 16, sign-ext) AND BLTDMOD (low 16,
+                    // sign-ext) — same pattern as BLTAFWM/BLTALWM split.
+                    // Bus adapter sets slv_is_long when CPU did a 32-bit
+                    // write to the canonical BLTAMOD address.
+                    4'h7: begin
+                        if (slv_is_long) begin
+                            bltamod <= {{16{slv_wdata[31]}}, slv_wdata[31:16]};
+                            bltdmod <= {{16{slv_wdata[15]}}, slv_wdata[15:0]};
+                        end else begin
+                            bltamod <= slv_wdata;
+                        end
+                    end
                     4'h8: bltbmod      <= slv_wdata;
-                    4'h9: bltcmod      <= slv_wdata;
+                    // BLTCMOD .L from CPU (MOVE.L to $DFF060) commits both
+                    // BLTCMOD (high 16, sign-ext) AND BLTBMOD (low 16,
+                    // sign-ext).
+                    4'h9: begin
+                        if (slv_is_long) begin
+                            bltcmod <= {{16{slv_wdata[31]}}, slv_wdata[31:16]};
+                            bltbmod <= {{16{slv_wdata[15]}}, slv_wdata[15:0]};
+                        end else begin
+                            bltcmod <= slv_wdata;
+                        end
+                    end
                     4'hA: bltdmod      <= slv_wdata;
                     4'hB: bltadat_pre  <= slv_wdata;
                     4'hC: bltbdat_pre  <= slv_wdata;
@@ -494,6 +542,17 @@ module blitter (
                         mst_be    <= 4'b1111;
                         if (mst_ack) begin
                             mst_req_r <= 1'b0;
+`ifdef BLT_A_TRACE_2AC
+                            // Log every A read during the corrupting blit
+                            // shape (bltcon=$2AC0000B).  Compares A source
+                            // address + returned data — finds why output
+                            // forces $0 at the iteration that hits $2D24.
+                            if (bltcon[31:0] == 32'h2AC0_000B)
+                                $display("[BLT_A_RD_2AC] bltapt=%h mst_rdata=%h pick=%h cur_word=%0d cur_row=%0d bltdpt=%h",
+                                    bltapt, mst_rdata,
+                                    pick_half(mst_rdata, bltapt[1]),
+                                    cur_word, cur_row, bltdpt);
+`endif
                             // Pick the 16-bit half and apply masks.
                             a_cur_word_q <= apply_a_masks(
                                 pick_half(mst_rdata, bltapt[1]),
@@ -518,13 +577,27 @@ module blitter (
                             b_cur_word_q <= pick_half(mst_rdata, bltbpt[1]);
                             bltbpt <= bltbpt + (desc ? -32'sd2 : 32'sd2);
                             state  <= use_c ? S_RDC : S_WRD;
+`ifdef BLT_RD_TRACE_2D24
+                            // Log B-reads from the cyl-53 sector-3 source
+                            // region.  Compares blitter's received data
+                            // against bus-side memory state.
+                            if (bltbpt >= 32'h0000_2D20 && bltbpt <= 32'h0000_2D34)
+                                $display("[BLT_B_RD_2D24] bltbpt=%h mst_rdata=%h pick=%h cur_word=%0d cur_row=%0d bltcon=%h",
+                                    bltbpt, mst_rdata, pick_half(mst_rdata, bltbpt[1]), cur_word, cur_row, bltcon);
+`endif
 `ifdef HDRCHK_WATCH
                             if (bltbpt >= 32'h0000_64B0 && bltbpt <= 32'h0000_64BB)
                                 $display("[BLT_RDB] bltbpt=%h mst_rdata=%h cur_word=%0d cur_row=%0d", bltbpt, mst_rdata, cur_word, cur_row);
 `endif
                         end
                     end else begin
-                        b_cur_word_q <= 16'd0;
+                        // USE-B=0: when entered from S_IDLE, treat B as
+                        // BLTBDAT preset (real Amiga semantics — see the
+                        // `use_b ? b_cur_word_q : bltbdat_pre[15:0]` arm
+                        // in the combine() call below).  Keeping
+                        // b_cur_word_q at 0 here is harmless since the
+                        // combine arm overrides it; we still need the
+                        // state transition.
                         state <= use_c ? S_RDC : S_WRD;
                     end
                 end
@@ -559,7 +632,7 @@ module blitter (
                     // See tests/t139_blt_usec0_bltcdat.s.
                     combined_w = combine(lf,
                                          shift_a(a_prev_word, a_cur_word_q, ash, desc),
-                                         shift_b(b_prev_word, b_cur_word_q, bsh, desc),
+                                         shift_b(b_prev_word, use_b ? b_cur_word_q : bltbdat_pre[15:0], bsh, desc),
                                          use_c ? c_cur_word_q : bltcdat_pre[15:0]);
                     filled  = apply_fill(combined_w, fill_carry, ife, efe, desc);
                     final_w = filled[15:0];
@@ -585,6 +658,22 @@ module blitter (
                             should_advance = 1'b1;
                         end else
 `endif
+`ifdef BLT_WR_TRACE_2D24
+                        // Catch any blitter copy-mode write to $2D24..$2D27.
+                        if (d_pipe_valid &&
+                            d_pipe_addr >= 32'h0000_2D24 &&
+                            d_pipe_addr <= 32'h0000_2D27)
+                            $display("[BLT_WR_2D24_COPY] addr=%h data=%h state=%0d cur_word=%0d cur_row=%0d bltcon=%h bltdpt=%h bltbpt=%h",
+                                d_pipe_addr, d_pipe_data, state, cur_word, cur_row, bltcon, bltdpt, bltbpt);
+`endif
+// BLT_MFM_BUFFER_GUARD copy-mode arm REMOVED: the MFM-decode blit
+// (BLTCON0=$CC USE=B+D, dst=$2060) legitimately writes into chip
+// $2000-$5FFF as part of K1.3 trackdisk's sector-decode pipeline.
+// Blocking those writes broke disk reads (chip $2D24 stayed at gap
+// pattern $AAAAAAAA, boot reached r=231M in a retry loop).  See
+// docs/WB13_DEBUG_JOURNAL.md.  Keep the line-mode guard in S_LWRD
+// because the corrupting blit (PC=$FC5772) IS line mode and walks
+// off-bitmap deliberately.
                         if (d_pipe_valid) begin
                             mst_req_r <= 1'b1;
                             mst_we    <= 1'b1;
@@ -741,6 +830,24 @@ module blitter (
                 S_LWRD: begin : lwrd_block
                     reg [15:0] lw;
                     lw = line_combine();
+`ifdef BLT_WR_TRACE_2D24
+                    if (bltdpt >= 32'h0000_2D24 && bltdpt <= 32'h0000_2D27)
+                        $display("[BLT_WR_2D24_LINE] addr=%h lw=%h cur_row=%0d bltcon=%h bltapt=%h bltcpt=%h",
+                            bltdpt, lw, cur_row, bltcon, bltapt, bltcpt);
+`endif
+`ifdef BLT_MFM_BUFFER_GUARD
+                    if (bltdpt >= 32'h0000_2000 && bltdpt < 32'h0000_6000) begin
+                        // LINE-draw descended into trackdisk MFM buffer
+                        // range (chip $2000-$5FFF).  Skip the bus write
+                        // but advance Bresenham so the loop completes.
+                        // See docs/WB13_DEBUG_JOURNAL.md.
+                        $display("[BLT_MFM_GUARD_LINE] dst=%h bltcon=%h row=%0d",
+                            bltdpt, bltcon, cur_row);
+                        mst_req_r <= 1'b0;
+                        state <= S_LSTEP;
+                    end else
+`endif
+                    begin
                     mst_req_r <= 1'b1;
                     mst_we    <= 1'b1;
                     mst_addr  <= bltdpt;
@@ -750,6 +857,7 @@ module blitter (
                         mst_req_r <= 1'b0;
                         if (lw != 16'd0) blt_bzero <= 1'b0;
                         state <= S_LSTEP;
+                    end
                     end
                 end
                 S_LSTEP: begin

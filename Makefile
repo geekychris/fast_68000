@@ -37,6 +37,13 @@ MEM_WORDS ?= 65536
 BUILD     ?= build
 
 TESTS  := $(filter-out $(TESTS_DIR)/t61_ovl.s $(TESTS_DIR)/t63_boot_rom.s $(TESTS_DIR)/t65_blockdev.s $(TESTS_DIR)/t66_boot_rom_ext.s $(TESTS_DIR)/t68_floppy_dsklen.s $(TESTS_DIR)/t69_fake_kickstart.s $(TESTS_DIR)/t111_dma_cache_snoop.s,$(wildcard $(TESTS_DIR)/*.s))
+# Auto-generated longword-split tests from tools/gen_chipset_long_tests.py
+# Only the readable (R) ones run as pass/fail; write-only smoke tests are
+# excluded to avoid runner confusion (they just halt with stop #0 without
+# verifying the second half landed — that requires a separate probe).
+TESTS  += $(TESTS_DIR)/gen/tg_blt_afwm_alwm_long.s \
+          $(TESTS_DIR)/gen/tg_blt_cmod_bmod_long.s \
+          $(TESTS_DIR)/gen/tg_blt_amod_dmod_long.s
 # Multicore tests (t06_multicore, t07_coherence) need N_CORES >= 2.
 ifeq ($(N_CORES),1)
 TESTS := $(filter-out $(TESTS_DIR)/t06_multicore.s $(TESTS_DIR)/t07_coherence.s,$(TESTS))
@@ -311,6 +318,13 @@ cosim-kick: $(MUSASHI_BUILD)/musashi_kick
 
 # Cross-validation: run each whitelisted test on both Verilator and Musashi
 # and diff the halt codes.  Any divergence means a real bug in one of them.
+# Differential CPU fuzz tester: generates random 68k tests targeting bug-prone
+# instruction classes (mem-dst, mem-src-dst), runs each through Vm68k_top and
+# musashi_sim, reports any STOP-code divergences.  See tools/cpu_fuzz.py.
+.PHONY: cpu-fuzz
+cpu-fuzz: $(BUILD)/Vm68k_top $(MUSASHI_BUILD)/musashi_sim
+	$(PYTHON) tools/cpu_fuzz.py --count $${COUNT:-500} --seed $${SEED:-1} --class $${CLS:-mem-dst} --save-divergent /tmp/cpu_fuzz_bugs
+
 crosscheck: $(MUSASHI_BUILD)/musashi_sim
 	@$(MAKE) --no-print-directory build BUILD=build N_CORES=1 USE_CACHE=1 >build/_build.log 2>&1
 	@pass=0; fail=0; \

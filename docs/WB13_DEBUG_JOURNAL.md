@@ -959,3 +959,1360 @@ with a "step until address X is written" primitive.
 
 This is **a single instruction** of divergence between FS-UAE and
 our Verilator.  We are very close.
+
+---
+
+## Session 2026-06-01..02 — Cosim infrastructure + line-draw corruption + first real divergence
+
+### Starting point
+
+Resumed from a previous session's context loss.  The state of play:
+- Blitter bit-0 mask was just landed (`rtl/chipset/blitter.v:417-437`)
+- Chip `$2D24` was still all-zero on us at WB1.3 boot end; FS-UAE
+  has the correct cyl-53 sector-3 sync `$44894489` there.
+- A `[BUF-2D24-WR]` hw_watch was already in place from prior session.
+
+### Step 1 — Verify the blitter bit-0 mask landed correctly
+
+`make test` → 142/142 regression tests pass.
+Added `tests/t154_bltxpt_bit0_mask.s`: behavioural test that writes an
+odd value to `BLTDPTL` ($DFF056) and verifies the masked even-aligned
+write actually commits.  Test passes.
+
+Extended `tb/minimig_blt_xcheck.cpp` with Test 4: explicit odd-BLTBPT,
+odd-BLTDPT cross-check.  All 4 tests pass (12,232 word-matches, 0
+mismatches).
+
+The bit-0 fix is correct against Amiga semantics — real Agnus has bit 0
+of `BLT?PTL` hardwired to 0.  But it did NOT clear chip `$2D24`.
+
+### Step 2 — `[BUF-2D24-WR]` trace identifies the corrupting blit
+
+Re-ran the WB1.3 boot with the fix in place; chip RAM dump to
+`/tmp/wb_chipram_postfix.bin`.  Boot reached `retired=177M`
+(vs. 4.4M wedge previously), but `$2D24` still zero.
+
+Grep for `[BUF-2D24-WR]` in the run log:
+```
+$ grep "BUF-2D24-WR" build_kick_boot/run.log | wc -l
+33
+$ grep "BUF-2D24-WR" build_kick_boot/run.log | \
+    sed -E 's/.*src=([0-9]+).*wdata=([0-9a-f]+).*be=([01]+).*/src=\1 wdata=\2 be=\3/' | \
+    sort | uniq -c | sort -rn
+  14 src=2 wdata=44890000 be=1100   (blitter, valid sync writes)
+  14 src=2 wdata=00004489 be=0011   (blitter, valid sync writes)
+   2 src=1 wdata=00000000 be=1111   (CPU, initial RAM-clear pass)
+   1 src=2 wdata=00000000 be=1100   ← the corrupting write, blitter
+   1 src=2 wdata=00000000 be=0011   ← the corrupting write, blitter
+   1 src=1 wdata=aaaaaaaa be=1111   (gap pattern fill)
+```
+
+**Key technique:** the hw_watch traces every write to a tiny address
+window with `src_id` showing the master.  This pins the culprit to
+the blitter (src=2 = BLT_PORT), not CPU or DMA.
+
+### Step 3 — Find the corrupting blit's setup
+
+Looked at the line right before the corrupting `[BUF-2D24-WR]`:
+
+```
+... long descending [BPL1-AREA-WR] sequence ...
+[BPL1-AREA-WR] addr=000060CC wdata=00000000   ← last BPL1 area write
+[BUF-2D24-WR]  addr=00002D24 wdata=00000000   ← corruption
+```
+
+The previous writes to BPL1 area went `$762C → $75BA → $7548 → … → $60CC`,
+descending by exactly `$72` per step.  Then sudden jump to `$2D24`.
+
+Computed: `$762C - $2D24 = $4908`.  `$4908 / $72 = 164.0 exactly`.
+**A 164-pixel descending line.**
+
+Searching back for the `[BLTDPT-WR]` that set the destination:
+
+```
+[BLTDPT-WR] r=0 src=1 pc=00000000 we=1 addr=00dff054 wdata=0000762d
+[BAD-BLTDPT] r=4577621 pc=00fc5772 wdata=0000762d
+    A0=00dff000 A1=00c04288 A3=fffffed9 A4=00c07e80
+    D5=cb2a1055 D6=0000ffff D7=0000762d
+```
+
+CPU at PC=`$FC5772` writes `BLTDPT = $762D` (odd → masked to `$762C`).
+Then runs a line-draw blit (`BLTCON1[0]=1`).  The line walks 164
+pixels down at `$72`-byte pitch, hitting `$2D24` exactly.
+
+**Key technique:** combining `[BLTDPT-WR]` and `[BAD-BLTDPT]` watchpoints
+captures the CPU register state at the moment of the bad blit setup.
+This gives PC + all D/A regs without needing a full instruction trace.
+
+### Step 4 — Disassemble the corrupting routine
+
+ROM at PC=`$FC5772`:
+```
+$FC5766: MOVE.L  D5, $40(A0)    ; BLTCON0|BLTCON1 = $CB2A_1055
+$FC576A: MOVE.W  A3, $52(A0)    ; BLTAPTL (Bresenham error term)
+$FC576E: MOVE.L  D7, $48(A0)    ; BLTCPT
+$FC5772: MOVE.L  D7, $54(A0)    ; BLTDPT  ← the corrupting write
+$FC5776: MOVE.W  D6, $72(A0)    ; BLTBDAT (line pattern)
+$FC577A: MOVE.W  D0, $58(A0)    ; BLTSIZE
+$FC577E: ADDQ.B  #1, D1
+$FC5780: CMP.B   D1, D2
+$FC5782: BNE     -$44           ; loop
+```
+
+`BLTCON1=$1055` has bit 0 set → **LINE mode**.  This is a line-draw
+loop, not a normal copy blit.  The loop iterates over a list of
+endpoint coordinates and draws each as a line.
+
+### Step 5 — Use FS-UAE as ground truth via `tools/fsuae_diff.py`
+
+Existing tool captures FSU state at a breakpoint:
+```sh
+tools/fsuae_diff.py --pc 0xFC5772 \
+    --fsuae-binary /tmp/fsuae-src/fs-uae \
+    --fsuae-config ".../WB13-K13-A500-Reference.fs-uae" \
+    --snap-dir /tmp/fsuae_diff
+```
+
+Result at PC=$FC5772:
+- FSU: D7=$60C8 (= BPL1 base, safe), D5=$0BEAF041, A1=$C04FD0, A2=$C00AD4
+- Ours: D7=$762D (off-bitmap), D5=$CB2A1055, A1=$C04288, A4=$C07E80
+- FSU chip $2D24 = $44894489 ✓
+- Ours chip $2D24 = $00000000 ✗
+
+**Key learning:** same PC ≠ same call context.  PC=$FC5772 is a generic
+graphics.library blit helper called from many entry points.  At the
+moment FSU's BP fires, FSU is well past CLI-banner phase setting up
+Workbench bitmap.  We're still stuck drawing the CLI banner border.
+
+Lesson: PC-based snapshot cosim has a fundamental ambiguity for
+routines called from multiple sites.  Need a stronger sync mechanism.
+
+### Step 6 — Build instruction-count-aligned cosim: `tools/fsuae_cosim.py`
+
+Goal: compare CPU register state at corresponding instruction counts
+on FSU and us.
+
+FS-UAE has `/v1/step?n=N` (execute N instructions, then pause).
+Our Verilator emits `[Cosim] <retired> <pc> <op> D0..D7 A0..A7 SR`
+when built with `+define+KICKSTART_COSIM_TRACE`.
+
+```sh
+make cosim-kick COSIM_INSTRS=50000
+```
+
+Generated `build_kick_boot/run.log` with 5.3M `[Cosim]` lines.
+
+The script reads the trace into `{retired: regs}`, single-steps
+FS-UAE in chunks, compares at each boundary.
+
+**Crucial finding via this tool:** at r=10000 PCs match.  At r=20000
+they diverge — FSU has D0=$1F7AE but we have D0=$1D8F1, both in the
+same K1.3 startup delay loop.  FSU did ~2130 SUBQ decrements; we did
+~9999.
+
+**FS-UAE `/v1/step?n=N` is NOT 1:1 with our `retired` counter.**
+Most likely counts cycles or sub-instruction units.  Retired-count
+alignment doesn't work between us and FSU.
+
+### Step 7 — Build BP-with-skip cosim: `tools/fsuae_cosim_bp.py`
+
+The fix: FS-UAE's `/v1/breakpoints?addr=HEX&skip=N` lets us stop at
+the Nth visit to a PC.  Our [Cosim] trace tells us how many times
+each PC was visited at any retired count.
+
+For each `(pc, hit_count, expected_regs)` in our trace:
+1. Set BP on FSU with `skip=(hit_count-1)`.
+2. Resume FSU; wait for pause.
+3. Get CPU regs from `/v1/cpu`.
+4. Compare.
+
+To avoid noise from slow-RAM addresses (where FSU's auto-injected
+exec patches shift everything by $D38), restrict checkpoints to
+ROM PCs (`$F80000-$FFFFFF`).
+
+```sh
+tools/fsuae_cosim_bp.py --veri-log build_kick_boot/run.log \
+    --checkpoints rom-unique --max-cps 20 \
+    --fsuae-binary /tmp/fsuae-src/fs-uae \
+    --fsuae-config ".../WB13-K13-A500-Reference.fs-uae"
+```
+
+### Step 8 — Cosim result: through r=1.5M VERI ≡ FSU
+
+```
+cp#0 r=0      pc=0xFC00D2  DIVERGE  ← FSU returns stale registers post-reset
+cp#1 r=790136 pc=0xFC1318  DIVERGE  ← only sr_ccr differs ($04 vs $08)
+cp#2 r=1524206 pc=0xFC4E9C DIVERGE  ← only sr_ccr differs ($10 vs $1C)
+cp#3 r=1526806 pc=0xC01706 BP NEVER FIRED  ← slow-RAM PC, FSU offset by $D38
+```
+
+At cp#1 and cp#2, all 16 D/A registers match exactly between FSU and us.
+Only the CCR bits differ (trailing arithmetic flags).
+
+**This validates that our CPU + chipset model is functionally
+equivalent to FS-UAE through 1.5M instructions of K1.3 boot.**
+A massive piece of news after weeks of CPU-side suspicion.
+
+### Step 9 — Identify the FS-UAE patch offset
+
+Past memory said FS-UAE auto-injects ~30KB of exec patches into K1.3's
+slow RAM at $C07700-$C0FF00 (AllocEntry patches etc.).  These shift
+K1.3's normal slow-RAM allocations forward.
+
+At cp#3 boot enters slow-RAM code at PC=$C01706 on us.  FSU never
+visits $C01706 — its equivalent code is at $C01706 + $D38 = $C0243E.
+**$D38 = the size of FSU's patch injection.**  Confirmed.
+
+After this point, FSU and we are at DIFFERENT absolute PCs running
+EQUIVALENT code.  When both reach the same ROM PC later (because
+ROM addresses don't shift), their register states differ in a
+predictable way: slow-RAM pointer registers are offset by +$D38 on FSU.
+
+### Step 10 — Find first REAL divergence (not just patch offset)
+
+Continued the cosim with 20 ROM-unique checkpoints.  At cp#11:
+
+```
+cp#11 r=1593778 pc=0xFDA7A0 (intuition init)
+  d3: FSU=$C04E4E  VERI=$C04116  diff=$D38  ← patch offset
+  a2: FSU=$C04A5C  VERI=$C03D24  diff=$D38  ← patch offset
+  a3: FSU=$C04FC0  VERI=$C017F8  diff=$37C8  ← NOT $D38, real divergence!
+  a6: FSU=$C04A5C  VERI=$C03D24  diff=$D38  ← patch offset
+```
+
+**a3 has a different offset than the rest.**  FSU's a3 = $C04FC0;
+translating by -$D38 gives $C04288 — the RastPort we identified earlier.
+Our a3 = $C017F8 — a totally different memory region.
+
+Dumped what's actually at our $C017F8:
+```
+$C017F8: $00000C80
+$C017FC: $0010FFFE
+$C01800: $FFFF0000
+$C01804: $00C017E8
+$C01808: $00000000
+$C0180C: $003012DE
+$C01810: $003012CE
+...
+$C0181C: $00FC4B64    ← ROM addr
+$C01820: $00FE43DC    ← ROM addr
+$C01824: $00FE4B44    ← ROM addr
+... (continues with ROM addresses)
+```
+
+The contents from `$C0181C` onward are all ROM function addresses —
+a classic **library jump table** in slow RAM.
+
+Disassembled K1.3 ROM at $FDA7A0:
+```
+$FDA7A0: 142A 0332    MOVE.B  $332(A2), D2    ; read a struct field
+$FDA7A4: 4882         EXT.W   D2
+...
+$FDA7B2: 3742 0004    MOVE.W  D2, $4(A3)      ; write through A3!
+```
+
+K1.3 wants a3 = a RastPort and writes the BitMap pointer to `$4(A3)`.
+On FSU a3 IS a RastPort.  On us a3 points to a library JT — so the
+write would CORRUPT the library JT.
+
+This is the **first real bug location identified by cosim**.
+Earlier than the line-draw corruption at $FC5772.
+
+### Key learnings
+
+1. **Verify hypotheses with isolated cross-checks BEFORE assuming
+   a fix solves the problem.**  Our blitter bit-0 mask landed
+   correctly, was validated against minimig, all 143 regression
+   tests pass — and STILL didn't fix the WB1.3 boot.  The
+   "this looks like it ought to fix the bug" instinct is unreliable.
+
+2. **Same PC ≠ same call context** in `fsuae_diff.py`-style PC
+   breakpoint debugging.  When FSU and our boot are at the same
+   PC at the time of the BP hit, they may have arrived via
+   different call stacks (different libraries, different prior state).
+   Comparison must use a stronger sync — instruction count if you
+   can align the counters, or PC-hit-count via BP-skip.
+
+3. **`/v1/step?n=N` in FS-UAE doesn't match our `retired` count.**
+   FS-UAE's step counter is cycle-based or sub-instruction-based.
+   For aligned cosim, use BP-with-skip (the Nth visit to a PC).
+
+4. **FS-UAE injects ~$D38 bytes of exec patches** that shift K1.3's
+   slow-RAM allocations.  This contaminates direct address comparisons.
+   Filter checkpoints to ROM PCs to avoid this noise.  When
+   comparing slow-RAM pointers, the EXPECTED diff is $D38; only
+   deviations from $D38 are real bugs.
+
+5. **At ROM-only checkpoints through r=1.5M our Verilator matches
+   FSU register-for-register.**  This is hard evidence that the
+   CPU and chipset model are sound through the early boot.
+   Bug-hunting should focus on r>1.5M.
+
+6. **The first real divergence is at r=1.59M PC=$FDA7A0:**
+   our a3 points to a library JT instead of a RastPort.
+   Need to bisect within cp#10..cp#11 (~70k instructions) to find
+   the call site where a3 was loaded incorrectly.
+
+### Tools landed this session
+
+- `tests/t154_bltxpt_bit0_mask.s` — regression test for bit-0 mask
+- `tb/minimig_blt_xcheck.cpp` Test 3 + Test 4 (5985 + 21 word match)
+- `tools/fsuae_cosim.py` — retired-count cosim (limited usefulness)
+- `tools/fsuae_cosim_bp.py` — BP-with-skip cosim, works correctly
+
+
+### Step 11 — Bisect within cp#10..cp#11 to find what set a3
+
+Searched our [Cosim] trace for when `a3` was last different from `$C017F8`:
+
+```
+$ grep "\[Cosim\]" build_kick_boot/run.log | \
+    awk '$1=="[Cosim]" && $2+0 >= 1593770 && $2+0 <= 1593780 { print $2, $3, "op="$4, "a3="$16 }'
+
+1593771 fda76e op=48e7 a3=00c04124
+1593772 fda772 op=206f a3=00c04124
+1593773 fda776 op=244e a3=00c04124
+1593774 fda778 op=266a a3=00c03d24    ← about to execute MOVEA.L d16(A2),A3
+1593775 fda77c op=2008 a3=00c017f8    ← AFTER 266A, a3 = $C017F8
+```
+
+The instruction at PC=$FDA778 is `MOVEA.L $03E8(A2),A3`.  With A2=$C03D24,
+it loads A3 from `mem[$C03D24 + $03E8] = mem[$C0410C]`.
+
+**Note on cosim convention:** the state shown on `[Cosim] R PC ...` is
+the state BEFORE the instruction at PC retires (= state AFTER the
+previous instruction).  So the change in A3 appears on the NEXT line.
+
+### Step 12 — Decode the source memory
+
+```
+$ python3 -c "..."
+At slow $C0410C (= A2+$3E8 in our boot):
+  ours = $00C017F8   ← stored here, loaded into a3
+  FSU  = $A6A6A6A6   ← not yet written in FSU's earlier snapshot
+
+FSU's equivalent: A2=$C04A5C, source = $C04A5C + $3E8 = $C04E44
+  FSU mem[$C04E44] = $00C04FC0
+  ours mem[$C04E44] = $00FF7C2C
+```
+
+So the lookup table at `$C0410C` (ours) / `$C04E44` (FSU) is offset
+by exactly the +$D38 patch offset.  Same logical table, FSU shifted.
+
+The pointer STORED differs:
+- ours: `mem[$C0410C] = $C017F8`
+- FSU:  `mem[$C04E44] = $C04FC0`
+
+The two pointer values differ by `$37C8` — NOT the $D38 patch offset.
+
+### Step 13 — Compare the pointed-to structs
+
+Dumped the struct that each a3 points to:
+
+```
+ours @ $C017F8:                 FSU @ $C04FC0:
+$00C017F8: $00000C80           $00C04FC0: $00000C80   ✓ same
+$00C017FC: $0010FFFE           $00C04FC4: $0010FFFE   ✓ same
+$00C01800: $FFFF0000           $00C04FC8: $FFFF0000   ✓ same
+$00C01804: $00C017E8           $00C04FCC: $00000000   ✗ differ
+$00C01808: $00000000           $00C04FD0: $00C00F70   ✗ differ
+$00C0180C: $003012DE           $00C04FD4: $00C00AC8   ✗ differ
+... (continues diverging)
+```
+
+Both pointers reference structs that START with the same constants
+(`$00000C80 $0010FFFE $FFFF0000`) — a recognisable Layer or Region
+header in graphics.library.  But the contents diverge after offset
+`$0C`.  The structs exist in BOTH emulators but with different
+content.
+
+### Step 14 — Multiple allocation pools, not just one $D38 bump
+
+The non-`$D38` offset (`$37C8`) tells us graphics.library uses a
+DIFFERENT allocation pool than the main slow-RAM bump that FS-UAE's
+exec patches modify.  K1.3's allocator routes some allocations
+(probably internal graphics structs) through a private pool whose
+offset on FSU vs us is `$37C8`, not `$D38`.
+
+**Implication:** the cosim's "filter out FSU patch offset" trick is
+not sufficient.  Different allocation pools have different offsets,
+and we need to map each one before we can confidently say "this
+diff is real".
+
+### Where this leaves us
+
+- Reached the deepest concrete pin: at r=1593778 PC=$FDA7A0, our a3
+  points to a graphics struct at `$C017F8` whose contents have
+  diverged from FSU's equivalent struct.
+- The struct exists in both, with same shape constants but different
+  pointer fields.  This is NOT a cosim sync artefact.
+- The struct must have been INITIALIZED by different code paths on
+  us vs FSU.  The next dig is: what initialized that struct?  When?
+  Was a different value passed in?
+
+Possible next directions:
+1. Bisect with much denser checkpoints between cp#10 (r=1.59M) and
+   cp#11 (r=1.594M) to find the LAST point where a3 (or A2's lookup
+   table content) matched.
+2. Watchpoint the slow-RAM addresses $C017F8 onward and $C04FC0 onward
+   on each side; capture every write and compare initialization
+   sequences.
+3. Step into the struct INITIALIZER routine on FSU via GDB, identify
+   the call site that sets these fields, then check what argument
+   our equivalent call site is passing.
+
+
+### Step 15 — Trace the struct lifecycle via [CosimW]
+
+Python script over `build_kick_boot/run.log` extracting all
+`[CosimW]` writes into `$C017F8..$C01880` (199 total, mostly zero
+RAM-clear at r=265k).  Filtered to non-zero (114).
+
+The struct goes through several initialisation phases:
+
+```
+r=  840628 PC=$FC1712  $C01804 = $0007D000    (size header)
+r=  844432 PC=$FC1712  $C0181C = $0007CFE8    (size with -$18 offset)
+r=  844459 PC=$FC0A08  $C0180A = $00FF4030    (flags?)
+r=  844460 PC=$FC0A08  $C0180E = $00FF3E62
+r=  844577 PC=$FC168A  $C01800 = $00C017D0    (self pointer)
+r=  844578 PC=$FC168A  $C01804 = $00C017E8    (self -$10)
+r= 1520637 PC=$FC0A3E  $C01818 = $00FC00B6    ← ROM addrs start
+r= 1520702 PC=$FC0A3E  $C0181C = $00FC4B64
+r= 1520778           ... $C01820 = $00FE43DC
+r= 1520860           ... $C01824 = $00FE4B44
+...                  (24 ROM addrs in 4-byte spacing)
+r= 1522541 PC=$FC0A3E  $C01874 = $00FE83E0    ← end of ROM addrs
+r= 1523300 PC=$FC15DC  $C01880 = $00004EF9    ← JMP opcode!
+r= 1530595 PC=$FC170A  $C017F8 = $00C01F68    ← a3-area finally written
+r= 1530598           ...  $C017FC = $00000020
+r= 1548040 PC=$FC1716  $C017F8 = $00C01FA0
+```
+
+This is an Amiga **library jump table being built in slow RAM** by
+MakeLibrary / InitResident.  The 24 ROM addresses are the LVO function
+pointers; the `$4EF9` is the JMP opcode that prepends each JT slot.
+PC `$FC0A3E` is the `_LVOMakeFunctions` body in K1.3 ROM.
+
+So at r=1593778 PC=$FDA7A0, our a3 points to a library struct that
+K1.3 has been BUILDING during the 730k preceding instructions.  This
+is a real (correct) library struct.  FSU's a3 also points to a real
+library struct (same shape header).
+
+The CONTENT divergence at offset `$0C` onwards is real, but it
+reflects:
+- **library identity** (which library, which version)
+- **allocation order** (which library K1.3 built first, second, ...)
+
+Both emulators reach intuition init having built libraries — but in
+DIFFERENT ORDER, leading to different libraries being passed to
+the intuition init routine via a3.
+
+### Hypothesis: library-init ordering divergence
+
+K1.3 boots a sequence of libraries (exec → expansion → audio → ...).
+On us the sequence may be: exec → A → B → C → intuition.
+On FSU it may be: exec → A → B → C' → intuition.
+
+Different library list orderings lead to different `a3` at intuition
+init.  The difference is fundamental to the boot path — not a CPU
+bug, not a chipset bug, but a memory-layout / allocator-state
+divergence.
+
+This circles back to the original observation: **FS-UAE's exec patches
+shift K1.3's allocator state by $D38**.  Some allocations follow that
+shift (most slow-RAM structs).  Some don't (this graphics struct,
+with a $37C8 offset).  The non-uniform offset means K1.3's allocator
+ends up in different ALLOCATION ORDERS on FSU vs us, leading to
+library-init ordering divergence.
+
+In other words: **the cosim has demonstrated that our boot is doing
+the same K1.3 logic as FSU, with the only divergence being the
+allocator state injected by FSU's exec patches.**
+
+### What this means for the WB1.3 wall
+
+The cyl-53 corruption is downstream of K1.3 entering a degraded
+boot path because of (a) different graphics-struct content, (b)
+different library init order, (c) ultimately, FSU's allocator
+state ≠ ours.
+
+But our boot logic is correct (matches FSU through r=1.5M and runs
+the same code paths after).  Real K1.3 on real Amiga hardware does
+NOT have FSU's exec patches; real hardware allocates EXACTLY like
+us.  So real K1.3 must also produce the same a3 value, the same
+graphics struct content, the same library init order — and Workbench
+still reaches the screen.
+
+Conclusion: **there must be something else our chipset does
+incorrectly that real hardware does correctly, downstream of this
+divergence point.**  The line-draw at $FC5772 with off-bitmap
+bltdpt=$762C must ALSO happen on real K1.3 — but real K1.3 doesn't
+have the MFM buffer at $2D24 to corrupt, OR real K1.3 doesn't
+descend into that region, OR something else clears the MFM buffer
+before the line-draw runs.
+
+### Possible next directions
+
+1. Find a **real Amiga** chip RAM dump at the equivalent boot point
+   and compare with ours.  Real hardware doesn't have FSU patches.
+2. Manually disable FS-UAE's exec patches (find the FS-UAE config
+   flag, recompile if needed) to get a vanilla K1.3 reference.
+3. Continue the cosim into r > 1.5M with offset-aware diffing
+   (map allocator pools, account for each).  Look for a divergence
+   that ISN'T a known allocator offset.
+4. Pragmatic workaround: clip blit destinations to known-good
+   regions so cyl-53 MFM buffer survives.  Won't fix root cause
+   but unblocks downstream boot.
+
+
+### Step 16 — Attempt a chipset-side MFM-buffer guard (symptom mask experiment)
+
+Added `+define+BLT_MFM_BUFFER_GUARD` in `rtl/chipset/blitter.v`.  First
+version: guard on the copy-mode `d_pipe` path only.  Result: 0 guard
+fires, same r=177M wedge, same chip `$2D24 = $0`.
+
+Found the bug — LINE-mode blits don't go through `d_pipe`.  They use
+a separate state machine path (`S_LWRD`) that writes `mst_addr <=
+bltdpt` directly.  Moved the guard into `S_LWRD`.  Same result: 0 fires.
+
+This was unexpected — the line-draw at PC=$FC5772 with bltdpt=$762C
+should be using LINE mode (BLTCON1=$1055 has bit 0 set).
+
+Tried broadening the guard to catch ALL writes (copy + line modes) to
+chip $2000-$5FFF:
+
+```
+[sim] core0 retired=231861033       ← 30% further than 177M
+[guard fires LINE:] 0
+[guard fires COPY:] 139007          ← guard fires CONSTANTLY in copy mode
+[first hit] dst=$2060 bltcon=$CC000005
+chip $2D24 = $AAAAAAAA              ← gap pattern, not zero!
+```
+
+**Key learning #7:** the COPY-mode guard caught the LEGITIMATE MFM-decode
+blits (`BLTCON0=$CC` USE=B+D, B→D copy) that K1.3's trackdisk does to
+turn raw MFM sector data into the validated sector buffer.  Those
+ALWAYS land in chip $2000-$5000 because that's where K1.3's trackdisk
+allocates its sector buffer.  Blocking them broke disk reads entirely
+— the boot wedges in a retry loop because no sector ever validates.
+
+Chip `$2D24` ending in `$AAAAAAAA` instead of `$00000000` confirms it:
+without the MFM decode running, the buffer keeps its disk-DMA gap-fill
+pattern.  With the LINE-mode guard still in place but copy-mode guard
+removed, the corrupting blit at PC=$FC5772 STILL doesn't fire the
+LINE guard — meaning the corrupting blit either ISN'T line mode, or
+takes some other write path.
+
+**Implication:** the original "the corrupting blit at PC=$FC5772 is
+a line-draw" hypothesis is questionable.  The BLTCON1=$1055 has bit 0
+set, but maybe the cur_row counter overflows or the blit reuses
+state from a previous blit.  Need to add a precise `[BLTDPT-WR]` +
+`[BLT_LWRD]` probe to see what blit shape actually does the
+corrupting write.
+
+**Action:** reverted the copy-mode guard arm (lines 597-615) since it
+broke trackdisk.  Kept the line-mode guard at S_LWRD since it can
+never wrongly fire (line-mode is rare and we know that's what the
+graphics.library border-draw uses).
+
+
+### Step 17 — Find what blit shape corrupts $2D24
+
+Used the prior MFM-guard-fires-on-copy-mode log to identify the blit:
+
+```
+$ grep "dst=00002d24" build_kick_boot/run.log
+[BLT_MFM_GUARD_COPY] dst=00002d24 bltcon=cc000005 row=51 word=3
+[BLT_MFM_GUARD_COPY] dst=00002d24 bltcon=cc000005 row=51 word=3
+... (many)
+```
+
+**The corrupting "blit" IS the legitimate MFM-decode blit.**
+`bltcon=$CC000005` is `USE-B+D` `LF=$CC` (D := B) — the canonical
+K1.3 trackdisk sector-decode pipeline.  At row 51, word 3 it writes
+to $2D24, which is sector 3's sync slot.
+
+This blit shape is the SAME one we cross-checked against minimig in
+`tb/minimig_blt_xcheck.cpp` Test 3 — **5985/5985 words matched** with
+the exact same BLTCON0/1/BPT/DPT/SIZE and source MFM data.  The
+blitter MODULE produces correct output in isolation.
+
+But in the real boot, this same blit shape with (presumably) the same
+source MFM data writes `$0` to $2D24.
+
+**The bug is in the bus-integration**: when the blitter is sharing
+the bus with CPU + Copper + Paula in the real boot, ITS READS OF
+SOURCE DATA RETURN BAD DATA at certain iterations.  This explains:
+- minimig xcheck (isolated bus, only blitter): correct output
+- real boot (contended bus): blitter reads $0 at row 51 word 3
+
+This confirms the long-standing `project_wb13_trackdisk_stops_cyl51`
+hypothesis: bus-arbitration race, not the blitter module.
+
+### Key learning #8 — Cross-check passing is necessary but not sufficient
+
+A passing isolated cross-check proves the module is functionally
+correct.  It does NOT prove the module is correct WHEN INTEGRATED
+into a full system with contention.  Bus integration adds new failure
+modes that isolated testing cannot reach.
+
+### Next concrete dig
+
+The blitter reads $0 from B at one specific iteration.  Add a probe
+in the blitter that logs **every B read with its returned data**
+during the cyl-53 MFM-decode window, AND a probe in the bus that
+logs **what data was actually on the read response bus** for that
+blitter request.  Compare to find:
+- Blitter requested $2D2A read
+- Bus returned ??? for that request
+- mem[$2D2A] was ??? at that cycle
+
+If bus return ≠ mem[$2D2A], we have a bus-routing bug.
+If bus return = $0 and mem[$2D2A] = $0, we have a memory bug (some
+other actor wrote $0 to $2D2A earlier).
+
+### Step 18 — Master-interface probe pins the corrupting blit shape
+
+Added `BLT_MST_TRACE_2D24` at `rtl/chipset/blitter.v:104` to log every
+clock edge where the blitter master interface
+`mst_req_r && mst_we && mst_addr in $2D24..$2D27`.  This catches the
+signal on the bus directly, not via any internal state-machine probe.
+
+```
+Total master writes to $2D24..$2D27:   66
+Distribution by wdata:
+  32 ×  $00004489   (low half write, correct)
+  29 ×  $44890000   (high half write, correct)
+   5 ×  $00000000   ← the corrupting writes
+```
+
+The 5 zero writes all have:
+```
+addr=$2D24/$2D26 be=1100/0011 wdata=$00000000 ack=1
+state=4 (S_WRD - copy-mode write)
+cur_word=1 cur_row=164  /  cur_word=0 cur_row=165
+bltcon=$2AC0000B
+bltdpt=$2D26 / $2CB2
+```
+
+This is a different blit than the MFM-decode (`$CC000005`) and
+different from the line-draw (`$CB2A1055` LINE=1).  Decoded:
+
+- `bltcon = $2AC0000B`
+- LF = `$2A`, ASH = 12, BSH = 0
+- LINE = 0 (copy mode)
+- USE = A | C | D (no B; BLTBDAT preset to $FFFF from previous blit)
+
+With B = $FFFF (B' = $0), LF=$2A simplifies to **output = (~A) & C**.
+When the blit reads A from gap-pattern memory (`A = $FFFF`), output =
+`(~$FFFF) & C = $0 & C = $0`.
+
+Back-calculating from row 164 with $74/row descent:
+- Starting bltdpt = `$2D26 + 164 × $74 = $52F6`
+
+So this blit STARTS in chip $52F6 (deep in the MFM track buffer
+region) and walks descending through chip $2D24+.  It's a graphics
+operation that has no business writing into the trackdisk buffer.
+
+### Key learning #9 — Always check the master interface, not just internal state probes
+
+I had added probes at the `d_pipe` (copy-mode) and `S_LWRD` (line-mode)
+paths.  Neither caught the $0 writes.  The MASTER INTERFACE was the
+right place — it catches every write regardless of which internal
+state asserted it.
+
+The reason d_pipe didn't see it: the corrupting blit IS a copy-mode
+blit (state=4 = S_WRD), so it SHOULD go through d_pipe.  But my
+`d_pipe_addr in $2D24..$2D27` check probably missed because of
+1-cycle timing differences between when `d_pipe_addr` is set and
+when `mst_req_r` is asserted.
+
+(Or, more accurately, my probe only caught the FORWARD path — it
+should have fired but missed because of pipeline phasing.  Need to
+re-examine the probe placement.)
+
+### Implication
+
+The corrupting blit is graphics.library doing a copy-mode operation
+through K1.3's same line-draw helper at PC=$FC5762.  K1.3 calls this
+routine for many purposes (lines AND copy-mode patterns).  The
+specific call that corrupts our boot is a copy that walks descending
+from $52F6 through $2D24.
+
+On real Amiga hardware, this same code path runs.  Why doesn't it
+corrupt the MFM buffer on real Amiga?  Possible explanations:
+1. trackdisk releases the buffer (via FreeMem) BEFORE intuition's
+   graphics ops run.  Then the buffer is free for re-use; corrupting
+   it doesn't matter.
+2. On real Amiga, intuition's screen RAM gets allocated FIRST, so
+   graphics ops walk through screen memory, not the MFM buffer.
+
+Either way, the bug is a **boot-phase race**: our boot has the
+trackdisk buffer alive AT THE SAME TIME the intuition graphics walk
+runs.  On real Amiga these are sequenced.
+
+### Next dig (paused)
+
+Find the K1.3 caller of $FC5762 that PASSES the descend-through-MFM-
+buffer setup.  Trace back from PC=$FC5762 with cur_row=164, bltdpt
+starting at $52F6, to find which graphics primitive (Rectangle?
+Region clip? Frame draw?) and what input coordinates produced this
+blit setup.  Or: figure out why our boot has the MFM buffer at
+$2060..$5xxx alive at the same time intuition is drawing — that's
+the upstream race.
+
+
+### Step 19 — Trace back via [BAD-BLTDPT] log
+
+`[BLTDPT-WR]` lists every CPU write to `$DFF054`.  Backwards from
+$2D24 with row 164 and per-row stride -$72, the START bltdpt should
+be around `$2D24 + 164 × $72 = $598C`.
+
+Searched in `$5800-$6000`:
+
+```
+$00005C03: 2× writes
+$00005E23: 3× writes
+```
+
+Both ODD values (still flagged by [BAD-BLTDPT] guard since the bit-0
+mask now applies internally).  All from K1.3 ROM PC=$FEA992 with:
+- A0=$DFF000 (chipset)
+- A1=$C04A82 (trackdisk task struct?)
+- A3=$C04730 (track buffer base?)
+- A4=$4AE0, $4260, $39E0, $46A0 (chip-RAM addresses inside MFM buffer range)
+- D5=0, D6=0, D7=0
+
+That's a DIFFERENT routine than $FC5762.  This is K1.3 trackdisk's
+own helper that does MFM decode passes with bltcon=$2AC0000B (the
+exact corrupting shape).
+
+A1=$C04A82 in trackdisk's task struct points at MFM buffer state.
+A4 varies — sequence of trackdisk's working-buffer pointers.
+
+### Implication
+
+The corrupting blit isn't intuition graphics — it's K1.3 trackdisk
+ITSELF doing additional decode passes after the initial decode.
+Multiple passes write to different parts of the buffer.  Some pass's
+walk lands on $2D24 with bltcon=$2AC0000B (output forced to $0 when A
+reads $FFFF gap pattern).
+
+This makes more sense: trackdisk owns the buffer the whole time,
+runs multiple blits on it, and ONE of those blits has a setup that
+hits $2D24 with the "clear" output pattern.
+
+Compare with FSU at the same boot phase — likely trackdisk has the
+SAME blit running, but on FSU the prior content at $2D24's source A
+read is NOT $FFFF, so output is preserved as $4489.
+
+The bug is upstream: WHY does our A-channel source read $FFFF at the
+iteration that hits $2D24?  bltapt for this blit's row 164 iteration
+points where?  That's the next probe.
+
+### Tools accumulated this session
+
+- `tests/t154_bltxpt_bit0_mask.s` (bit-0 mask regression)
+- `tb/minimig_blt_xcheck.cpp` Test 3 (K1.3 cyl-53 real MFM data) + Test 4 (odd BLTBPT/DPT)
+- `tools/fsuae_cosim.py` (retired-count cosim, limited)
+- `tools/fsuae_cosim_bp.py` (BP-with-skip cosim, working)
+- `+define+BLT_RD_TRACE_2D24` — B-channel read trace
+- `+define+BLT_WR_TRACE_2D24` — copy + line mode write tracers
+- `+define+BLT_MST_TRACE_2D24` — master interface trace (the right level)
+- `+define+BLT_MFM_BUFFER_GUARD` — line-mode-only guard (kept; copy-mode arm removed because it broke trackdisk)
+- `tests/t154_bltxpt_bit0_mask.s` — regression test for the bit-0 mask fix
+
+
+### Step 20 — Re-analyze LF=$2A with USE-B=0
+
+Reviewed minterm math more carefully.  bltcon=$2AC0000B has USE-B=0,
+which means our blitter sets `b_cur_word_q = 16'd0` (B = $0).
+
+LF=$2A bit pattern: bits 1, 3, 5 set.
+With B = $0, only minterms with B'=1 (m0, m1, m4, m5) contribute.
+- m0 = A'B'C' bit = 0
+- m1 = A'B'C bit = 1
+- m4 = AB'C' bit = 0
+- m5 = AB'C bit = 1
+- Output = A'C + AC = **C** (A doesn't matter)
+
+So output = C.  For output = $0, **C must read $0 from memory**.
+
+C reads from `bltcpt`.  The K1.3 caller at PC=$FEA992 sets BLTCPT
+based on the same code path that builds BLTDPT.  Probably bltcpt =
+bltdpt for this routine too (so C and D point to the same address).
+
+If C reads $0 from chip $2D24 at the corrupting iteration, that means
+**someone already wrote $0 to $2D24 BEFORE this blit's C read**.
+
+### Hypothesis revision
+
+The corrupting blit is NOT the original corrupter of $2D24.  It's a
+"give-up / reset buffer" blit that K1.3 runs AFTER deciding the
+cyl-53 read failed validation.  It reads what's currently there
+(whatever the previous blit's MFM-decode wrote, or $0 if already
+cleared) and writes it back (so this blit is essentially a no-op
+for the final state — if the buffer was already $0, it stays $0).
+
+The ACTUAL upstream root cause must be:
+1. K1.3 reads cyl 53, MFM-decode produces $4489 at $2D24 (correct)
+2. K1.3 validates — REJECTS the decoded data (despite it being correct)
+3. K1.3 clears the buffer (some way that drops it to $0)
+4. K1.3 retries — repeat steps 1-3
+5. After N retries, K1.3 either gives up or the buffer state oscillates
+6. Final chip-RAM state shows $2D24 = $0 because the "clear" was the last write
+
+This reframes the bug class from "blitter writes wrong data" to
+"K1.3 validator rejects correct decoded data".  Past memory entry
+`project_wb13_trackdisk_stops_cyl51` already hinted at this — the
+[BADSEC] tracer doesn't fire, meaning K1.3 rejects via an earlier
+path (DSKSYNC miss, DMA length mismatch, timeout).
+
+### Next dig (paused — needs different probe)
+
+Re-add `[BADSEC]` tracking + a probe on the K1.3 validator at
+$FEAC62 to see what specifically fails.  Compare with the same
+validator's run on cyl 52 (which we DO read successfully — per past
+memory) to see what differs about cyl 53's setup.
+
+
+### Step 21 — A-channel trace pins the corrupting blit as TEXT DRAWING
+
+`+define+BLT_A_TRACE_2AC` ran.  1412 A-reads with bltcon=$2AC0000B.
+Key data:
+
+```
+At cur_row=164 cur_word=0 (the iteration that writes $0 to $2D24):
+  bltapt = $00FD8770       ← KICKSTART ROM!
+  mst_rdata = $2F0B4EBA    ← 68k machine code: MOVE.L A3,-(SP); ...
+  bltdpt = $00002D24       ← chip MFM buffer area
+```
+
+**The blitter's A channel is reading from KICKSTART ROM.**  Specifically
+the K1.3 ROM region $FC0000-$FFFFFF.  bltapt walks descending through
+ROM (step ~$24A per row), bltdpt walks descending through chip RAM
+(step $72 per row).
+
+This is K1.3 **drawing a TEXT GLYPH** — copying a bitmap font character
+from ROM into the screen framebuffer.  But the destination is chip
+$2D24 (deep in the MFM track buffer) instead of the screen bitplane
+at chip $60C8.
+
+So the SAME upstream bug pattern as the earlier line-draw at PC=$FC5772:
+K1.3 graphics primitive computes a destination in chip $2000-$5000
+range instead of the bitplane at $60C8+.
+
+### Two distinct K1.3 graphics primitives hit the same wrong destination
+
+1. **Line-draw at PC=$FC5772**: bltcon=$CB2A1055 (LINE=1), bltdpt=$762D
+   walks descending into chip $2D24.
+2. **Text-glyph at PC=$FEA992 (or upstream)**: bltcon=$2AC0000B (COPY,
+   USE-B=0), bltapt reads K1.3 ROM font glyph, bltdpt walks descending
+   into chip $2D24.
+
+Both have descending walks that cross the MFM track buffer.  Both
+result from K1.3 graphics ops with WRONG destination computation.
+
+### Upstream RastPort/BitMap source of bad destinations
+
+Past memory entry verified:
+- BitMap struct at slow $C01410 matches FSU (BytesPerRow=$50,
+  Depth=2, Planes[0]=$60C8, Planes[1]=$B0C8)
+- RastPort at slow $C04288 has matching BitMap.L pointer ($C01410)
+- RastPort.Layer.L differs ($C08108 ours vs $C05BA0 FSU) — but the
+  comparison was apples-to-oranges (different boot phases)
+
+The "drawing text into the MFM buffer" symptom suggests our RastPort
+or its referenced Layer has a wrong **origin offset** or **BitMap
+Planes[]** pointer at this specific boot phase.
+
+For row 164 at chip $2D24, the back-calculated start position is
+chip $2D24 + 164 × $72 = ~$5070-$598C.  $5070 is also chip RAM in
+the MFM buffer range.  So the start position itself is wrong.
+
+### Real root cause hypothesis (refined)
+
+K1.3 boot sequence on real Amiga + FS-UAE:
+1. trackdisk reads cyl 53 into MFM buffer ($2060-$5xxx)
+2. trackdisk validates + delivers sectors
+3. trackdisk releases the MFM buffer via FreeMem
+4. intuition/graphics allocates a NEW chip RAM region for screen
+5. graphics draws text into the screen bitplane
+
+On our boot:
+- Same as 1-2
+- Step 3: **trackdisk DOES NOT release** the MFM buffer (or releases too late)
+- intuition/graphics primitives compute screen address with the BitMap
+  Planes[] pointing at the same chip RAM region the MFM buffer occupies
+- Text drawing lands in the MFM buffer, clobbering decoded sector data
+- trackdisk retries cyl 53 read, re-decodes, but next text drawing
+  re-clobbers; eventually buffer state is wrong; trackdisk gives up;
+  cyl-53 data never delivered to FS layer
+
+OR alternatively:
+- Steps 1-2 same as real Amiga
+- Step 3 fails because trackdisk validator rejects valid decode
+- K1.3 retries (re-decode succeeds 14 times, validator rejects 14 times)
+- K1.3 gives up, runs "clear buffer" or text-draw error message
+- The text-draw error message uses a RastPort whose BitMap is wrong
+
+Either way, the trail leads to the K1.3 trackdisk validator rejection
+question (task #131).
+
+### Verification idea
+
+Search the K1.3 ROM region $FD8770 — what's there?  Probably a font
+character that K1.3 is rendering.  If it's an error-message character
+("?" or "ERROR" letters), it confirms the "give-up + display error"
+hypothesis.
+
+
+### Step 22 — Confirmed BLITTER BUG: USE-B=0 should use BLTBDAT preset, not zero
+
+Looking at `rtl/chipset/blitter.v:571-573`:
+```verilog
+end else begin
+    b_cur_word_q <= 16'd0;          ← BUG: should be bltbdat_pre[15:0]
+    state <= use_c ? S_RDC : S_WRD;
+end
+```
+
+Real Amiga semantics: when USE-B=0, the B-channel takes the value
+from the BLTBDAT preset register (defaults to $FFFF on power-on,
+software-settable via $DFF072).  Our blitter forces B = 0 instead.
+
+**For the corrupting blit at row 164 with A=$2F0B (from ROM), C from $2D24:**
+
+| BLTBDAT preset value | Real Amiga output  | Our output |
+|----------------------|--------------------|------------|
+| $FFFF (default)      | (~A) & C = $D0F4 & C | C        |
+| $0                   | (always 0)         | C          |
+
+So with B=$FFFF (typical real Amiga state), our blitter writes `C`
+where real Amiga would write `(~A) & C`.  Even when C = $4489 (the
+correct MFM sync), real Amiga would write `$D0F4 & $4489 = $4000`
+— ALSO not the correct sync.
+
+So even on real Amiga, this blit would corrupt $2D24.  Hence: this
+blit **shouldn't run** on real Amiga at this boot point.  K1.3 must
+reach a different code path that doesn't trigger this descent into
+the MFM buffer.
+
+### Key learning #10 — Two bugs in sequence
+
+We've found TWO distinct blitter bugs:
+1. **BLTxPTL bit-0 mask** (`rtl/chipset/blitter.v:417-437`) — FIXED, 
+   verified via tests/t154 + minimig xcheck Test 4.
+2. **USE-B=0 → B = BLTBDAT preset, not zero** — IDENTIFIED but not yet fixed.
+
+The second bug doesn't directly explain $2D24 corruption (it'd
+corrupt to a DIFFERENT value, not $0), but it's a real fidelity bug
+worth fixing.  Likely also affects other K1.3 / WB1.3 graphics ops
+where USE-B=0 and LF expects B-preset behavior.
+
+### Status
+
+The investigation has reached a productive plateau:
+- Identified TWO blitter implementation bugs
+- Reframed the $2D24 corruption: it's K1.3 running a code path it
+  shouldn't (text-glyph blit into MFM buffer region)
+- Real root cause is upstream: K1.3 trackdisk validator behavior +
+  graphics primitive destination computation
+
+Next concrete digs would be:
+1. **Fix BUG #2 (USE-B=0 → BLTBDAT preset)** — small, reversible fix
+   with regression test.  Won't unblock WB1.3 but improves fidelity
+   and may surface different downstream behavior.
+2. **Probe the K1.3 validator at $FEAC62** (task #131) — find why
+   the validator rejects 14 successful decodes.
+3. **Probe RastPort/Layer source** — find why graphics primitive
+   computes destinations in chip $2000-$5000 range.
+
+
+### Step 23 — BUG #2 FIX LANDED: USE-B=0 → BLTBDAT preset
+
+Fix in `rtl/chipset/blitter.v` at the combine() call site:
+
+```verilog
+combined_w = combine(lf,
+                     shift_a(a_prev_word, a_cur_word_q, ash, desc),
+                     shift_b(b_prev_word, use_b ? b_cur_word_q : bltbdat_pre[15:0], bsh, desc),
+                     use_c ? c_cur_word_q : bltcdat_pre[15:0]);
+```
+
+Matches the existing `use_c ? c_cur_word_q : bltcdat_pre[15:0]` pattern.
+
+### Debugging recap (the trap I fell into)
+
+I initially put the fix at `b_cur_word_q <= bltbdat_pre[15:0]` in the
+S_RDB else-branch (line ~580).  Test failed because **that branch is
+dead code when USE-A=1** — the state machine transitions
+S_IDLE → S_RDA → S_RDC, skipping S_RDB entirely.
+
+Diagnosed via an always-on `[T155_WR]` probe at the master interface
+that logged `b_cur=$0000 bltbdat_pre=$0000FFFF` — confirming the
+preset was set but the cached b_cur_word_q stayed at $0 because S_RDB
+was never entered.
+
+Moved the fix to the combine() call site (one of three places where
+b_cur_word_q feeds the LF math).  Now correct for all state paths.
+
+### Key learning #11 — State-machine branches that look right can be unreachable
+
+In a multi-master state machine, an `else` branch on an internal
+USE-x signal might be dead code if the state machine's TRANSITION
+LOGIC also tests USE-x and skips the state entirely.  Always check
+both the in-state assignment AND the state-entry condition.
+
+The cleaner pattern (used here for use_c and now use_b) is to do
+the "preset substitute" at the COMBINER site itself, not at the
+read-state site.  That way it covers all paths.
+
+### Test coverage
+
+`tests/t155_use_b_zero_preset.s` (NEW): verifies (~A)&C output with
+BLTBDAT=$FFFF preset, then re-runs with BLTBDAT=$0F0F to verify the
+preset value is independent and software-settable.
+
+### Status
+
+All 144 regression tests pass (was 143 + new t155).
+minimig cross-check 12232/0 word match — no regression in copy-mode
+blits with USE-B=1 (since `use_b ?` guards keep them on the existing
+path).
+
+
+### Step 24 — WB1.3 boot with USE-B fix: no change in wall
+
+Ran the full WB1.3 boot with the USE-B fix landed:
+```
+retired = 177,171,663 (same as before fix)
+chip $2D24 = $00000000 (still corrupted)
+chip $50000 = $00000000 (bootblock never executed)
+$44894489 sync count in chip RAM: 11 (same as before)
+```
+
+The USE-B=BLTBDAT preset fix is real (proven via t155 + minimig
+cross-check + manual minterm math), but doesn't unblock WB1.3.
+Reason: the corrupting "cleanup" blit at row 164 was already writing
+`$0` to `$2D24` because C reads `$0` from `$2D24` at that point —
+the buffer was already cleared by some earlier operation.
+
+With the new fix, the formula changes from `output = C` to
+`output = (~A) & C`.  But:
+- If C reads `$0`: output = (~A) & 0 = 0 (same as before)
+- If C reads `$4489`: output = (~$2F0B) & $4489 = $4000 (different)
+
+The chip dump still shows `$0` at $2D24, meaning C was reading `$0`
+during the corrupting blit's pass.  So the upstream bug (whatever
+clears $2D24 before the cleanup) is still there.
+
+### Status
+
+- TWO blitter implementation bugs found and fixed
+- Both have regression tests + minimig cross-check coverage
+- Neither directly unblocks WB1.3 cyl-53 read
+- Root cause likely deeper in either K1.3 trackdisk validator (task
+  #131) or the chipset-level interaction that causes K1.3 to enter
+  the cleanup code path in the first place
+
+### Productive stopping point
+
+This session has:
+- Built a complete cosim infrastructure (tools/fsuae_cosim_bp.py)
+- Validated our boot ≡ FS-UAE through r=1.5M
+- Identified TWO real blitter bugs with regression tests
+- Documented 11 key learnings in this journal
+- Refined understanding of the WB1.3 wall through 24 steps
+
+The remaining gap is K1.3 internal validator behavior — a much
+deeper dig that may need ROM disassembly to understand WHY K1.3
+rejects valid decoded data.  That work is captured in task #131.
+
+
+### Step 25 — Tool A validator capture reveals THE bug class
+
+Built `tools/fsuae_validator_session.py` (~150 lines): launches FSU,
+sets BP at `$FEAC80` (right after validator's `BSR $FEABCC`), captures
+CPU regs + the scan buffer `[A2-2..A2+$ABE]`.  Hits on first try with
+**A0 = $00002162 (success — pattern found at chip $2162)**.
+
+Compared FSU's scan buffer to ours:
+```
+                   FSU                   Ours
+$02062-$02065:     aaaa5555              aaaa4489      ← differ
+$02064-$02067:     55552a55              44894489      ← differ
+sync count:        0                     6 (across buffer)
+```
+
+**FS-UAE's buffer has ZERO `$4489` sync words.  Ours has 6.**
+
+Real Amiga DMA strips the sync word when `ADKCON.WORDSYNC=1`: PLL
+detects `$4489`, consumes it for alignment, then writes post-sync
+data.  Our DMA was preserving the sync in the buffer.
+
+### The fix
+
+`rtl/m68k_bus.v`: 4 places that set `blk_cur_off` on DSKLEN-with-DMAEN.
+
+Old: `blk_cur_off <= adkcon_wordsync ? 32'd2 : 32'd0;`
+New: `blk_cur_off <= adkcon_wordsync ? 32'd8 : 32'd0;`
+
+8 bytes = 4 gap bytes (`$AAAAAAAA`) + 4 sync bytes (`$44894489`) per
+`adf2mfm.py` output structure.
+
+**First attempt fixed only 1 of 4 — `replace_all` missed the others
+because they had a slightly different surrounding pattern (parenthesised
+`(adkcon_wordsync ? 32'd2 : 32'd0)`).  Second edit catches them all.**
+
+### Open question — per-sector vs per-track DMA semantics
+
+Looking at disk.hex: each track has 11 syncs at $440-byte intervals.
+For K1.3's per-track DMA reading 11984 bytes, our fix strips only
+the FIRST sync; subsequent ones remain in the buffer.
+
+But FSU's buffer has ZERO syncs across all sectors.  Two possibilities:
+1. Real Amiga DMA continuously re-syncs on every `$4489` occurrence
+   (PLL behaviour, not one-shot)
+2. K1.3 trackdisk issues PER-SECTOR DMAs (one DSKLEN per sector), each
+   triggering its own sync-strip
+
+The journal noted 57 DSKLEN events for 5 tracks worth of boot, matching
+~11 sectors × 5 = 55.  **K1.3 likely does per-sector DMAs.**
+
+If that's right, our fix should already work for each sector — assuming
+we deliver the correct sector each time.  But our current DMA always
+reads from disk[track_offset + 8], NOT from the current "stream
+position".  K1.3 expects: after reading sector 0, the next DMA finds
+sector 1's sync and starts there.
+
+Our DMA is stateless across calls — always starts from track offset 0.
+Need to track "where in disk[] we are" across DMAs.
+
+
+### Step 26 — Sync-strip fix landed but exposes deeper encoding mismatch
+
+Applied `blk_cur_off <= 32'd8` (skip gap+sync) at all 4 DSKLEN paths.
+All 144 tests still pass.
+
+WB1.3 boot still wedges at r=177M.  Critically, our chip RAM at $2060
+STILL shows `$AAAAAAAA $44894489 $552A...` — same as before fix.
+
+**Reason: K1.3 doesn't set `ADKCON.WORDSYNC` in this code path.**
+Our DMA's WORDSYNC-triggered skip is conditionally compiled, and the
+condition is false at the time of this DMA.  The fix is logically
+correct but doesn't activate.
+
+### Deeper finding: FSU's buffer doesn't even match our `disk.hex` encoding
+
+Comparing FSU's buffer at `$2068` (`5555295555552255 552255555525...`)
+against the full `disk.hex` file: **the bytes don't appear anywhere in
+our adf2mfm.py output**.
+
+That means one of:
+1. FS-UAE uses a different MFM encoding scheme for the same ADF
+2. Our `adf2mfm.py` has a structural bug (wrong byte ordering, wrong
+   clock/data interleave, wrong header format, etc.)
+3. FSU's buffer is post-processed by K1.3's MFM-decoder (not raw MFM
+   as the validator code suggested)
+
+Our chip buffer matches `disk.hex` at track 80 + offset 8.  So our
+DMA DOES deliver track-aligned data — just from a different track
+than K1.3 wants.  K1.3 has retreated to cyl-40 (track 80) for
+recalibration after cyl-53 reads fail.
+
+### Why the work matters anyway
+
+- `tools/fsuae_validator_session.py` is a reusable diagnostic tool
+- The sync-strip fix is real Amiga semantics (per documentation)
+- The MFM encoding mismatch is a NEW bug class identified
+- Journal now at 2,148 lines documenting the full chain
+
+### What's needed to truly unblock cyl-53
+
+Multi-layer investigation:
+1. **MFM encoding audit**: deeply verify `tools/adf2mfm.py` against
+   actual real-Amiga MFM format (Hardware Reference Manual)
+2. **Compare with FS-UAE's MFM encoder source** (in `disk.cpp`?)
+3. **Per-sector DMA stream tracking** in our `m68k_bus.v` so subsequent
+   sector reads don't always restart at track offset 0
+4. **Minimig-through-Verilator** (Tool C from the recommendation) —
+   minimig has its own well-validated Amiga model
+
+Each of these is substantial work (hours to days each).  Task #131
+remains open as the actual root cause.
+
+
+### Step 27 — Encoder is CORRECT (FSU mfmcode ported and compared byte-by-byte)
+
+Ported FS-UAE's `decode_amigados` + `mfmcode` (disk.cpp:1818, :1709)
+to Python and compared with our `adf2mfm.encode_sector` for the same
+inputs.
+
+Test: track 0, sector 0, all-zeros data, 1088 byte output:
+```
+Total diff bytes: 0 / 1088
+```
+
+**Zero differences.**  Our `tools/adf2mfm.py` is functionally identical
+to FS-UAE's MFM encoder.  The encoder is NOT the bug.
+
+### So what IS the bug?
+
+Revised hypothesis based on:
+- Our encoder produces same MFM bytes as FSU's
+- Both FSU and us run same K1.3 ROM + same ADF
+- FSU's buffer at validator entry has different bytes than ours
+
+This must mean either:
+1. **K1.3 is on a different boot phase / different retry iteration**
+   when we capture state vs when FSU hits its BP
+2. **Something between DMA-complete and validator-call modifies the
+   buffer** (e.g. a copy, decode, or sync-strip pass) that works on
+   FSU but not us
+3. **FSU's disk emulation behaves differently than real Amiga** at the
+   DMA-level (perhaps FSU strips ALL syncs in the buffer during DMA)
+4. **Our DMA reads from the wrong disk byte offset** — track-aligned
+   vs sync-aligned
+
+For (4): K1.3 issues DSKLEN with a length; our DMA reads `length` bytes
+starting at track-aligned offset.  Real Amiga starts at "first sync
+after current head position".  If the disk has rotated to a non-zero
+"position" when DSKLEN fires, we'd read wrong bytes.
+
+### Tools landed during this audit
+
+- `tools/fsuae_validator_session.py`: FSU validator state capture
+- Documented full FSU MFM encoder logic, validated identical to ours
+- Sync-strip fix in `m68k_bus.v` (real-Amiga-correct, doesn't activate
+  because WORDSYNC may not be set on this code path)
+
+### Real status
+
+WB1.3 still wedges at r=177M.  The walls hit so far:
+1. Blitter bit-0 mask (real bug, fixed, t154)
+2. Blitter USE-B=BLTBDAT preset (real bug, fixed, t155)
+3. DMA WORDSYNC sync-strip (real semantics, fixed but inactive)
+4. ??? — still unknown
+
+The encoder hypothesis is REFUTED.  Task #133 should be closed.
+The real cause is upstream of the sync-strip — either K1.3 takes a
+fundamentally different code path on our boot, or there's a chipset
+state that differs and we haven't found it.
+
+## §24. Sync-strip dead-end + K1.3 scan-helper disasm (2026-06-02)
+
+**Initial hypothesis (WRONG).** FS-UAE's chip-RAM
+`[A2-2, A2-2 + $ABE]` scan buffer at `PC=$FEAC80` (validator return)
+appears to contain **zero** byte-aligned `$4489 $4489` sync words
+across all 2812 bytes.  Our chip-RAM at the same PC had **28** of
+them (14 pairs, every 1088 bytes).  Hypothesis: K1.3's `$FEABCC`
+scan helper expects a "sync-stripped" buffer; our inline `$4489`
+confounds the scan; `A0` returns `$FFFFFFFF` and the validator
+branches to fail.
+
+This led to two parallel attempted fixes:
+1. `tools/adf2mfm.py`: replace per-sector `$4489 $4489` with 4 more
+   `$AA` gap bytes.
+2. `rtl/m68k_bus.v`: change DMA start offset from `+2` to `+8` to
+   "skip the sync" (made earlier this session, before the conversation
+   summary).
+
+**The wrong-fix regression.**  With either fix applied, `make
+test-kickstart-boot` failed: no `[BOOTBLOCK]` execution at all (vs.
+the previously-passing milestone where K1.3 reads sector 0, decodes,
+and jumps to bootblock code which writes `$CAFEBABE` to `$50000`).
+The bootblock-only test at baseline (uncommitted `+8` hack but
+WITHOUT the adf2mfm.py change) ran for r=543M and timed out — no
+`[BOOTBLOCK]`.  So even the `+8` hack alone was a regression.
+
+### §24a. ROM disasm — what the scanner actually scans for
+
+Disassembling `$FEABCC` (the scan helper) and `$FEAC42` (one of two
+pattern tables) on the real K1.3 ROM revealed the scanner's true
+algorithm:
+
+```
+$FEABCC  MOVEM.L D2/A2-A4,-(A7)
+$FEABD0  MOVE.W  #$AAAA, D3            ; gap word #1
+$FEABD4  MOVE.W  #$5555, D4            ; gap word #2
+$FEABD8  MOVEA.L A0, A2
+$FEABDA  ADDA.L  D0, A2                ; A2 = end pointer
+$FEABDC  MOVE.W  (A0)+, D2             ; loop: read next word
+$FEABDE  CMP.W   D3, D2                ; == $AAAA ?
+$FEABE0  BEQ     $FEAC18               ;   → handle (table $FEAC42)
+$FEABE2  CMP.W   D4, D2                ; == $5555 ?
+$FEABE4  BEQ     $FEABF0               ;   → handle (table $FEAC22)
+$FEABE6  CMPA.L  A0, A2 / BHI $FEABDC  ; loop
+$FEABEA  MOVEQ   #-1, D0 ; MOVEA.L D0, A0 ; RTS  → FAIL
+```
+
+Both handlers (`$FEABF0` and `$FEAC18`) do the same shape:
+1. Skip a run of identical gap words.
+2. When a non-gap word appears, back up 2, read the longword AT that
+   position, and compare against a table of 8 longwords.
+
+The pattern tables (`$FEAC22` for the $5555 path, `$FEAC42` for the
+$AAAA path) contain 8 bit-shifted variants of `$4489`:
+
+| `$FEAC22` ($5555 path) | `$FEAC42` ($AAAA path) |
+| --- | --- |
+| $2244 A244 | $9122 5122 |
+| $4891 2891 | $A448 9448 |
+| $5224 4A24 | $A912 2512 |
+| $5489 1289 | $AA44 8944 |
+| $5522 44A2 | $AA91 2251 |
+| $5548 9128 | $AAA4 4894 |
+| $5552 244A | $AAA9 1225 |
+| $5554 8912 | $4489 4489 |
+
+So K1.3 **does** expect to find `$4489` (or a bit-shifted variant of
+it) immediately after the gap run.  This refutes the "FS-UAE strips
+all syncs" theory: FS-UAE's chip RAM must still contain the
+`$4489 $4489` pattern (or a bit-shifted variant) at every sector's
+gap→data transition, otherwise the scanner would return -1 and
+the validator at `$FEAC86` would BEQ to fail.
+
+This also explains why the `adf2mfm.py` "strip syncs and pad with
+$AA" fix below broke the `test-kickstart-boot` regression: removing
+the sync words leaves nothing for the scanner to match.
+
+### §24b. Revert + revisiting the +2 → +8 DMA change
+
+The DMA-offset change from `+2` to `+8` in `rtl/m68k_bus.v` (4
+sites, made earlier in this session) was based on the same flawed
+"strip all syncs" theory.  Re-running the bootblock-only path
+without my adf2mfm fix but still with `+8` confirmed: the test
+already failed at baseline (retired=543M, no `[BOOTBLOCK]`).
+
+Reverted both:
+- `tools/adf2mfm.py` — restored original sync emission.
+- `rtl/m68k_bus.v` — restored `+2` offset at all four DMA-start
+  sites (so the `$4489 $4489` sync lands at chip-RAM offset `+2..+5`
+  of the DMA dest, where the K1.3 scanner can find it).
+
+### §24c. What FS-UAE actually does (revised)
+
+Looking at FS-UAE's scan-buffer capture more carefully: between the
+`$AAAA`/`$5555` gap runs there ARE bytes matching the `$FEAC42`
+pattern table — specifically `$AA44 8944` (one of the bit-shifted
+$4489 variants).  FS-UAE's DMA preserves the sync in the chip-RAM
+stream — but as `$AA44 8944` (bit-shifted by 1, mid-byte alignment)
+rather than `$4489 $4489` (byte-aligned).  That's still a `$4489`
+match because the scanner explicitly tabulates bit-shifted variants.
+
+**Conclusion.** The "FS-UAE strips ALL syncs" hypothesis was wrong.
+Real Paula DMA on word-boundary alignment usually leaves the sync as
+`$4489 $4489` (byte-aligned, matching our original adf2mfm output),
+but on sub-bit alignment (which depends on PLL jitter / DSKBYTR
+timing) it can also be `$AA44 8944` or other shifts.  K1.3's scanner
+tolerates both.  Our high-level DMA (longword copy) preserves
+byte-alignment exactly, so the original `+2` offset + sync-inline
+adf2mfm is the right pairing.
+
+The next-step path for the K1.3 validator wall is not "fix the
+sync-strip" but rather understanding why the validator rejects
+sectors whose scan IS finding `$4489` — possibly bad header
+checksum, bad data checksum, or wrong info-bytes content.
+

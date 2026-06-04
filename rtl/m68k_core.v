@@ -3059,9 +3059,22 @@ module m68k_core #(
             // Track number check ($FEAD1C: BNE if track != $4B(A3))
             if (is_settled && ex_pc == 32'h00fe_ad18)
                 $display("[TRACK] r=%d cmp D0=%h vs $4B(A3) (A3=%h)", retired, u_rf.regs[0], u_rf.regs[11]);
-            // Error path ($FEAE6C)
+            // Error path ($FEAE6C) — TDERR_BadHdrSum or similar
             if (is_settled && ex_pc == 32'h00fe_ae6c)
                 $display("[BADSEC] r=%d error path D0=%h D3=%h D6=%h A0=%h", retired, u_rf.regs[0], u_rf.regs[3], u_rf.regs[6], u_rf.regs[8]);
+            // Other validator error paths (all set D0=TDERR_* and BRA to $FEAE64)
+            if (is_settled && ex_pc == 32'h00fe_ae68)
+                $display("[TDERR21] r=%d NoSync A0=%h A2=%h D2=%h", retired, u_rf.regs[8], u_rf.regs[10], u_rf.regs[2]);
+            if (is_settled && ex_pc == 32'h00fe_ae70)
+                $display("[TDERR22] r=%d BadSecPreamble A0=%h A2=%h", retired, u_rf.regs[8], u_rf.regs[10]);
+            if (is_settled && ex_pc == 32'h00fe_ae74)
+                $display("[TDERR23] r=%d D0=23 A0=%h A2=%h", retired, u_rf.regs[8], u_rf.regs[10]);
+            if (is_settled && ex_pc == 32'h00fe_ae78)
+                $display("[TDERR24] r=%d D0=24 A0=%h A2=%h", retired, u_rf.regs[8], u_rf.regs[10]);
+            if (is_settled && ex_pc == 32'h00fe_ae7c)
+                $display("[TDERR25] r=%d BadSecSum A0=%h A2=%h", retired, u_rf.regs[8], u_rf.regs[10]);
+            if (is_settled && ex_pc == 32'h00fe_ae80)
+                $display("[TDERR26] r=%d TooFewSecs A0=%h A2=%h", retired, u_rf.regs[8], u_rf.regs[10]);
             // strap.task bootblock-load checks at $FE85A0..$FE85AA.
             if (is_settled && ex_pc == 32'h00fe_85a0)
                 $display("[STRAP] r=%d post DoIO Read: D0=%h (io_Error)", retired, u_rf.regs[0]);
@@ -3160,6 +3173,47 @@ module m68k_core #(
                 $display("[HDRCHK_BUF_PC] r=%d pc=%h kind=%d addr=%h be=%b wdata=%h",
                     retired, ex_pc, ex_kind, dc_addr, dc_be, dc_wdata);
 `endif
+            // [BAD-BLTDPT] CPU writes to BLTDPT ($DFF054/$DFF056) with a
+            // destination value in low chip RAM (under \$10000).  Captures
+            // the PC + value + register state so we can find which
+            // routine in our system is computing the bogus destinations
+            // that land at chip \$C2xx (corrupting the task stack at
+            // \$C2CC).  Always-on (independent of any BOOT_TRACE define).
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h00DF_F054 && dc_addr <= 32'h00DF_F057 &&
+                dc_wdata < 32'h0001_0000)
+                $display("[BAD-BLTDPT] r=%d pc=%h wdata=%h A0=%h A1=%h A3=%h A4=%h D5=%h D6=%h D7=%h",
+                    retired, ex_pc, dc_wdata,
+                    u_rf.regs[8], u_rf.regs[9], u_rf.regs[11], u_rf.regs[12],
+                    u_rf.regs[5], u_rf.regs[6], u_rf.regs[7]);
+            // [MH-ATTRS] FS-UAE-confirmed: PC \$FC1A38 is
+            //   `MOVE.W D1, \$0E(A0)`
+            // — the exec.AddMemHeader helper that writes mh_Attributes.
+            // On FS-UAE, the chip-RAM call has D1=\$0003
+            // (MEMF_PUBLIC|MEMF_CHIP).  Our system ends up with the chip
+            // header at \$00000400 carrying attrs=\$0000, which makes
+            // AllocMem(MEMF_CHIP) fall through to slow RAM and breaks the
+            // entire bitmap-allocation/task-stack layout (project
+            // wb13_displays).  Capture D1 + A0 to see if the caller is
+            // passing the wrong value, or if MOVE.W is dropping the
+            // store.  Always-on.
+            if (is_settled && ex_pc == 32'h00fc_1a38)
+                $display("[MH-ATTRS] r=%d enter A0=%h D1=%h D2=%h",
+                    retired, u_rf.regs[8], u_rf.regs[1], u_rf.regs[2]);
+            // [BLT-SETUP] Capture register state at the FS-UAE-confirmed
+            // graphics.library blit-setup loop body at PC \$FC5DF2 /
+            // \$FC5E04 — the routine that writes BLTAPT/BLTCPT/BLTDPT/
+            // BLTSIZE.  On FS-UAE this loop runs with *A3 = \$60C8 /
+            // \$B0C8 (correct screen Planes[]).  On our system this PC
+            // may not be reached at all — in which case our boot uses a
+            // different drawing routine that we then need to find.
+            if (is_settled && ex_pc == 32'h00fc_5df2)
+                $display("[BLT-SETUP] r=%d enter loop A1=%h A2=%h A3=%h D0=%h D4=%h",
+                    retired, u_rf.regs[9], u_rf.regs[10], u_rf.regs[11],
+                    u_rf.regs[0], u_rf.regs[4]);
+            if (is_settled && ex_pc == 32'h00fc_5e04)
+                $display("[BLT-SETUP] r=%d post-A4-compute A4=%h A3=%h D4=%h",
+                    retired, u_rf.regs[12], u_rf.regs[11], u_rf.regs[4]);
 `ifdef KICKSTART_BOOT_TRACE
             // Edge-triggered watch for user-mode A7 dipping below $200.
             // Catches tasks running with a smashed stack pointer.  Kept
@@ -3293,6 +3347,16 @@ module m68k_core #(
             if (dc_req_r && dc_we && dc_ack &&
                 dc_addr >= 32'h00DF_F048 && dc_addr <= 32'h00DF_F057)
                 $display("[CPUBLT] r=%d pc=%h addr=%h be=%b wdata=%h",
+                    retired, ex_pc, dc_addr, dc_be, dc_wdata);
+            // [BLTMOD-WR]: ALL CPU writes to BLTAMOD/BMOD/CMOD/DMOD
+            // ($DFF060..$DFF067).  Filtered to the window around the
+            // corrupting blit at r=4,196,883 to keep the log small.
+            // Captures PC + wdata so we can trace which write set
+            // bltdmod=-90 for the corrupting blit.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h00DF_F060 && dc_addr <= 32'h00DF_F067 &&
+                retired >= 32'd4_180_000 && retired <= 32'd4_200_000)
+                $display("[BLTMOD-WR] r=%d pc=%h addr=%h be=%b wdata=%h",
                     retired, ex_pc, dc_addr, dc_be, dc_wdata);
             // [BLT-DST-SRC]: probe registers right after the MOVEM.L $8(A1)
             // at $FEA97A that loads D0/D1/A5 from the struct.  This is the
@@ -3498,6 +3562,168 @@ module m68k_core #(
             if (is_settled && ex_pc == 32'h00FC_1E84)
                 $display("[SIGNAL-CALL] r=%d task=%h mask=%h sp=%h",
                     retired, u_rf.regs[9], u_rf.regs[0], u_rf.regs[15]);
+            // [ALLOCSIG-ENTRY] / [ALLOCSIG-EXIT]: AllocSignal at $FC2000.
+            // Bug investigation: FSU's "File System" task has tc_SigAlloc=$0000FFFF
+            // (no bit 31), ours has $8000FFFF — our path called AllocSignal($FF)
+            // and got 31, FSU's didn't.  Find the call site responsible.
+            if (is_settled && ex_pc == 32'h00FC_2000)
+                $display("[ALLOCSIG-ENTRY] r=%d req=%h sp=%h",
+                    retired, u_rf.regs[0], u_rf.regs[15]);
+            if (is_settled && ex_pc == 32'h00FC_2036)
+                $display("[ALLOCSIG-EXIT] r=%d ret=%h sp=%h",
+                    retired, u_rf.regs[0], u_rf.regs[15]);
+            // [FREESIG] FreeSignal at $FC2038 — tracks the bit being freed.
+            if (is_settled && ex_pc == 32'h00FC_2038)
+                $display("[FREESIG] r=%d bit=%h sp=%h",
+                    retired, u_rf.regs[0], u_rf.regs[15]);
+            // [FS-PORT-WR]: every write to the File System task's MsgPort
+            // header at slow $C00ADC..$C00AEC (mp_LN + mp_Flags + mp_SigBit
+            // + mp_SigTask).  Identifies when mp_SigBit changes between
+            // 31 (the AllocSignal result that sets Wait mask = $80000000)
+            // and 8 (the value at idle).  PC capture nails the instruction.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h00C0_0ADC && dc_addr <= 32'h00C0_0AEC)
+                $display("[FS-PORT-WR] r=%d pc=%h kind=%d addr=%h be=%b wdata=%h",
+                    retired, ex_pc, ex_kind, dc_addr, dc_be, dc_wdata);
+            // [BCPL-WAITPKT]: every entry to BCPL DOS handler's
+            // waitpkt loop at K1.3 ROM $FDE3D0.  Captures A2 (and
+            // A2+$56 = port-pointer field) so we can identify WHICH
+            // port the handler reads mp_SigBit from.  Prior FS-PORT-WR
+            // run shows FS task's pr_MsgPort mp_SigBit=$08, but bug
+            // Wait mask=$80000000=1<<31 — so handler must be reading
+            // a DIFFERENT (auxiliary) port with mp_SigBit=31.
+            if (is_settled && ex_pc == 32'h00FD_E3D0)
+                $display("[BCPL-WAITPKT] r=%d A2=%h",
+                    retired, u_rf.regs[10]);
+            // [REQ-BUILDER]: entry to K1.3 ROM $FF4CE8 — DOS error
+            // requester builder.  Called when BCPL DOS wants to put
+            // up an error dialog ("Volume X has a read/write error",
+            // "Disk full", etc).  A1 = pointer to BPTR list of strings
+            // to fill in the requester body.  Capturing A1 + ThisTask
+            // tells us which error path called it.  ThisTask + $94 =
+            // pr_Result2 (the DOS error code).
+            if (is_settled && ex_pc == 32'h00FF_4CE8)
+                $display("[REQ-BUILDER] r=%d A1=%h A6=%h sp=%h",
+                    retired, u_rf.regs[9], u_rf.regs[14], u_rf.regs[15]);
+            // [AUTO-REQ]: just before the actual AutoRequest call at
+            // $FF4DB4.  By here the requester struct is fully built;
+            // A0 = body IText (already populated), A1=pos/A2=neg.
+            if (is_settled && ex_pc == 32'h00FF_4DB4)
+                $display("[AUTO-REQ] r=%d body=%h pos=%h neg=%h sp=%h",
+                    retired, u_rf.regs[8], u_rf.regs[9], u_rf.regs[10], u_rf.regs[15]);
+            // [DLG-BUILDER]: trace multiple candidate entry points to
+            // the K1.3 DOS error-dialog routine that ends at AutoRequest
+            // ($FF4DB4).  We probe $FF4CE8 (full prelude) and several
+            // mid-routine PCs to identify which entry path the dialog
+            // takes.  Captures A1/A3/A4/A6/SP/D-args.
+            if (is_settled &&
+                (ex_pc == 32'h00FF_4CE8 ||  // full prelude entry
+                 ex_pc == 32'h00FF_4D08 ||  // just before AllocMem JSR
+                 ex_pc == 32'h00FF_4D1C ||  // just before FindTask JSR
+                 ex_pc == 32'h00FF_4D28 ||  // just before OpenLibrary JSR
+                 ex_pc == 32'h00FF_4D32 ||  // post-OpenLibrary entry
+                 ex_pc == 32'h00FF_4D40 ||  // BCPL-string-iter entry
+                 ex_pc == 32'h00FF_4DAA))   // pre-AutoRequest setup
+                $display("[DLG-PC] r=%d pc=%h A1=%h A3=%h A4=%h A6=%h sp=%h d0=%h d1=%h",
+                    retired, ex_pc,
+                    u_rf.regs[9], u_rf.regs[11], u_rf.regs[12], u_rf.regs[14],
+                    u_rf.regs[15],
+                    u_rf.regs[0], u_rf.regs[1]);
+            // [DLG-CALLER]: catch BSR or JSR landing at any of these
+            // by recording every PC change in a narrow window before
+            // the dialog fires.  Track the LAST CHANGE INTO $FF4Dxx
+            // range to find the caller PC.
+            if (is_settled &&
+                ex_pc >= 32'h00FF_4D20 && ex_pc <= 32'h00FF_4D32 &&
+                retired >= 4444460 && retired <= 4444475)
+                $display("[DLG-TRACE] r=%d pc=%h",
+                    retired, ex_pc);
+            // [BPTR-STRUCT-WR]: catch CPU writes to the 3-BPTR struct at
+            // slow RAM $C00F2C..$C00F37 (the dialog template that becomes
+            // input to $FF4D08).  The CPU instruction that writes these
+            // BPTRs is the BCPL DOS function that built the error msg.
+            // Log ex_pc + the address + write data so we can find the
+            // BCPL "ErrorReport"-style routine.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h00C0_0F2C && dc_addr <= 32'h00C0_0F37)
+                $display("[BPTR-STRUCT-WR] r=%d pc=%h addr=%h be=%b wdata=%h",
+                    retired, ex_pc, dc_addr, dc_be, dc_wdata[31:0]);
+            // [SRC-TPL-WR]: catch writes to the source template at
+            // $C00EE8..$C00EF3.  Those BPTRs are copied to the dialog
+            // struct by $FF532E/$FF5334/$FF533A.  The writer is the
+            // BCPL DOS routine that picked the read/write error msg.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h00C0_0EE8 && dc_addr <= 32'h00C0_0EF3)
+                $display("[SRC-TPL-WR] r=%d pc=%h addr=%h be=%b wdata=%h",
+                    retired, ex_pc, dc_addr, dc_be, dc_wdata[31:0]);
+            // [FF4506-ENTRY]: BCPL handler at $FF4506.  At r=4307668 it
+            // received D3=0 and wrote 0 to $C00C9C, triggering the
+            // downstream chain to the dialog.  Probe captures all args
+            // (D1..D4, A1) plus A6 (BCPL next-instr ptr, = caller).
+            if (is_settled && ex_pc == 32'h00FF_4506)
+                $display("[FF4506-ENTRY] r=%d D1=%h D2=%h D3=%h D4=%h A1=%h A6=%h",
+                    retired, u_rf.regs[1], u_rf.regs[2], u_rf.regs[3],
+                    u_rf.regs[4], u_rf.regs[9], u_rf.regs[14]);
+            // [Y-ZERO-WR]: focused on CPU writes that ZERO the Y-coord
+            // field at $C04786.  Captures EX_PC + EX_KIND so we can
+            // identify the specific instruction.  The existing
+            // Y-FIELD-WR probe is wider but might miss byte/word
+            // sized variants.  Trigger on ANY write with wdata=0 that
+            // touches $C04786..$C04789.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h00C0_4784 && dc_addr <= 32'h00C0_4789 &&
+                dc_wdata[31:0] == 32'h0000_0000)
+                $display("[Y-ZERO-WR] r=%d pc=%h kind=%d addr=%h be=%b",
+                    retired, ex_pc, ex_kind, dc_addr, dc_be);
+            // [Y-FIELD-RD]: capture all reads from $C04786 (the Y-coord
+            // field).  If $C04786 holds $1958 but A0 ends up 0 at
+            // $FEA932 entry, that's a MOVEA.L bug.  If $C04786 reads
+            // back 0, something cleared it after the last Y-FIELD-WR.
+            if (dc_req_r && !dc_we && dc_ack &&
+                dc_addr >= 32'h00C0_4784 && dc_addr <= 32'h00C0_4789)
+                $display("[Y-FIELD-RD] r=%d pc=%h kind=%d addr=%h rdata=%h",
+                    retired, ex_pc, ex_kind, dc_addr, dc_rdata);
+            // [FEA920-ENTRY]: capture A2 + SP at K1.3 ROM $FEA920
+            // (a function that's part of the trackdisk MFM-decode path).
+            // BAD-BLTDPT event at $FEA992 was traced back to A2=0
+            // entering this routine.  Find which caller passes A2=0.
+            if (is_settled && ex_pc == 32'h00FE_A920)
+                $display("[FEA920-ENTRY] r=%d A2=%h A1=%h D0=%h sp=%h",
+                    retired, u_rf.regs[10], u_rf.regs[9], u_rf.regs[0], u_rf.regs[15]);
+            // [FEA926-PRECALL]: capture A0 right before BSR $FEA932
+            // where A0 is the value that ends up at $C04A8E.
+            if (is_settled && ex_pc == 32'h00FE_A926)
+                $display("[FEA926-PRECALL] r=%d A0=%h A2=%h",
+                    retired, u_rf.regs[8], u_rf.regs[10]);
+            // [ALLOCMEM-ENTRY] / [ALLOCMEM-EXIT]: trace every call.
+            // Exec.library AllocMem on K1.3 patches itself into slow RAM
+            // at $C05088 after init (the JT at $C001B0 = LVO -$C6 jumps
+            // there).  D0 = size requested, D1 = MEMF_* flags.  Exit at
+            // RTS with D0 = returned address.  Cosim found a $4E88 byte
+            // shift between our slow-RAM ptrs and FSU's at r=2881025;
+            // this probe lets us identify which AllocMem call returns
+            // a different address than FSU's.
+            if (is_settled && ex_pc == 32'h00C0_5088)
+                $display("[ALLOCMEM-ENTRY] r=%d size=%h flags=%h sp=%h",
+                    retired, u_rf.regs[0], u_rf.regs[1], u_rf.regs[15]);
+            // Slow-RAM AllocMem returns through a chain; can't easily
+            // capture exit PC.  Instead trace ALL slow-RAM JMPs $C0xxxx
+            // via PC tracking.  Skip for now — rely on entry probe.
+
+            // [ERR-DIALOG]: entry to BCPL DOS error-display wrapper
+            // at $FDFE32.  This wrapper saves A0..A3/D0..D3 then JSRs
+            // $FDE368 (the actual display routine which eventually
+            // calls AutoRequest).  Capturing all 8 caller-passed regs
+            // tells us EXACTLY what the BCPL DOS handler is asking
+            // the user about (volume name BPTR, error code, etc.).
+            // SP at entry = caller's return-PC location, so *(SP)
+            // identifies the BCPL DOS callsite.
+            if (is_settled && ex_pc == 32'h00FD_FE32)
+                $display("[ERR-DIALOG] r=%d A0=%h A1=%h A2=%h A3=%h D0=%h D1=%h D2=%h D3=%h sp=%h",
+                    retired,
+                    u_rf.regs[8],  u_rf.regs[9],  u_rf.regs[10], u_rf.regs[11],
+                    u_rf.regs[0],  u_rf.regs[1],  u_rf.regs[2],  u_rf.regs[3],
+                    u_rf.regs[15]);
             // [TD-BEGIO]: trace every entry into trackdisk.device.BeginIO
             // at $FE9C3E with the IORequest pointer (A1).  Used to find
             // out whether the chip-RAM FileHandler task is actually

@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include "track80_mfm_data.h"
 
 static void tick(Vminimig_blt_xcheck_top* dut) {
     dut->clk = 0; dut->eval();
@@ -158,8 +159,109 @@ int main(int argc, char** argv) {
     }
     printf("Test 2: %d match, %d mismatch\n", t2_match, t2_mis);
 
-    int mismatches = t1_mis + t2_mis;
-    printf("\nTotal: %d match, %d mismatch\n", t1_match + t2_match, mismatches);
+    // ====================================================================
+    // Test 3: K1.3 cyl-53 cc000005 blit with ACTUAL track-80 MFM data.
+    //   Captured from a failed WB1.3 boot where output at chip $2D24 became
+    //   $0 instead of $44894489 (sector 3 sync).
+    //   Same BLTCON0=$05CC USEB+USED, ASH=0, BLTBPT=$2064, BLTDPT=$2060,
+    //   BLTSIZE=$2EE0 — only the source data differs (real MFM vs synthetic).
+    // ====================================================================
+    printf("=== Test 3: K1.3 cyl-53 cc000005 blit with real track-80 MFM ===\n");
+    // BLTBPT byte $2064 = word $1032; BLTDPT byte $2060 = word $1030
+    // Source data covers 5984 words = $1032..$2EF1
+    // Pre-fill the destination range with sentinel
+    for (uint16_t w = 0x1028; w <= 0x2EF8; w++)
+        init_mem(dut, w, 0xBEEF);
+    // Load actual track-80 MFM into source range starting at word $1032
+    for (uint16_t w = 0; w < 6000 && (0x1032 + w) <= 0x7FFF; w++)
+        init_mem(dut, 0x1032 + w, TRACK80_MFM[w]);
+
+    reg_w(dut, 0x40, 0x05CC);   // BLTCON0 — same as K1.3
+    reg_w(dut, 0x42, 0x0000);   // BLTCON1
+    reg_w(dut, 0x44, 0xFFFF);   // BLTAFWM
+    reg_w(dut, 0x46, 0xFFFF);   // BLTALWM
+    reg_w(dut, 0x4C, 0x0000);   // BLTBPTH
+    reg_w(dut, 0x4E, 0x2064);   // BLTBPTL — exact byte from K1.3 boot
+    reg_w(dut, 0x54, 0x0000);   // BLTDPTH
+    reg_w(dut, 0x56, 0x2060);   // BLTDPTL — exact byte from K1.3 boot
+    reg_w(dut, 0x62, 0x0000);   // BLTBMOD
+    reg_w(dut, 0x66, 0x0000);   // BLTDMOD
+    reg_w(dut, 0x58, 0x2EE0);   // BLTSIZE — same as K1.3
+
+    for (int i = 0; i < 200000; i++) {
+        tick(dut);
+        if (!dut->mm_busy && !dut->our_busy && i > 32) {
+            printf("  Both idle after %d cycles\n", i);
+            break;
+        }
+    }
+    int t3_mis = 0, t3_match = 0;
+    int first_mis = -1;
+    // Compare dest range word $1030..$1030+5984
+    for (uint32_t w = 0x1030; w <= 0x1030 + 5984; w++) {
+        uint16_t mm = read_mm(dut, w);
+        uint16_t our = read_our(dut, w);
+        if (mm != our) {
+            if (t3_mis < 16) printf("  MISMATCH @ word $%04X (chip $%04x): mm=$%04X our=$%04X\n",
+                w, w*2, mm, our);
+            if (first_mis < 0) first_mis = w;
+            t3_mis++;
+        } else t3_match++;
+    }
+    printf("Test 3: %d match, %d mismatch (first mismatch @ word $%04X)\n",
+        t3_match, t3_mis, first_mis);
+    // Specifically inspect chip $2D24 (= word $1692) which had $0 instead of $44894489 in the real boot
+    printf("  Spot check chip $2D24 (sector 3 sync): mm=$%04x our=$%04x (expect $4489)\n",
+        read_mm(dut, 0x1692), read_our(dut, 0x1692));
+
+    // ====================================================================
+    // Test 4: ODD BLTBPT/BLTDPT must be masked to word-aligned (bit 0 = 0).
+    //   Real Amiga BLT*PTL has bit 0 wired to 0.  K1.3 occasionally writes
+    //   odd byte addresses to BLTDPT (e.g. $762D).  Without our mask, the
+    //   iteration produces odd-byte writes that hit "different memwords"
+    //   than the CPU expects, corrupting buffers (caught via [BUF-2D24-WR]
+    //   trace during WB1.3 cyl-53 read).  Verify that an odd BLTDPT
+    //   produces THE SAME output as an even BLTDPT (= odd_addr & ~1) — both
+    //   should match minimig.
+    // ====================================================================
+    printf("=== Test 4: ODD BLTBPT/BLTDPT masking ===\n");
+    // Setup: same as Test 1, but use ODD addresses for BPT and DPT.
+    for (uint16_t w = 0; w < 16; w++)
+        init_mem(dut, 0x1000 + w, 0xAA00 + w);
+    for (uint16_t w = 0; w < 16; w++)
+        init_mem(dut, 0x2000 + w, 0xDEAD);
+
+    reg_w(dut, 0x40, 0x05CC);   // BLTCON0
+    reg_w(dut, 0x42, 0x0000);   // BLTCON1
+    reg_w(dut, 0x44, 0xFFFF);
+    reg_w(dut, 0x46, 0xFFFF);
+    reg_w(dut, 0x4C, 0x0000);
+    reg_w(dut, 0x4E, 0x2001);   // BLTBPTL = $2001 (ODD!) — should be masked to $2000
+    reg_w(dut, 0x54, 0x0000);
+    reg_w(dut, 0x56, 0x4001);   // BLTDPTL = $4001 (ODD!) — should be masked to $4000
+    reg_w(dut, 0x62, 0x0000);
+    reg_w(dut, 0x66, 0x0000);
+    reg_w(dut, 0x58, 0x0048);   // BLTSIZE = 1 row x 8 words
+
+    for (int i = 0; i < 2000; i++) {
+        tick(dut);
+        if (!dut->mm_busy && !dut->our_busy && i > 8) break;
+    }
+    int t4_mis = 0, t4_match = 0;
+    for (uint16_t w = 0x0FFC; w <= 0x1010; w++) {
+        uint16_t mm = read_mm(dut, w);
+        uint16_t our = read_our(dut, w);
+        if (mm != our) {
+            if (t4_mis < 8) printf("  MISMATCH @ $%04X: mm=$%04X our=$%04X\n", w, mm, our);
+            t4_mis++;
+        } else t4_match++;
+    }
+    printf("Test 4: %d match, %d mismatch (odd BLTBPT/DPT must mask to even)\n",
+        t4_match, t4_mis);
+
+    int mismatches = t1_mis + t2_mis + t3_mis + t4_mis;
+    printf("\nTotal: %d match, %d mismatch\n",
+        t1_match + t2_match + t3_match + t4_match, mismatches);
     delete dut;
     return mismatches ? 1 : 0;
 }

@@ -1099,9 +1099,14 @@ module m68k_bus #(
                 blt_xlat_wdata = {16'd0, amiga_wdata_half};
             end
             5'd16: begin                      // BLTCMOD ($DFF060)
+                // .L writes also commit BLTBMOD ($DFF062), same pattern as
+                // the BLTAFWM/BLTALWM split at 5'd2.  K1.3 graphics.library
+                // does MOVE.L to $DFF060 to set BOTH BLTCMOD and BLTBMOD.
                 blt_xlat_valid = 1'b1;
                 blt_xlat_addr  = 6'h24;
-                blt_xlat_wdata = {{16{amiga_wdata_half[15]}}, amiga_wdata_half};
+                blt_xlat_wdata = (is_long[winner] && be[winner] == 4'b1111)
+                                 ? wdata[winner]
+                                 : {{16{amiga_wdata_half[15]}}, amiga_wdata_half};
             end
             5'd17: begin                      // BLTBMOD ($DFF062)
                 blt_xlat_valid = 1'b1;
@@ -1109,9 +1114,20 @@ module m68k_bus #(
                 blt_xlat_wdata = {{16{amiga_wdata_half[15]}}, amiga_wdata_half};
             end
             5'd18: begin                      // BLTAMOD ($DFF064)
+                // .L writes also commit BLTDMOD ($DFF066), same pattern
+                // as BLTAFWM/BLTALWM split.  K1.3 graphics.library at
+                // PC $FC5CFE does `MOVE.L D0, $64(A0)` to set BOTH BLTAMOD
+                // and BLTDMOD in one instruction.  Without this split,
+                // BLTDMOD retains its stale value from the previous blit;
+                // for the WB1.3 boot wall, a previous blit had BLTDMOD=-90
+                // and the corrupting bitmap blit inherited it, walking the
+                // dst pointer DOWN 12 bytes/row through K1.3's BCPL DOS
+                // pool data at $5E40.  See project_wb13_dialog_chain.md.
                 blt_xlat_valid = 1'b1;
                 blt_xlat_addr  = 6'h1C;
-                blt_xlat_wdata = {{16{amiga_wdata_half[15]}}, amiga_wdata_half};
+                blt_xlat_wdata = (is_long[winner] && be[winner] == 4'b1111)
+                                 ? wdata[winner]
+                                 : {{16{amiga_wdata_half[15]}}, amiga_wdata_half};
             end
             5'd19: begin                      // BLTDMOD ($DFF066)
                 blt_xlat_valid = 1'b1;
@@ -1653,10 +1669,13 @@ module m68k_bus #(
                         if (wdata[winner][15] && !blk_busy) begin
                             blk_busy    <= 1'b1;
                             blk_byte_mode <= 1'b1;
-                            // WORDSYNC=1: skip the $AAAA gap so the buffer
-                            // starts at the first $4489 sync (matching real
-                            // PLL behaviour where DMA only stores from sync
-                            // onward).  adf2mfm emits exactly 2 bytes of gap.
+                            // WORDSYNC=1: skip $AAAA gap AND the $4489 sync
+                            // word so the buffer starts at post-sync data
+                            // (matching real Amiga PLL behaviour where DMA
+                            // consumes the sync word for alignment and
+                            // doesn't write it to memory).  adf2mfm emits
+                            // 4 bytes gap ($AAAAAAAA) + 4 bytes sync
+                            // ($44894489) before sector data = 8 bytes total.
                             blk_cur_off <= adkcon_wordsync ? 32'd2 : 32'd0;
                             // Combine DSKPTH (already set) + new DSKPTL.
                             blk_cur_dst <= {dsk_pt[31:16], wdata[winner][31:16]};
@@ -1946,8 +1965,8 @@ module m68k_bus #(
                      addr[winner][1:0] == 2'b10) ||
                     addr[winner] == 32'h0000_5E40 ||
                     addr[winner] == 32'h0000_5E42)
-                    $display("[5E40-BUS-WR] port=%d addr=%h mem_idx=%h be=%b wdata=%h",
-                        winner, addr[winner], mem_idx, be[winner], wdata[winner]);
+                    $display("[5E40-BUS-WR] r=%d port=%d addr=%h mem_idx=%h be=%b wdata=%h",
+                        cosim_retired_i, winner, addr[winner], mem_idx, be[winner], wdata[winner]);
 `endif
 `ifdef HDRCHK_WATCH
                 // Watch writes that touch \$64DC..\$64E7 (hdr_chk + data_chk
@@ -2434,6 +2453,81 @@ module m68k_bus #(
         .be      (be[winner]),
         .src_id  (bus_src),
         .pc      (32'd0),
+        .retired (cosim_retired_i),
+        .hit_o   ()
+    );
+
+    // [MH-ATTRS-WR]: every write to chip $40E — the mh_Attributes
+    // field of the chip-RAM MemHeader at chip $400.  FS-UAE writes
+    // $0003 (MEMF_PUBLIC|MEMF_CHIP) here at PC=$FC1A38.  Our dump
+    // shows $0000 — either the write doesn't land, or something else
+    // clears it.  Always-on, captures src/value.
+    hw_watch #(
+        .LABEL      ("MH-ATTRS-WR"),
+        .ADDR_LO    (32'h0000_040E),
+        .ADDR_HI    (32'h0000_040F),
+        .MATCH_WE   (1),
+        .MATCH_RE   (0)
+    ) u_w_mh_attrs (
+        .clk     (clk),
+        .rst_n   (rst_n),
+        .valid   (bus_we_now),
+        .we      (1'b1),
+        .addr    (addr[winner]),
+        .wdata   (wdata[winner]),
+        .be      (be[winner]),
+        .src_id  (bus_src),
+        .pc      (32'd0),
+        .retired (32'd0),
+        .hit_o   ()
+    );
+
+    // [BUF-2D24-WR]: every write to chip $2D24..$2D27 — the corrupt
+    // longword in the WB1.3 cyl-53 MFM-decode buffer.  Our chip dump
+    // consistently shows $0 here; FS-UAE shows $44894489 (sector 3
+    // sync).  Blitter unit test passes for the cc000005 blit in
+    // isolation so this is a bus-arbitration / DMA-race / CPU-write
+    // interaction in the real boot.  Logs PC + src + wdata.
+    hw_watch #(
+        .LABEL      ("BUF-2D24-WR"),
+        .ADDR_LO    (32'h0000_2D24),
+        .ADDR_HI    (32'h0000_2D27),
+        .MATCH_WE   (1),
+        .MATCH_RE   (0)
+    ) u_w_buf_2d24 (
+        .clk     (clk),
+        .rst_n   (rst_n),
+        .valid   (bus_we_now),
+        .we      (1'b1),
+        .addr    (addr[winner]),
+        .wdata   (wdata[winner]),
+        .be      (be[winner]),
+        .src_id  (bus_src),
+        .pc      (32'd0),
+        .retired (32'd0),
+        .hit_o   ()
+    );
+
+    // [BLTDPT-WR]: every write to BLTDPT ($DFF054).  Captures the moment
+    // the CPU programs the destination of the next blit.  Used to find
+    // which graphics.library routine is computing destinations in our
+    // boot that land at chip $C2xx (corrupting the task stack).
+    hw_watch #(
+        .LABEL      ("BLTDPT-WR"),
+        .ADDR_LO    (32'h00DF_F054),
+        .ADDR_HI    (32'h00DF_F057),
+        .MATCH_WE   (1),
+        .MATCH_RE   (0)
+    ) u_w_bltdpt (
+        .clk     (clk),
+        .rst_n   (rst_n),
+        .valid   (bus_we_now),
+        .we      (1'b1),
+        .addr    (addr[winner]),
+        .wdata   (wdata[winner]),
+        .be      (be[winner]),
+        .src_id  (bus_src),
+        .pc      (32'd0),
         .retired (32'd0),
         .hit_o   ()
     );
@@ -2474,6 +2568,58 @@ module m68k_bus #(
         .MATCH_WE   (1),
         .MATCH_RE   (0)
     ) u_w_bplcon0 (
+        .clk     (clk),
+        .rst_n   (rst_n),
+        .valid   (bus_we_now),
+        .we      (1'b1),
+        .addr    (addr[winner]),
+        .wdata   (wdata[winner]),
+        .be      (be[winner]),
+        .src_id  (bus_src),
+        .pc      (32'd0),
+        .retired (32'd0),
+        .hit_o   ()
+    );
+
+    // [YFLD-BUS-WR]: ANY bus write (CPU or DMA) to slow $C04784..$C04789
+    // (the Y-coord field that gets zeroed by an unidentified writer).
+    // The Y-FIELD-WR probe in m68k_core only catches CPU writes via
+    // dc_we — DMA writes (blitter/copper/disk) go through different
+    // signal paths but all show up here in the bus arbiter.
+    hw_watch #(
+        .LABEL      ("YFLD-BUS-WR"),
+        .ADDR_LO    (32'h00C0_4780),
+        .ADDR_HI    (32'h00C0_4790),
+        .MATCH_WE   (1),
+        .MATCH_RE   (0)
+    ) u_w_yfld_bus (
+        .clk     (clk),
+        .rst_n   (rst_n),
+        .valid   (bus_we_now),
+        .we      (1'b1),
+        .addr    (addr[winner]),
+        .wdata   (wdata[winner]),
+        .be      (be[winner]),
+        .src_id  (bus_src),
+        .pc      (32'd0),
+        .retired (32'd0),
+        .hit_o   ()
+    );
+
+    // [FS-SIG-WR]: writes into the File System task's signal-state
+    // fields at slow $C00A92..$C00A9F (covers tc_SigAlloc, tc_SigWait,
+    // tc_SigRecvd, tc_SigExcept).  At r=177M idle the FS task has
+    // tc_SigWait=$80000000 (CTRL_C only) but tc_SigRecvd=$00000100
+    // (port sigbit already raised) — scheduler never wakes it because
+    // sigWait excludes the port bit.  Trace what wrote that to see if
+    // Wait() got the wrong mask or if memory got corrupted.
+    hw_watch #(
+        .LABEL      ("FS-SIG-WR"),
+        .ADDR_LO    (32'h00C0_0A92),
+        .ADDR_HI    (32'h00C0_0A9F),
+        .MATCH_WE   (1),
+        .MATCH_RE   (0)
+    ) u_w_fs_sig (
         .clk     (clk),
         .rst_n   (rst_n),
         .valid   (bus_we_now),
