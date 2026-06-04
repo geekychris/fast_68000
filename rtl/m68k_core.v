@@ -3050,6 +3050,19 @@ module m68k_core #(
                     retired, ex_pc, dc_addr, dc_wdata, dc_be);
             end
 `endif
+`ifdef BLT_TRIGGER_PC_TRACE
+            // Catch every CPU write to BLTSIZE (\$DFF058 = blit trigger).
+            // Prints PC + the size word so we can correlate which K1.3
+            // ROM routine issues each blit; cross-references with
+            // BLT_START_TITLE/BANNER (which print bltcon and bltdpt) by
+            // matching the size word.  Per WB13_DEBUG_JOURNAL §41 — used
+            // to find which Intuition routine issues the late LF=\$00
+            // banner clear.
+            if (dc_we && dc_addr == 32'h00DF_F058) begin
+                $display("[BLT_TRIGGER] r=%d pc=%h dc_wdata=%h dc_be=%b",
+                    retired, ex_pc, dc_wdata, dc_be);
+            end
+`endif
 `ifdef KICKSTART_TRACKDISK_TRACE
             // Wider window trace: K1.3 trackdisk decoder PCs during the
             // validation window.  Open r=2.0M..5.0M after the snoop fix

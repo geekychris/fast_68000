@@ -3497,3 +3497,26 @@ diary methodology — §25 through §38, with §30-§32 ruling out
 false trails — was directly responsible for landing the fix here
 instead of months later.
 
+
+---
+
+## §41. BLT_TRIGGER_PC_TRACE — finding the PC that issues each blit (2026-06-04)
+
+Per §40 + task #144: a late `LF=$00` clear blit (bltdpt=$6438
+bltsize=$2F68) zeroes the CLI banner area after Text() has painted
+it.  Need to find the K1.3 ROM PC that issues this clear so we
+can identify which Intuition routine is responsible.
+
+Probe added in `rtl/m68k_core.v`: `BLT_TRIGGER_PC_TRACE` fires
+whenever the CPU writes to `$DFF058` (BLTSIZE — the blit-trigger
+register).  Prints `r=`, `pc=`, `dc_wdata=`.
+
+Cross-referenced against `BLT_START_BANNER_TRACE` (§39) by
+matching the bltsize word printed in both probes.  Combined:
+each blit's CPU-side trigger PC + chipset-side BLTCON0/source/
+dest is captured.
+
+Filter: find `[BLT_TRIGGER]` events with `dc_wdata=$00002F68`
+(low half = `$2F68`, the size word of the suspect blit) and
+look at the preceding context.  Result lands in §42.
+
