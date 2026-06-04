@@ -4175,3 +4175,111 @@ Future session can resume with a single concrete plan:
 4. The missing/extra blits tell us where Workbench's icon-init
    diverges from real WB1.3
 
+
+---
+
+## §53. Correction: the "icon gap" was a wrong-active-window comparison (2026-06-04)
+
+§50–§52 concluded the icon-graphic gap was upstream of the blitter
+on the basis of this comparison:
+
+```
+$6668 OURS: 00 00 00 00 ...                ← supposedly empty
+$6668 FSU:  c0 00 0f 07 00 00 07 c0 ...   ← supposedly has icon graphics
+```
+
+Re-examination shows that assertion was wrong on **both sides**.
+`$6668` is row 17 of BPL1.  On the FSU snapshot CLI is the active
+window covering everything below the title bar, so the bytes at
+`$6668` aren't icon graphics — they're **CLI banner text glyphs**
+("Copyright 1987 Commodore-Amiga, Inc.").  Our snapshot has WB
+Backdrop as the active window, so BPL1 at that row is mostly
+empty (CLI text isn't drawn at all in our boot).
+
+The actual icons live in **BPL2** (`$B0C8 + row*80`).  Direct
+BPL2 inspection of our post-§38 chip-RAM dump:
+
+```
+=== OURS BPL2 rows 16-31, cols 440-639, BPL1+BPL2 combined ===
+r16  ...22222222222222222222222222...
+r17  ...22111111######2222####11222..  ← floppy disk top + write-protect
+r18  ...22111111######2222####11112..
+...
+r22  ...221111111111111111111111111..  ← floppy disk body
+...
+r31  ...222222222222222222222222222..  ← floppy disk bottom
+r32  ...111111.....11...1.....1......  ← "RAM DISK" text label
+r33  ...11..11...1111..11...11.......
+...
+r43  ...222222222################...  ← Workbench1.3 disk icon
+...
+r57  ...222222.......................
+r59  ...11...11.................111.  ← "Workbench1.3" text label
+```
+
+The RAM DISK floppy icon, RAM DISK label, Workbench1.3 disk icon,
+adjacent Trashcan icon, and Workbench1.3 label are **all present
+in BPL2**, rendered correctly with shading, write-protect notch,
+and labels.
+
+The §50–§52 sessions were chasing a non-existent bug.  The
+correct post-§38 outcome is: the WB1.3 desktop renders the
+icons properly.  There is no missing "earlier-in-sequence blit"
+(§51b) and no `.info` load gap (§52a).
+
+### §53a. What the visible-state actually is
+
+After §38, our boot renders the natural Workbench 1.3 desktop:
+
+| Element                                      | State                                |
+| -------------------------------------------- | ------------------------------------ |
+| Title bar (solid white + "Workbench release.") | ✓ rendered                         |
+| Title bar gadgets (depth/close, top-right)   | ✓ rendered                           |
+| Blue backdrop                                | ✓ rendered                           |
+| RAM Disk icon + label                        | ✓ rendered (BPL2)                    |
+| Workbench1.3 disk icon + label               | ✓ rendered (BPL2)                    |
+| Trashcan icon                                | ✓ rendered (BPL2)                    |
+| Mouse cursor                                 | ✓ rendered (sprite layer, see §25)   |
+| CLI window + AmigaDOS banner                 | Not depth-arranged (CLI not in front) |
+| WB Backdrop right border                     | Subtle 4-px gap (Intuition-side)     |
+
+The CLI banner gap (§40–§45) is the only remaining "blit"-related
+gap, and it is **diagnosed**: graphics.library per-plane RectFill
+at `$FE2FFC` (via LAYERREFRESH chain at `$FE210C`, called from
+CON: CR-handler at `$FE4962`) clears the banner body after it's
+drawn.  Reproducing that fix requires changes inside CON: /
+graphics.library logic — not RTL.
+
+### §53b. Lessons
+
+1. **Same-active-window snapshots are mandatory for chip-RAM
+   comparison.**  Without matching FS-UAE's depth state to ours,
+   pixel-level diffs are noise.  We need to either click CLI to
+   front in our sim or click WB Backdrop to front in FS-UAE
+   before snapshotting.
+
+2. **Look at both BPL1 and BPL2 before concluding a plane is
+   "empty."**  BPL1 carries text/banner glyphs (CLI in FSU,
+   nothing here); BPL2 carries icon graphics + backdrop color.
+   They tell different stories.
+
+3. **The §38 USE_A=0 fix was complete.**  No further blitter fix
+   is required for icon rendering.  Three regression tests
+   (t157/t158/t159) lock in coverage of the canonical Intuition
+   blit forms.
+
+### §53c. Task status reset
+
+Re-labelling the open items based on §53:
+
+- ~~Open: `.info` icon files not loaded from disk~~ — **closed by §53**, icons render
+- ~~Open: Workbench earlier blits missing~~ — **closed by §53**, no missing blits
+- Still open: CLI banner gap (graphics.library LAYERREFRESH path, §44/§45)
+- Still open: WB Backdrop right border (Intuition-side, not RTL)
+- Still open: Title bar text appears partial ("Workbench release. 888272" instead of
+  full "Workbench release. NNNNNN graphics mem MMMMMM other mem") — Workbench
+  trims free-mem reporting; investigate `exec/AvailMem` return path
+
+Net: the WB1.3 desktop rendering is **substantively correct**.
+Remaining gaps are CLI/Intuition-side, not blitter.
+

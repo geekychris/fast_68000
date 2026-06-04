@@ -258,3 +258,32 @@ quadrature counter wraps gracefully so 624 px is reachable, but
 clicking a struct whose pixels were never painted doesn't bring
 content back — Intuition has no refresh path that re-emits the title
 bar glyphs out of thin air.
+
+### 2026-06-04 PM — Honesty re-check: desktop renders correctly
+
+![](20260604_144929_wb13_actual_render_check.png)
+
+Per `docs/WB13_DEBUG_JOURNAL.md` §53: the §50-§52 "icon-graphic gap"
+diagnosis was a wrong-active-window comparison.  We were diffing our
+BPL1 (WB Backdrop active, mostly empty) against FS-UAE's BPL1 (CLI
+active, full of banner text).  Direct inspection of BPL2 in our
+post-§38 chip-RAM shows **RAM DISK floppy, Workbench1.3 disk,
+Trashcan, both labels, and depth gadgets all rendered correctly**.
+
+The render above is the natural post-§38 boot.  Visible-state
+summary:
+
+- ✓ Title bar (solid white + "Workbench release.")
+- ✓ Title bar gadgets (depth/close, top-right)
+- ✓ Blue backdrop
+- ✓ RAM Disk icon + label
+- ✓ Workbench1.3 disk icon + label
+- ✓ Trashcan icon
+- ✓ Mouse cursor (sprite layer)
+- ⨯ CLI / AmigaDOS banner (CLI not depth-arranged in front; diagnosed
+  in §40-§45 as graphics.library LAYERREFRESH path, not a blitter
+  bug)
+- ⨯ WB Backdrop right border (Intuition-side, not RTL)
+
+WB1.3 desktop is **substantively correct** with no further blitter
+work needed.  Remaining gaps are CLI/Intuition-side.
