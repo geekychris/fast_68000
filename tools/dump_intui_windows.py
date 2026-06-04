@@ -82,13 +82,17 @@ def dump_window(addr, r8, r16, r32, rstr):
         mp_name_ptr = r32(user_port + 0x0A)
         mp_name = rstr(mp_name_ptr) if mp_name_ptr else None
         print(f"    mp_LN.Name:  {mp_name!r}")
-        print(f"    mp_SigBit:   ${mp_sigbit:02X} ({mp_sigbit})  ← Wait mask = 1<<{mp_sigbit} = ${1<<mp_sigbit:08X}")
-        print(f"    mp_SigTask:  ${mp_sigtask:08X}")
-        # Check if msg list is empty
-        head = r32(user_port + 0x14)
-        tail_pred = r32(user_port + 0x1C)
-        empty = head == user_port + 0x18 and tail_pred == user_port + 0x14
-        print(f"    msgs pending: {'NO (empty)' if empty else 'YES'}")
+        if mp_sigbit is None or mp_sigtask is None:
+            print(f"    (UserPort unmapped or out-of-range — skipping signal fields)")
+        else:
+            print(f"    mp_SigBit:   ${mp_sigbit:02X} ({mp_sigbit})  ← Wait mask = 1<<{mp_sigbit} = ${1<<mp_sigbit:08X}")
+            print(f"    mp_SigTask:  ${mp_sigtask:08X}")
+            # Check if msg list is empty
+            head = r32(user_port + 0x14)
+            tail_pred = r32(user_port + 0x1C)
+            if head is not None and tail_pred is not None:
+                empty = head == user_port + 0x18 and tail_pred == user_port + 0x14
+                print(f"    msgs pending: {'NO (empty)' if empty else 'YES'}")
 
     if first_req:
         print(f"  FirstRequest: ${first_req:08X}")
