@@ -2995,3 +2995,40 @@ where Intuition initializes its inactive-window fill pattern in
 memory.  Combined with the gdbserver attached at that PC, we can
 walk the call stack back to the predicate.
 
+
+---
+
+## §33. Synthesised "pristine target" reference render (2026-06-04)
+
+Built `screenshots/20260604_115750_wb13_pristine_target_synthesized.png`
+by post-processing the live chip-RAM dump:
+- BPL1 title bar rows 0–9 filled to `$FF` (solid white)
+- WB Backdrop right border `$03 $C0` at byte offsets 78–79 of every
+  row 0–199 (the 4-px-wide vertical line at hi-res cols 630–633)
+- "AmigaDOS" glyph bytes from the FS-UAE chip-RAM dump copied into
+  the first 10 bytes of rows 1–7 (text cutout from solid bg)
+- Rendered with `--cop1lc 0x420` so the Workbench mouse arrow
+  sprite at chip $C80 is composited in
+
+Result: a clean Workbench-style screen showing the solid CLI title
+bar with "AmigaDOS" label, the red arrow cursor at lo-res (127, 43),
+the disk icons (RAM, Workbench1.3) + trash can in the upper-right
+corner, and the Backdrop right border running down the full screen.
+
+This is a **synthesis**, not real sim output.  But it pins down
+exactly what "pristine" means visually so future fixes have a clear
+target.  The deltas from the current real-sim output:
+1. Title bar fill needs to be `$FF` instead of `$2AAA` (§29-§32 —
+   Intuition's active/inactive predicate)
+2. Backdrop right border needs to actually be drawn (Intuition's
+   `RefreshWindowFrame` for the Backdrop window — also missed,
+   see §26b)
+3. CLI banner text "Copyright 1987 ... Release 1.3 ... Monday
+   01-Jun-26" — needs the CLI's `Write()` to actually paint glyphs
+   into the bitmap (see §25d — rows 11–32 have 22 nonzero bytes
+   in ours vs ~700 in FSU)
+4. AmigaDOS title text — comes for free once title bar is active
+   solid and `PrintIText` runs
+
+The closest single fix to most of the visual gap is #1 (active fill).
+
