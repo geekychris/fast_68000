@@ -3911,3 +3911,63 @@ Until that probe lands, the visible UI is "garbled WB1.3 with
 title bar working but icons missing graphics", not "natural
 Workbench desktop".
 
+
+---
+
+## §49. Amiga test-pattern approach to triangulate the icon-graphic gap (2026-06-04)
+
+User suggestion: write a small 68k assembly test that **uses the
+blitter the way Workbench uses it for icons**, so we can isolate
+the specific blit form that's failing without running a 24M-cycle
+WB1.3 boot first.
+
+The existing `tests/t157_use_a_zero_preset.s` (and `t155`) test
+*one* specific blit shape per file.  An icon-rendering test would
+chain the actual sequence Workbench uses:
+
+1. RectFill the icon background box (foreground-pen)
+2. BltBitMapRastPort the icon image (LF=$E2 typically, with mask)
+3. Maybe a shadow/outline blit
+4. PrintIText the icon label
+
+Each step uses different BLTCON0 / LF / USE bits.  Once we know
+which step produces wrong output, the fix is local instead of
+walking back through OS-stack call chains.
+
+### §49a. Existing infrastructure
+
+We already have:
+- `tests/t1*.s` — single-blit-shape tests, asm68k.py builds them,
+  the Vm68k_top binary runs them
+- `tests/gen/` — auto-generated tests (`tools/gen_chipset_long_tests.py`)
+- `crosscheck-minimig-blt` make target compares our blitter against
+  minimig's reference on the actual K1.3 boot blits
+
+So adding `tests/t158_icon_drawimage.s` that runs a Workbench-style
+DrawImage sequence and verifies the result against a precomputed
+expected byte pattern is straightforward — same harness as t157.
+
+### §49b. Why this beats more probing
+
+A targeted unit test:
+- Runs in seconds (not 7 min per boot)
+- Has known inputs (we set BLTCON0/BLTAxxx/BLTBxxx explicitly)
+- Lets us write a Python ground-truth blitter to compare against
+  (~50 lines)
+- Pinpoints failures to a specific blit form
+
+If the test PASSES with the same shape as Workbench's icon blit,
+the bug is in the SOURCE DATA Workbench reads from (icon `.info`
+files not loaded from disk) — not in the blitter.
+
+If it FAILS, we've isolated another RTL bug, ready for a t158-
+style regression test.
+
+### §49c. Awaiting BLT_START_ICON_TRACE
+
+Need the actual BLTCON0/LF/USE values WB1.3 uses for icon-image
+blits.  Probe `BLT_START_ICON_TRACE` (committed earlier this
+session) is filtered to `bltdpt ∈ [$6618, $6A78]` — boot in
+flight.  Once it returns we have the parameters to write t158
+against.
+
