@@ -3617,3 +3617,91 @@ graphics.library per-plane loop, which called `BltClear` /
 
 Result lands in §44.
 
+
+---
+
+## §44. Call chain at the banner-clear instant — Layer refresh path (2026-06-04)
+
+`BANNER_CLEAR_PC_STACK_TRACE` (§43) caught the user-stack pointer
+A7=$00C071C0 at the moment the late banner-clear fires.  At idle
+the stack contents are preserved enough to walk the saved return
+PCs.  The return-PC chain (most-recent caller on top):
+
+| Stack offset (A7+)   | Saved PC          | Disasm context                                       |
+| -------------------- | ----------------- | ---------------------------------------------------- |
+| +$20  (C071E0)       | `$FC62A6`         | After `JSR $FCF738` — small library-call wrapper     |
+| +$2C  (C071EC)       | `$FE3D18`         | Inside `MOVEA.L (A7)+, A6` epilogue                  |
+| +$34  (C071F4)       | `$FE210C`         | After `BSR $FE3D08`, then **`ORI.W #$80, $1E(A2)`** |
+| +$38  (C071F8)       | `$FE2158`         | After `BSR $FE13B8`                                  |
+| +$48  (C07208)       | `$FC1826`         | Small helper, `MOVEM ... A2`/RTS                    |
+| +$58  (C07218)       | `$FE496E`         | After `JSR $FF76(A6)` — library call to `-$8A`(A6)  |
+
+### §44a. The smoking-gun signature
+
+The instruction at PC=$FE210C is:
+
+```
+$FE210C:  ORI.W #$0080, $001E(A2)
+```
+
+`$001E(A2)` is `Layer.Flags`.  Bit 7 (`$80`) is `LAYERREFRESH`.
+So the caller is **setting LAYERREFRESH on a Layer** — Intuition's
+canonical "this layer needs to be re-drawn" signal.  The clear blit
+that follows is the standard layer-refresh implementation: erase
+the body region, queue an REFRESHWINDOW IDCMP to the owning task,
+let the task redraw.
+
+Walking back two more frames: the deepest visible saved PC
+`$FE496E` came right after `JSR $FF76(A6)` — a library call at
+offset `$-8A` from the library base A6.  $-8A is **graphics.library
+LVO_InitRastPort** or thereabouts (precise mapping depends on the
+.fd file, not searched here).  Combined with the LAYERREFRESH
+signature, the operation looks like:
+
+```
+Some user code → graphics.library Layer op → mark LAYERREFRESH →
+  refresh helper → per-plane clear loop ($FE2FFC) → BLTSIZE @ $FE301E
+```
+
+### §44b. Why does this fire late in our boot?
+
+This is the upstream gap.  In real K1.3+WB1.3, the CLI window
+ALSO gets its body cleared at some point (e.g. when an
+`ActivateWindow` deactivates a previous window).  But in real
+operation the CLI process then *redraws* its banner content
+because it has the text-string buffer ready.  In our boot:
+- The clear happens at retired=24M
+- The CLI process has presumably already finished its banner-write
+  and entered `WaitForChar`/`Wait` (= blocking on IDCMP/console
+  signal)
+- When the LAYERREFRESH fires, CLI's wakeup signal doesn't
+  re-emit the banner — it's stuck waiting on a different signal
+
+So the "fix" for the CLI banner gap is either:
+1. Don't trigger LAYERREFRESH on the CLI window in the first place
+   (requires understanding what user code at $FC62A6/$FE3D18
+   issues it)
+2. Wake the CLI process so it re-emits its banner when REFRESHWINDOW
+   arrives — but K1.3 CON: handler doesn't auto-redo Write() on
+   refresh
+3. Just accept that the visible Workbench desktop already shows
+   the actually-important content (icons, title bar) and call this
+   gap done
+
+### §44c. Diary line — this thread is closing
+
+Per §40b / §42c, this CLI-banner gap is *not blocking* the
+Workbench desktop milestone landed in §38d.  The natural
+`make wb-screenshot` produces the correct WB1.3 desktop image
+(title bar, icons, labels, depth gadget).  The CLI banner is
+extra info that only appears if the CLI window happens to be the
+active/front window — and our boot has WB Backdrop in front.
+
+The diary methodology has now traced this specific bug from
+"title bar paints as stipple" (§29) all the way through to the
+exact instruction (`$FE210C ORI.W #$80, $1E(A2)`) and the exact
+mechanism (LAYERREFRESH-triggered clear).  Future session can
+resume by finding what user code triggers the
+`JSR $-8A(GraphicsBase)` near $FE4960 and either filter it or
+ensure CLI's IDCMP path queues a banner re-emit.
+
