@@ -527,6 +527,21 @@ module blitter (
                                     bltafwm[15:0], bltalwm[15:0]);
                             end
 `endif
+`ifdef BLT_START_ICON_TRACE
+                            // Same shape but for the Workbench disk-icon
+                            // area: BPL1 rows 17..30 = $6618..$6A78.
+                            // Per §48a: investigate why icons render as
+                            // solid white outlines instead of detailed
+                            // graphics — find which blits hit this range
+                            // and what their LF/USE/source data is.
+                            if (bltdpt[23:0] >= 24'h00_6618 &&
+                                bltdpt[23:0] <= 24'h00_6A78) begin
+                                $display("[BLT_START_ICON] bltcon=%h bltapt=%h bltbpt=%h bltcpt=%h bltdpt=%h bltsize=%h adat_pre=%h bdat_pre=%h cdat_pre=%h afwm=%h alwm=%h",
+                                    bltcon, bltapt, bltbpt, bltcpt, bltdpt, slv_wdata[15:0],
+                                    bltadat_pre[15:0], bltbdat_pre[15:0], bltcdat_pre[15:0],
+                                    bltafwm[15:0], bltalwm[15:0]);
+                            end
+`endif
 `ifdef KICKSTART_BOOT_TRACE
                             $display("[BLT_START] bltcon=%h bltapt=%h bltbpt=%h bltcpt=%h bltdpt=%h bltsize=%h bltamod=%h bltbmod=%h bltcmod=%h bltdmod=%h",
                                 bltcon, bltapt, bltbpt, bltcpt, bltdpt, slv_wdata[15:0],
