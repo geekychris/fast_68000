@@ -3800,3 +3800,63 @@ in the §38 fix as known-good against the existing regression
 infrastructure (149/149 functional tests + 1000 fuzz tests + the
 WB1.3 boot reaching natural Workbench-desktop idle).
 
+
+---
+
+## §47. Session epilogue (2026-06-04)
+
+A small remaining visual gap: WB Backdrop's right border (4-px
+vertical line at hi-res cols 630-633) is still empty in our chip
+RAM, while FS-UAE has `$03 $C0` at byte offsets 78-79 of every
+row 0-199.  Audited the line-mode code path
+(`S_LRDC`/`S_LWRD`/`line_combine`) for the same USE_X=0 staleness
+class that §38 fixed in copy mode — line mode is fine:
+- `a_word` is explicitly set to `pixel_mask` (Bresenham-derived
+  bit) regardless of USE_A
+- `b_word` is explicitly set from `bltbdat_pre` regardless of
+  USE_B
+- `c_cur_word_q` is read in S_LRDC unconditionally
+
+So whatever's keeping our Backdrop border from rendering is
+something other than a Verilator-blitter staleness bug.  Possible
+candidates (untested):
+- Intuition's "should I draw this border?" predicate considers
+  the Backdrop window a no-border case in our state
+- The border-draw calls happen but during a guarded region
+  (`BLT_VECTABLE_GUARD` or `BLT_MFM_BUFFER_GUARD`) — would need
+  to enable those guards' traces to confirm
+
+### §47a. The final session ledger
+
+After ~30 hours total across the §25-§47 arc (mixed across two
+days):
+
+| Category               | Count | Notes                                  |
+| ---------------------- | ----- | -------------------------------------- |
+| Diary sections         | 23    | §25 through §47                        |
+| Root-cause RTL fixes   | 2     | USE_A=0 (§38), USE_B prev-word (§39)   |
+| Renderer fixes         | 1     | sprite `len(tuple)=2` (§25a)           |
+| Regression tests added | 1     | t157_use_a_zero_preset                 |
+| Diagnostic probes      | 7     | per §26-§43                            |
+| Memory notes           | 3     | sprite, frame-skipped (deprecated), use_a_fix |
+| Screenshots saved      | 9     | progress timeline                      |
+| Makefile targets       | 1     | `make wb-pristine`                     |
+| Helper scripts         | 1     | `tools/gen_pristine_pokes.py`          |
+| Commits pushed         | 22    | all to origin/main                     |
+
+The natural Workbench 1.3 desktop now renders from a real
+`make wb-screenshot` run with no patches: solid title bar
+"Workbench release. 888272", RAM Disk + Workbench1.3 icons,
+labels, depth gadget, blue backdrop.
+
+Open gaps (documented, not blocking):
+- WB Backdrop right border (this §47 — not a blitter bug)
+- CLI banner content (§40-§45 — CR-handler / LAYERREFRESH path)
+- Bottom-row disk-icon label rendering (suspected related to
+  Workbench-process state we haven't probed)
+
+The diary methodology — keeping a written record of *what was
+disproven* as well as *what was proven* — produced an
+investigation that future sessions can join at any point without
+re-walking the dead ends.
+
