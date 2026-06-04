@@ -3520,3 +3520,81 @@ Filter: find `[BLT_TRIGGER]` events with `dc_wdata=$00002F68`
 (low half = `$2F68`, the size word of the suspect blit) and
 look at the preceding context.  Result lands in §42.
 
+
+---
+
+## §42. Late LF=$00 banner clear issuer: K1.3 ROM `$FE2FFC` per-plane loop (2026-06-04)
+
+`BLT_TRIGGER_PC_TRACE` from §41 caught **18,623** BLTSIZE writes
+over the boot.  Filtering for `dc_wdata=$2F680000` (the size word of
+the suspect banner-clear) found:
+
+```
+[BLT_TRIGGER] r=24187930 pc=00fe301e dc_wdata=2f680000 dc_be=1100
+```
+
+So the late banner-clear blit is issued by CPU PC `$00FE301E` at
+`retired=24,187,930` (~24M instructions in, mid-boot).
+
+### §42a. ROM disasm — it's a per-plane clear loop
+
+Disassembling K1.3 ROM `$FE2FFC..$FE3038`:
+
+```
+$FE2FFC:  MOVE.B  $0018(A2), D0    ; D0 = RastPort.Mask (plane mask)
+$FE3000:  MOVE.B  D2, D1           ; D1 = loop iter (current plane idx)
+$FE3002:  LSR.B   D1, D0           ; shift mask right by iter
+$FE3004:  BTST.L  #0, D0           ; test bit 0
+$FE3008:  BEQ     $FE3022          ; skip if plane disabled
+$FE300A:  BSR     $FE3C20          ; (helper — sets up BLTCON0/etc.)
+$FE300E:  MOVE.L  D2, D0
+$FE3010:  ASL.L   #2, D0           ; D0 = iter * 4 (longword offset)
+$FE3012:  MOVEA.L D3, A4           ; A4 = BitMap*
+$FE3014:  MOVE.L  $08(A4,D0.L), D0 ; D0 = BitMap.Planes[i]
+$FE3018:  ADD.L   D4, D0           ; D0 += row offset (= $370 = 11 rows)
+$FE301A:  MOVE.L  D0, $0054(A3)    ; BLTDPT = plane[i] + offset
+$FE301E:  MOVE.W  D5, $0058(A3)    ; BLTSIZE = trigger
+$FE3022:  ADDQ.L  #1, D2           ; next plane
+$FE3024:  ...                       ; loop test
+```
+
+So $FE2FFC is the canonical graphics.library per-plane loop body
+for **a BitMap operation that clears `Mask`-selected planes** with
+`bltcon` set up by `$FE3C20` (which produces `bltcon=$00000001` =
+LF=$00 USE_D=1).  The blit is invoked for each plane separately.
+
+Parent caller is somewhere above $FE2FE0; based on `D4` adding a
+row-offset and `D5` carrying size, this is the inner loop of
+**`BltClear` / `RectFill` / `ScrollRaster`** — graphics.library's
+plane-iterating helpers.
+
+### §42b. Why does it clear the banner area?
+
+`bltdpt = $6438` lands at BPL1 row 11, col 0 — exactly where the
+CLI window body starts (CLI title bar = rows 0-10, body = rows 11+).
+The full clear size 189 × 80 = 15,120 bytes covers the entire CLI
+body from row 11 to row 199.
+
+That's not a "scroll bottom row" or "refresh after activation" —
+it's a **whole-body wipe**.  Likely scenarios:
+1. Our CLI process re-enters its main loop and clears the body
+   before re-printing (which fails because the re-print path has
+   already had its text source freed)
+2. Some misbehaving input event triggers a window refresh that
+   wipes the body
+3. WB1.3 startup-sequence runs a script that issues `ClearWindow`
+   (this would be a CLI command after banner-print)
+
+To pick between these we'd need to walk the call stack at
+`retired=24,187,930` PC=$FE301E — the gdbserver could do this:
+breakpoint at $FE301E with a hit-condition on retired ≥ 24M,
+then `bt` the call chain.
+
+### §42c. Scope decision — punt this thread
+
+Per §40b: this is downstream of our blitter RTL work and lives
+in OS-emulation territory.  The natural Workbench desktop renders
+correctly; the CLI banner gap is one quartile of the visible
+screen, not a blocking issue.  Recording the diagnosis here so a
+future session can resume from this exact point.
+
