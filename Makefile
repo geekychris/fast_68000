@@ -59,7 +59,7 @@ build: $(BUILD)/Vm68k_top
 # Generic build rule: BUILD, N_CORES, USE_CACHE, MEM_WORDS, WITH_SDL2 control the output.
 # Optional ROM_WORDS / ROM_HEXFILE / OVL_RESET configure the Kickstart-ROM
 # region and reset-time OVL latch.
-$(BUILD)/Vm68k_top: $(RTL_SRCS) $(TB_DIR)/sim_main.cpp
+$(BUILD)/Vm68k_top: $(RTL_SRCS) $(TB_DIR)/sim_main.cpp $(TB_DIR)/gdbserver.cpp $(TB_DIR)/gdbserver.h
 	@mkdir -p $(BUILD)
 	$(VERILATOR) -Wno-fatal --cc --exe --build \
 	    -CFLAGS "-DNUM_CORES=$(N_CORES) -std=c++17 -O1 $(if $(WITH_SDL2),-DHAVE_SDL2 $(SDL2_CFLAGS),) $(if $(FB_W),-DFB_W=$(FB_W),)" \
@@ -78,7 +78,7 @@ $(BUILD)/Vm68k_top: $(RTL_SRCS) $(TB_DIR)/sim_main.cpp
 	    --top-module m68k_top \
 	    -Mdir $(BUILD) \
 	    -o Vm68k_top \
-	    $(RTL_SRCS) $(TB_DIR)/sim_main.cpp
+	    $(RTL_SRCS) $(TB_DIR)/sim_main.cpp $(TB_DIR)/gdbserver.cpp
 
 # Regression suite (functional tests). Uses the default cached build.
 test:

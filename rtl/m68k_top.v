@@ -24,6 +24,9 @@ module m68k_top #(
     // chipram snapshots when execution hits a configured PC.  Single-core
     // kickstart-boot only inspects core 0.  See DIAGNOSTICS.md.
     output wire [32*N_CORES-1:0] core_pc_flat,
+    // gdbserver debug interface: D0..A7 (16 × 32 bits per core), SR (16 bits).
+    output wire [16*32*N_CORES-1:0] dbg_regs_flat,
+    output wire [16*N_CORES-1:0]    dbg_sr_flat,
 
     // Framebuffer peek for the simulator harness. Drive fb_peek_addr with a
     // word-aligned byte address; fb_peek_data returns the 32-bit word.
@@ -864,7 +867,9 @@ module m68k_top #(
                 .halt_code  (halt_code_flat[16*gi +: 16]),
                 .retired    (retired_flat[32*gi +: 32]),
                 .cpu_in_stop(cpu_in_stop_flat[gi]),
-                .cur_pc     (core_pc_flat[32*gi +: 32])
+                .cur_pc     (core_pc_flat[32*gi +: 32]),
+                .dbg_regs_flat(dbg_regs_flat[16*32*gi +: 16*32]),
+                .dbg_sr     (dbg_sr_flat[16*gi +: 16])
             );
         end
     endgenerate

@@ -30,6 +30,8 @@
 #include <unistd.h>   // chdir
 #include <algorithm>
 
+#include "gdbserver.h"
+
 #ifdef HAVE_SDL2
 #include <SDL.h>
 #include <chrono>
@@ -174,7 +176,10 @@ static constexpr uint32_t CONSOLE_RING_ADDR = 0x0000F010;
 static constexpr uint32_t CONSOLE_RING_MASK = 0xFFu;
 static constexpr uint64_t CONSOLE_POLL      = 32;
 
-static uint32_t mem_peek_word(Vm68k_top* top, uint32_t byte_addr) {
+// Make mem_peek_word externally callable for tb/gdbserver.cpp.
+uint32_t mem_peek_word(Vm68k_top* top, uint32_t byte_addr);
+
+uint32_t mem_peek_word(Vm68k_top* top, uint32_t byte_addr) {
     top->fb_peek_addr = byte_addr & ~3u;
     top->eval();
     return top->fb_peek_data;
@@ -698,7 +703,21 @@ static int run_regression(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
     // motion as a smooth glide rather than one giant teleport step.
     const uint64_t MOUSE_MOVE_DURATION = 30000000ULL;
 
+    // ---- gdbserver: optional debugger interface ----
+    GdbServer gdb;
+    if (gdb.init_from_env()) {
+        gdb.wait_for_client_if_enabled();
+    }
+
     while (cycle < max_cycles && !all_halted()) {
+        // gdbserver tick.  If a debugger is attached and we're halted,
+        // spin here draining packets until it sends `c` or `s`.
+        if (gdb.enabled()) {
+            while (!gdb.tick(top, cycle)) {
+                // Halted; busy-wait briefly so we don't peg the CPU.
+                usleep(1000);
+            }
+        }
         // Default ext_kbd_wr to 0; the injection block below pulses it
         // for exactly one cycle when a scancode is due.
         top->ext_kbd_wr = 0;
@@ -785,6 +804,9 @@ static int run_regression(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
         top->clk = 0; top->eval();
         top->clk = 1; top->eval();
         cycle++;
+
+        // gdbserver: after each clock advance, check breakpoints / step.
+        if (gdb.enabled()) gdb.notify_step(top, cycle);
 
         // CHIPRAM_SNAP: check core 0's EX-stage PC each cycle.  Fire on
         // the rising edge (PC transitions INTO a configured value) so a

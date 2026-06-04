@@ -68,7 +68,14 @@ module m68k_core #(
     // Current EX-stage PC, exposed so the simulator harness can trigger
     // chipram snapshots at specific instructions.  Pure observation -
     // no functional impact.  See DIAGNOSTICS.md "CHIPRAM_SNAP_PCS".
-    output wire [31:0] cur_pc
+    output wire [31:0] cur_pc,
+    // ---- gdbserver debug interface (pure observation) ----
+    // Full register file flattened: regs[0]=D0..regs[7]=D7, regs[8]=A0..
+    // regs[15]=A7.  Each entry is 32 bits, ordered LSB-first in the bus.
+    output wire [16*32-1:0] dbg_regs_flat,
+    // Status register (T,S,I[2:0],X,N,Z,V,C — packed into 16 bits as
+    // sr_now is built).
+    output wire [15:0]      dbg_sr
 );
     assign ic_we    = 1'b0;
     assign ic_lock  = 1'b0;
@@ -1237,6 +1244,15 @@ module m68k_core #(
     end
     assign cpu_in_stop = cpu_in_stop_r;
     assign cur_pc      = ex_pc;
+
+    // ---- gdbserver: expose D0..A7 and SR for external inspection ----
+    genvar __dbgi;
+    generate
+        for (__dbgi = 0; __dbgi < 16; __dbgi = __dbgi + 1) begin : gdbg_regs
+            assign dbg_regs_flat[32*__dbgi +: 32] = u_rf.regs[__dbgi];
+        end
+    endgenerate
+    assign dbg_sr = sr_now;
     wire bcc_mispred   = is_settled && (ex_kind == K_BCC) && (ex_predicted_taken != take_branch_c);
     wire other_branch  = is_settled && (ex_kind != K_BCC) && take_branch_c;
     wire exc_redirect  = is_settled_after_exc || is_settled_after_rte;
