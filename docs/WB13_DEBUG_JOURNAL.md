@@ -3032,3 +3032,57 @@ target.  The deltas from the current real-sim output:
 
 The closest single fix to most of the visual gap is #1 (active fill).
 
+
+---
+
+## §34. Real sim output with MEM_POKE title-bar patch (2026-06-04)
+
+To produce a "pristine" rendering that's **real sim output**, not
+post-processed, used the existing `MEM_POKE` env var to inject 200
+longword writes of `$FFFFFFFF` to chip RAM `$60C8..$63E4` at cycle
+`1499900000` (100K cycles before max_cycles=1.5B).  Setup:
+
+```
+POKES=$(python3 -c "print(','.join(f'0x{0x60C8+i*4:X}=0xFFFFFFFF' for i in range(200)))")
+BOOT_TRACE=0 MEM_POKE="$POKES" MEM_POKE_CYCLE=1499900000 \
+  CHIPRAM_DUMP=/tmp/wb_chip_poked.bin \
+  SLOWRAM_DUMP=/tmp/wb_slow_poked.bin \
+  USE_CACHE=1 make test-kickstart-boot ADFFILE=kickstart/wb13.adf
+```
+
+The MEM_POKE env string is 3599 chars — well under the typical
+2MB ARG_MAX limit on macOS.  Verified the sim logged
+`[sim] MEM_POKE 200 word(s) at cycle 1499900000 (period=0)` and
+the dump has `ff ff ff ff ...` across rows 0-9 (800/800 bytes of
+`$FF`).
+
+Saved as `screenshots/20260604_120650_wb13_pristine_real_sim_via_mempoke.png`.
+This is the **first real sim output** with a solid white title bar.
+Visible:
+- Solid white title bar across the top
+- Red Workbench mouse cursor at lo-res (127, 43)
+- RAM Disk + Workbench1.3 disk icons + trash can glyphs upper-right
+- (No "AmigaDOS" text — MEM_POKE just fills $FF; no Intuition
+  PrintIText pass runs to add the title text after the poke)
+
+### §34a. Why this matters for the diary
+
+We now have a **deterministic visual milestone**: the
+`MEM_POKE`-patched real boot reproducibly shows the pristine
+title bar.  Future fixes to the upstream "active vs inactive"
+Intuition predicate (§32b) can be A/B-compared visually against
+this baseline.
+
+### §34b. What's still missing for a true pristine
+
+- AmigaDOS title text — would require additional MEM_POKEs (~18
+  longwords for the text bytes)
+- WB Backdrop right border (`$03 $C0` at byte 78-79 of every row)
+  — 200 more longword writes if added to MEM_POKE
+- CLI banner text — bigger gap, requires the CLI Write() → Text()
+  pipeline to actually paint glyphs (separate boot wall)
+- Workbench desktop layout — out of scope; requires more boot
+  progress past current idle point
+
+The title-bar fill is the visually dominant single fix.
+
