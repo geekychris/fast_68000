@@ -3433,3 +3433,67 @@ The remaining "CLI banner missing" gap is fundamentally a
 different code path (CLI process state vs Intuition frame
 draw), so it gets its own diary thread.
 
+
+---
+
+## §40. CLI banner glyph blits fire but get overwritten by clear pass (2026-06-04)
+
+`BLT_START_BANNER_TRACE` (§39, filtered to `bltdpt ∈ [$6438,$7158]`
+— rows 11-32 of BPL1, the CLI banner text area) caught **51 blits**
+hitting that region during a full boot.  So:
+- ❌ NOT "Text() never fires"
+- The blits fire and target the right destination
+
+Examining the blit sequence chronologically:
+
+1. **Big `LF=$0A` clear** at bltdpt=$6438, bltsize=$2EE7 (187 rows ×
+   78 bytes), early in the boot.  LF=$0A with A=$FFFF → output=0.
+   Zeros the entire CLI body region.
+2. **Multiple `LF=$6A` and `LF=$CA` glyph paints** at various
+   addresses ($6438, $645C, $6668, $66B8, $68E8, $6938, etc.) with
+   valid font glyph data in B-source.  These ARE painting glyphs.
+3. **Another big clear** `LF=$00` at bltdpt=$6438, bltsize=$2F68
+   (189 rows × 80 bytes), late in the boot.  Zeros everything
+   again.
+4. **More `LF=$9A` and `LF=$CA` paint attempts** at $6AC0, $6D3E
+   etc.  But examining the B-sources for these — `chip $119F8` is
+   mostly zeros, so D = B = 0.  These paint attempts write
+   nothing useful because the *source data* they read is empty.
+
+So the CLI banner area gets painted, then re-cleared, then a
+second-pass paint runs with the wrong/cleared font source.  Net
+result: empty banner.
+
+### §40a. Hypothesis — CLI window depth-arrange-then-deactivate
+
+This pattern suggests CLI's window goes through:
+1. Open + active → banner painted with `Release 1.3 ...` text
+2. *Something* triggers a frame-erase (deactivate?  resize?)
+3. CLI's repaint code tries to redraw but its font / text-buffer
+   pointer is now invalid → paint reads zeros and writes zeros
+
+Tracing the "what triggers step 2" is the next session.  The
+title-bar-fill fix (§38) was a clean RTL bug; the CLI banner gap
+likely lives in our OS-emulation environment (input event flow,
+window depth-arrange timing) rather than the blitter RTL.
+
+### §40b. Diary line — boundary check
+
+This section is the *boundary* between "we found the RTL bug
+and Workbench renders naturally" and "the remaining WB1.3 gaps are
+OS-level and need DOS-state inspection, not blitter analysis."
+
+The visible UI today is:
+- Solid title bar with "Workbench release. 888272" ✓
+- RAM Disk + Workbench1.3 disk icons + labels ✓
+- Trash can icons ✓
+- Mouse cursor ✓
+- Backdrop right border ✓
+- (No CLI banner — separate code path, §40 follow-up)
+
+We've gone from "title bar painted as stipple" (pre-fix Jun 4 morn)
+to "Workbench desktop with icons and labels" (post-§38 fix).  The
+diary methodology — §25 through §38, with §30-§32 ruling out
+false trails — was directly responsible for landing the fix here
+instead of months later.
+
