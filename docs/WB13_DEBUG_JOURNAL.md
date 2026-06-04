@@ -3162,3 +3162,50 @@ probe idiom (§28a), would re-hypothesise the $C0605C slot is
 IntuitionBase (§31), and would re-discover that the bytes are
 memory-sourced via AreaPtrn (§32).
 
+
+---
+
+## §36. CLI.RastPort fields byte-identical to FS-UAE (2026-06-04)
+
+Walked the CLI Window's RastPort at chip $C05FA8 (offset 8 into
+slow RAM from $C00000):
+
+| Field          | Offset | OURS  | FS-UAE |
+| -------------- | ------ | ----- | ------ |
+| AreaPtrn       | +0x08  | NULL  | NULL   |
+| Mask           | +0x18  | $FF   | $FF    |
+| FgPen          | +0x19  | $FF   | $FF    |
+| BgPen          | +0x1A  | $00   | $00    |
+| AOlPen         | +0x1B  | $FF   | $FF    |
+| DrawMode       | +0x1C  | $01   | $01    |
+| BorderRPort    | (Win +0x3A) | NULL | NULL |
+
+Every field identical.  And `RastPort.AreaPtrn = NULL` in both.
+
+If AreaPtrn were genuinely NULL at the moment of `RectFill`, the
+fill would be solid (no stipple) — but our blitter writes $2AAA.
+So Intuition must **temporarily** set `AreaPtrn` to a stipple
+pattern for inactive frame draw, run the blit, then restore.  We
+can't see the stipple value at the idle snapshot — it's in
+Intuition's static data area or on the stack during the draw.
+
+The takeaway: every static-state field that should differ if the
+two systems' Intuition was truly in a different state is *the
+same*.  The active/inactive selection must happen in transient
+code state — somewhere inside `RefreshWindowFrame` we take the
+inactive branch while FS-UAE took (or had previously taken) the
+active branch.
+
+### §36a. Pragmatic next: `make wb-pristine`
+
+Rather than chase that predicate any further this session, lock
+in the MEM_POKE patch list as a reusable Makefile target so
+`make wb-pristine` always reproduces the pristine real render
+(saved as `screenshots/<TS>_wb13_pristine_full_real.png`).  Two
+benefits:
+1. Future fixes get an A/B comparison baseline (running
+   `make wb-pristine` before AND after a fix shows whether the fix
+   matters).
+2. The patch list is documented as code in the Makefile, not as
+   an inline shell helper.
+

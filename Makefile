@@ -762,6 +762,46 @@ wb-screenshot:
 	@if command -v open >/dev/null 2>&1; then open /tmp/wb_screen.png; fi
 
 # ---------------------------------------------------------------------------
+# wb-pristine: boot K1.3 + WB1.3 with MEM_POKE patches that overwrite the
+# CLI window title bar BPL1 region ($60C8..$63E8 = 10 rows × 80 bytes) with
+# solid white + WB Backdrop right border + "AmigaDOS" text bytes from the
+# FS-UAE reference dump.  Produces the most pristine real-sim WB1.3 render.
+#
+# The MEM_POKE list (390 longwords) lands at cycle 1499900000 — late
+# enough that no Intuition repaint follows it before max_cycles (1.5B).
+#
+# Per WB13_DEBUG_JOURNAL §34-§36, this is a runtime *patch* — the upstream
+# fix (Intuition's active/inactive predicate, §32b + task #143) is still
+# open.  Use this target as the A/B comparison baseline when working on
+# that predicate.
+# ---------------------------------------------------------------------------
+.PHONY: wb-pristine
+wb-pristine:
+	@echo "Generating MEM_POKE patch list (title bar + border + AmigaDOS text)..."
+	@$(PYTHON) tools/gen_pristine_pokes.py > /tmp/wb_pristine_pokes.env
+	@echo "Pokes: $$(wc -c < /tmp/wb_pristine_pokes.env) chars"
+	@echo "Booting K1.3 + WB1.3 with MEM_POKE patches..."
+	BOOT_TRACE=0 \
+	    MEM_POKE="$$(cat /tmp/wb_pristine_pokes.env)" \
+	    MEM_POKE_CYCLE=1499900000 \
+	    CHIPRAM_DUMP=/tmp/wb_pristine_chip.bin \
+	    SLOWRAM_DUMP=/tmp/wb_pristine_slow.bin \
+	    USE_CACHE=1 \
+	    $(MAKE) --no-print-directory test-kickstart-boot \
+	    ADFFILE=kickstart/wb13.adf 2>&1 | tail -3 || true
+	@echo "Rendering pristine screen..."
+	@TS=$$(date +%Y%m%d_%H%M%S); \
+	  OUT=screenshots/$${TS}_wb13_pristine.png; \
+	  $(PYTHON) tools/render_k13_screen.py \
+	    --chipram /tmp/wb_pristine_chip.bin \
+	    --slowram /tmp/wb_pristine_slow.bin \
+	    --cop1lc 0x420 --cop2lc 0x100C8 \
+	    --width 640 --height 200 \
+	    --out $$OUT >/dev/null && \
+	  echo "Saved $$OUT" && \
+	  if command -v open >/dev/null 2>&1; then open $$OUT; fi
+
+# ---------------------------------------------------------------------------
 # kickstart-graphics: same build pipeline as test-kickstart-boot but with
 # WITH_SDL2=1 and FB_W=320 / FB_H=200 so we can see K1.3's screen live.
 # Pass --graphics and RENDER_K13_COP1LC=$$0x2368 to sim_main so the SDL
