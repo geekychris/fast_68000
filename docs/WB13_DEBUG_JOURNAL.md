@@ -2858,3 +2858,77 @@ at a mid-boot cycle.  If Intuition's next refresh sees a coherent
 writes appear in the BUS_WR trace and the rendered output will
 finally have solid title bar.
 
+
+---
+
+## §31. The $C0605C slot is a reused heap allocation, not IntuitionBase (2026-06-04)
+
+`ACTIVE_SCREEN_SLOT_TRACE` (from §30b) fired and surfaced the
+write history for `$C0605C..$C06063`:
+
+```
+[ACT_SLOT_WR] port=1 addr=00c0605c be=1111 wdata=00000000 is_long=1   # alloc
+[ACT_SLOT_WR] port=1 addr=00c06060 be=1111 wdata=00000000 is_long=1
+[ACT_SLOT_WR] port=1 addr=00c0605c be=1111 wdata=00000000 is_long=1
+[ACT_SLOT_WR] port=1 addr=00c06060 be=1111 wdata=00000000 is_long=1
+[ACT_SLOT_WR] port=1 addr=00c0605c be=1111 wdata=abababab is_long=1   # free
+[ACT_SLOT_WR] port=1 addr=00c06060 be=1111 wdata=abababab is_long=1
+[ACT_SLOT_WR] port=1 addr=00c0605c be=1111 wdata=00000000 is_long=1   # alloc
+...                                                                    # 5 more
+[ACT_SLOT_WR] port=1 addr=00c0605c be=1111 wdata=000004d8 is_long=1   # transient
+[ACT_SLOT_WR] port=1 addr=00c0605c be=1111 wdata=00c05e90 is_long=1   # CLI ptr
+[ACT_SLOT_WR] port=1 addr=00c06060 be=1111 wdata=00000000 is_long=1   # NULL
+```
+
+The alternating `$00000000` / `$ABABABAB` pattern is unmistakable —
+`exec.AllocMem`/`FreeMem` cycling with MEMF_CLEAR + the canonical
+"freed memory" debug fill (`$ABABABAB`).  So this address is **not
+a fixed Intuition global**; it's a heap block that gets allocated,
+freed, and re-allocated several times during boot, and we just
+happen to see a CLI-Window pointer in it at the snapshot point
+because that was the *current owner*.
+
+The hypothesis from §30 — that `$C0605C` is `IntuitionBase.
+ActiveWindow` — is **wrong**.  This is some short-lived struct
+(possibly an `IntuiMessage` with a Window pointer, or a Process's
+`pr_WindowPtr` after a setup call).
+
+### §31a. So where IS IntuitionBase.ActiveWindow?
+
+To find a *real* IntuitionBase global, we need a region that's
+allocated **once** at OS startup and never freed.  Those don't
+show the `$ABABABAB` free-fill churn — they get written once with
+the initial value and updated in place.
+
+Two paths forward:
+1. **Search the K1.3 ROM** for accesses to `(_IntuitionBase)+34`
+   (= ActiveWindow at offset 0x22 from LibBase per intuition.i).
+   That gives the actual instruction PC; one trap there in the
+   gdbserver and we see who reads/writes the slot.
+2. **Look at the AT-IDLE chip-RAM diff** focusing on long-lived
+   allocations only.  AllocMem returns from the "system" or
+   "permanent" memlist; FreeMem fills with `$ABABABAB`.  Anything
+   NOT followed by an `$ABABABAB` write within ~10k cycles is a
+   permanent allocation.  Filter the trace for those.
+
+### §31b. The simpler practical question
+
+Even ignoring "find IntuitionBase," the directly-observable
+behavior is: blitter writes `$2AAA` to the CLI title bar, never
+`$FFFF`.  That comes from `BLTADAT` (or BLTBDAT, depending on the
+blit logic-function bits).  Whoever wrote `$2AAA` to `$DFF074`
+(BLTADAT) right before the title-bar BLT_START is who decided to
+paint inactive.
+
+Hooking a probe to `addr[winner] == 32'h00DF_F074 && wdata = ...`
+with a small PC-history capture would surface the K1.3 ROM PC
+that issued the inactive-state fill.  That PC tells us which
+Intuition function makes the active/inactive decision.
+
+### §31c. Lesson learned
+
+`$ABABABAB` adjacent to a pointer is a tell: that's a heap
+allocation, not an OS global.  Future debugging should filter
+adjacency to the AllocMem free-fill pattern before assuming a
+slot is "the" IntuitionBase ActiveWindow.
+
