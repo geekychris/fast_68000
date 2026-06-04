@@ -3773,3 +3773,30 @@ through §45, from a "stippled title bar" symptom to the exact
 CR-handler PC issuing a refresh.  The natural Workbench desktop
 remains the deliverable.
 
+
+---
+
+## §46. Sanity-check: cpu_fuzz validates no CPU regression (2026-06-04)
+
+After §38/§45's blitter changes (USE_A=0 and USE_B=0 prev/cur
+defaults), ran the differential CPU fuzz tester against Musashi
+to confirm no CPU-side regression:
+
+```
+$ make cpu-fuzz COUNT=500 SEED=20260604 CLS=mem-dst
+[cpu_fuzz] 500 match-pass, 0 DIVERGE, 0 asm-fail/both-fail (of 500 total)
+
+$ make cpu-fuzz COUNT=500 SEED=20260604 CLS=mem-src-dst
+[cpu_fuzz] 500 match-pass, 0 DIVERGE, 0 asm-fail/both-fail (of 500 total)
+```
+
+1000 random 68k programs (memory-destination + memory-source-and-
+destination instruction classes), zero divergences against the
+Musashi reference.
+
+Expected, since the blitter fix is isolated to the chipset module
+and doesn't touch the CPU at all — but worth confirming.  Locks
+in the §38 fix as known-good against the existing regression
+infrastructure (149/149 functional tests + 1000 fuzz tests + the
+WB1.3 boot reaching natural Workbench-desktop idle).
+
