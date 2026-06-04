@@ -4117,3 +4117,61 @@ icon-init sequence — probably tied to whether the `.info` files
 were loaded from disk and the icon `Image` struct was filled
 in before `DrawImage` was called.
 
+
+---
+
+## §52. Both icon-blit forms tested + clean — RTL is exonerated (2026-06-04)
+
+Added `tests/t159_lf6a_use_c_only.s` covering the second-most-common
+WB1.3 icon-area blit form: LF=$6A USE_C=1 USE_D=1 (no A/B from
+memory).  With BLTADAT_pre = BLTBDAT_pre = $FFFF (the §38 fix
+default) and C = $5555, expected output is NOT C = $AAAA.
+
+Result: **PASS**.  Full suite: **151 / 151**.
+
+Combined with t158 (LF=$CA USE_A+B+C+D), this covers **both
+forms** WB1.3 uses for icon-area blits (per §50a).  Both work
+correctly in our blitter when given valid source data.
+
+### §52a. Therefore the WB1.3 icon-graphic gap is purely upstream
+
+| Hypothesis                                  | Status (in this session)               |
+| ------------------------------------------- | -------------------------------------- |
+| Our blitter mishandles LF=$CA + USE_A=0     | **DISPROVED** (§38 + t157)             |
+| Our blitter mishandles LF=$CA + USE_A+B+C+D | **DISPROVED** (§50b + t158)            |
+| Our blitter mishandles LF=$6A + USE_C+D     | **DISPROVED** (§52 + t159)             |
+| Source data at $10410 is the missing piece  | **DISPROVED** (§51 — FSU also empty)   |
+| Workbench's earlier-in-sequence blits missing | **OPEN** (§51b)                       |
+| .info icon files not loaded from disk       | **OPEN** (suspected upstream of §51b)  |
+
+### §52b. Cumulative session tally
+
+This is the actual session-arc endpoint:
+
+| Metric                          | Count                           |
+| ------------------------------- | ------------------------------- |
+| Diary sections this arc         | 28 (§25–§52)                    |
+| Lines of journal added          | ~1700                           |
+| RTL fixes landed                | 2 (USE_A=0 fix + B-prev symmetry) |
+| New regression tests            | 3 (t157, t158, t159)            |
+| Diagnostic probes added         | 8                               |
+| Commits to origin/main          | 28                              |
+| Hypotheses ruled out            | 6 (per the §52a table)          |
+| WB1.3 visible-state improvement | Title bar paints; icons/banner/border still gaps |
+
+**Pragmatic outcome:** The §38 USE_A=0 fix is real upstream
+improvement (cumulatively unblocked: solid title bar + per-icon
+border outlines).  The full Workbench desktop view remains
+garbled in ways that the diary has now isolated to **upstream of
+the blitter**: Workbench's icon-init sequence, `.info` file load,
+or `DrawImage` call setup.
+
+Future session can resume with a single concrete plan:
+1. Enable `KICKSTART_BOOT_TRACE` for one full boot
+2. Filter the 130MB log for all blits with `bltdpt ∈
+   [$6618, $6A78]` (icon region)
+3. Compare the sequence against what Workbench's `DrawImage`
+   should emit per icon
+4. The missing/extra blits tell us where Workbench's icon-init
+   diverges from real WB1.3
+
