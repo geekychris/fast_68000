@@ -3025,6 +3025,17 @@ module m68k_core #(
             if (is_settled && ex_kind != K_STOP)
                 $display("[PC] r=%d pc=%h kind=%d", retired, ex_pc, ex_kind);
 `endif
+`ifdef CLI_TITLE_CPU_WR_TRACE
+            // Trace any CPU memory write whose dest lands in CLI window's
+            // title bar BPL1 region ($60C8..$63E8).  Identifies which K1.3
+            // ROM routine writes the $2AAA pattern there (since the
+            // BLT_CLI_TITLE_TRACE probe in the blitter saw 0 hits).
+            if (dc_we &&
+                dc_addr >= 32'h0000_60C8 && dc_addr <= 32'h0000_63E8) begin
+                $display("[CLI_TITLE_CPU_WR] r=%d pc=%h addr=%h wdata=%h be=%b is_long=%b",
+                    retired, ex_pc, dc_addr, dc_wdata, dc_be, dc_is_long);
+            end
+`endif
 `ifdef KICKSTART_TRACKDISK_TRACE
             // Wider window trace: K1.3 trackdisk decoder PCs during the
             // validation window.  Open r=2.0M..5.0M after the snoop fix

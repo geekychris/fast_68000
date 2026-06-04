@@ -2580,3 +2580,55 @@ proven correct, the bug definitively isolated to a missed blit
 rather than struct corruption or CPU divergence) land in the
 current commit batch.
 
+
+---
+
+## §27. CPU-write probe also zero hits (2026-06-04)
+
+Added `CLI_TITLE_CPU_WR_TRACE` in `rtl/m68k_core.v` that fires
+whenever `dc_we && dc_addr ∈ [$60C8, $63E8]`.
+
+```verilog
+`ifdef CLI_TITLE_CPU_WR_TRACE
+    if (dc_we &&
+        dc_addr >= 32'h0000_60C8 && dc_addr <= 32'h0000_63E8) begin
+        $display("[CLI_TITLE_CPU_WR] r=%d pc=%h addr=%h wdata=%h be=%b is_long=%b",
+            retired, ex_pc, dc_addr, dc_wdata, dc_be, dc_is_long);
+    end
+`endif
+```
+
+Re-built and ran full 1.5B-cycle boot.  **Zero hits.**
+
+Combined with §26's BLT_CLI_TITLE_TRACE = 0:
+
+| Source     | Probe                    | Hits in $60C8..$63E8 |
+| ---------- | ------------------------ | -------------------- |
+| Blitter    | BLT_CLI_TITLE_TRACE      | 0                    |
+| CPU        | CLI_TITLE_CPU_WR_TRACE   | 0                    |
+
+The chip RAM file at boot time is `$readmemh`-loaded from a 0-pad
+program hex; nothing pre-fills `$60C8..$63E8` with `$2A AA`.  So
+*some* path writes those bytes during boot — and so far it's
+neither blitter nor CPU.
+
+Candidates left:
+1. Some unmodelled bus path (e.g. memory poke port `mem_poke_strobe`,
+   though we don't use it during normal boot)
+2. Disk DMA (trackdisk) — but it would write a whole track (~11 KB),
+   not just a 800-byte block; would need DSKPT to land at $60C8 mid-
+   read for residual bytes only
+3. The `dc_we`/`dc_addr` signals on m68k_core don't fire for the
+   *actual* CPU write path that touched this memory (likely cause)
+
+### §27a. Bus-level content-change detector (§28-experiment)
+
+Added `CLI_TITLE_MEM_CHG_TRACE` in `rtl/m68k_bus.v` that fires
+whenever `mem[$60C8/4]`, `mem[$60CC/4]`, or `mem[$60D0/4]` changes
+value from the previous cycle.  Whatever *actually* wrote those
+bytes will trigger this probe regardless of which path it took
+(CPU, blitter, DMA, slave snoops, etc.) — same probe pattern as
+the existing `[MEM-1B-CHG]` we already use elsewhere.
+
+Run in flight; result lands in §28.
+

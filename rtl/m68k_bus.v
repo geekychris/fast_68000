@@ -2324,6 +2324,44 @@ module m68k_bus #(
         end
     end
 
+`ifdef CLI_TITLE_MEM_CHG_TRACE
+    // Per-cycle change detector for the first longword of the CLI title bar
+    // (mem[$60C8/4] = mem[$1832]).  Fires whenever the longword value
+    // changes from the previous cycle and prints the winning bus master.
+    // Used in tandem with BLT_CLI_TITLE_TRACE and CLI_TITLE_CPU_WR_TRACE:
+    // if all three say "0 hits", but mem[$1832] still contains $2AAA_2AAA
+    // at boot end, then some hidden write path is responsible.
+    reg [31:0] mem_60c8_prev;
+    reg [31:0] mem_60cc_prev;
+    reg [31:0] mem_60d0_prev;
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            mem_60c8_prev <= 32'd0;
+            mem_60cc_prev <= 32'd0;
+            mem_60d0_prev <= 32'd0;
+        end else begin
+            if (mem[17'h1832] != mem_60c8_prev) begin
+                $display("[CLI_TITLE_MEM_CHG] addr=$60C8 prev=%h new=%h winner=%d we=%b w_addr=%h w_data=%h w_be=%b",
+                    mem_60c8_prev, mem[17'h1832],
+                    winner, we[winner], addr[winner], wdata[winner], be[winner]);
+            end
+            if (mem[17'h1833] != mem_60cc_prev) begin
+                $display("[CLI_TITLE_MEM_CHG] addr=$60CC prev=%h new=%h winner=%d we=%b w_addr=%h w_data=%h w_be=%b",
+                    mem_60cc_prev, mem[17'h1833],
+                    winner, we[winner], addr[winner], wdata[winner], be[winner]);
+            end
+            if (mem[17'h1834] != mem_60d0_prev) begin
+                $display("[CLI_TITLE_MEM_CHG] addr=$60D0 prev=%h new=%h winner=%d we=%b w_addr=%h w_data=%h w_be=%b",
+                    mem_60d0_prev, mem[17'h1834],
+                    winner, we[winner], addr[winner], wdata[winner], be[winner]);
+            end
+            mem_60c8_prev <= mem[17'h1832];
+            mem_60cc_prev <= mem[17'h1833];
+            mem_60d0_prev <= mem[17'h1834];
+        end
+    end
+`endif
+
     // [CosimMW]: non-CPU memory writes (blitter, copper, denise, paula)
     // and disk-DMA-bypass writes, emitted only inside the cosim window.
     // Format: `[CosimMW] <retired> <addr> <size> <value>`
