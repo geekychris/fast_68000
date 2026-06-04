@@ -2474,3 +2474,109 @@ The visible-UI gap is purely a missing blit; CPU correctness and
 struct setup are both healthy.  The fix is somewhere in Intuition's
 WB1.3 frame-draw path.
 
+
+---
+
+## §26. BLT_CLI_TITLE_TRACE — zero blits hit the title bar (2026-06-04)
+
+Added a probe in `rtl/chipset/blitter.v` that fires for any blitter
+master-write whose `mst_addr` is in `$60C8..$63E8` (CLI window's
+title bar in BPL1).  Ran a fresh `test-kickstart-boot` with
+`EXTRA_VERI_DEFS=+define+BLT_CLI_TITLE_TRACE` to find out *how*
+Intuition's frame-draw is skipping.
+
+**Result: 0 hits.**
+
+```
+$ grep -c 'BLT_CLI_TITLE' /tmp/title_trace_boot.log
+0
+```
+
+The boot ran the full 1.5B-cycle budget (retired=183M) and reached
+the usual idle state, with chip-RAM content matching the previous
+four snapshots (rows 0–9 stippled with `$2A AA`, rows 11–32 empty).
+
+So **no blit ever touched the CLI title bar region** during the
+entire boot.  The `$2A AA` pattern that's there was written by
+something else — CPU MOVE.W, or it was already in chip RAM from
+some earlier state.
+
+### §26a. The $2AAA pattern is unique to that region
+
+51 occurrences of the 4-byte sequence `$2A AA $2A AA` in our chip
+RAM — **all 51 inside `$60C8..$63E8`** (the CLI title bar).  None
+anywhere else in our chip RAM.  None anywhere in FS-UAE's chip RAM.
+
+Searched the K1.3 ROM for `$2AAA_2AAA` and `$5555_5555` immediates
+(in case the blitter shifts an Intuition-supplied `$5555` pattern):
+
+| Value             | ROM hits |
+| ----------------- | -------- |
+| `$2AAA` (16-bit)  | 1 (CMPI.L operand at $FEAD9C, unrelated) |
+| `$2AAA_2AAA`      | 0        |
+| `$5555` (16-bit)  | 21       |
+| `$5555_5555`      | 8        |
+
+Plus `$5555 >> 1 = $2AAA`, so a blitter shift of 1 on a `$5555`
+source would produce `$2AAA`.  But the blit-probe says no blit ever
+fired for this region, so a buggy blitter shift isn't the cause.
+
+### §26b. The screen body is *completely empty*
+
+Examined BPL1 rows 50, 100, 150, 180:
+
+| Row | Ours          | FS-UAE                          |
+| --- | ------------- | ------------------------------- |
+|  50 | 6 nonzero (text fragments) | 2 nonzero (`$03 $C0` at cols 78-79) |
+| 100 | 0 nonzero     | 2 nonzero (`$03 $C0` at cols 78-79) |
+| 150 | 0 nonzero     | 2 nonzero (`$03 $C0` at cols 78-79) |
+| 180 | 0 nonzero     | 2 nonzero (`$03 $C0` at cols 78-79) |
+
+`$03 $C0` at columns 78-79 ⇒ pixels at hi-res columns 630–633.
+That's a 4-pixel-wide vertical line at the right edge of every
+screen row — the **Workbench Backdrop window's right border**.
+
+FS-UAE draws this border across the *entire* screen height (rows
+0 through 199).  Ours never draws it.
+
+But our chip RAM does contain the disk icons in the upper-right
+(visible in the `wb-screenshot` render).  So Intuition's Backdrop
+window's *icon-area draw* succeeded, but its *border-draw* did not.
+
+### §26c. Two separate frame-draw misses, same Intuition path
+
+Both the CLI window's title-bar fill AND the Workbench Backdrop
+window's right-border line are missed in our boot.  Both go through
+`RefreshWindowFrame()`'s blit sequence in Intuition.
+
+So the bug is upstream of those individual blits — somewhere in the
+common path that issues them.  Candidates:
+
+- `RectFill()` (used for the title bar background)
+- `Move()` + `Draw()` (used for the 4-pixel-wide right border)
+- A shared rendering-mode flag that, when wrong, causes both routines
+  to abort or write to nowhere.
+
+The icon-rendering path uses a different Intuition entry point
+(`DrawImage()` on a `struct Image`), which apparently *does* work.
+
+### §26d. Diary line — what to do next
+
+1. Add a CPU memory-write probe filtered to `$60C8..$63E8` so we
+   can find out which K1.3 ROM PC writes the `$2A AA` pattern (and
+   thus the OS routine that did it — likely some Init step before
+   Intuition's frame-draw is supposed to overwrite).
+2. Search the K1.3 ROM for `RectFill`-like blit sequences (any
+   sequence that issues BLTSIZE with the BLTCON0 LF-bits set for
+   solid fill, e.g. `$09F0` = D=A, USE-D only) and use the
+   gdbserver to step through them at boot time.
+3. Cross-check against the FS-UAE GDB stub: where in the K1.3 ROM
+   does the title-bar fill blit issue, and what does our system do
+   at that PC instead?
+
+These are all multi-hour follow-ups; the smaller incremental gains
+from this session (sprite cursor visible, all CLI struct fields
+proven correct, the bug definitively isolated to a missed blit
+rather than struct corruption or CPU divergence) land in the
+current commit batch.
+
