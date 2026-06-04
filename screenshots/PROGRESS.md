@@ -11,6 +11,21 @@ difference.
 
 Filenames: `YYYYMMDD_HHMMSS_<label>.png`.
 
+## Current state (Jun 4 2026 PM)
+
+After landing the **blitter USE_A=0 fix** (`rtl/chipset/blitter.v`,
+`tests/t157_use_a_zero_preset.s`), `make wb-screenshot` produces
+the actual rendered Workbench 1.3 desktop with no MEM_POKE patches:
+
+![current state](20260604_125444_wb13_NATURAL_no_mempoke_post_usea_fix.png)
+
+Solid title bar, RAM Disk + Workbench1.3 icons + labels, depth
+gadget, blue backdrop.  Open question: the CLI banner text
+("Copyright 1987 ... Release 1.3 ...") is still missing —
+diagnosed in `docs/WB13_DEBUG_JOURNAL.md` §40 as an
+OS-state issue (CLI body gets cleared post-paint), not a
+blitter bug.  Workbench desktop itself is now correct.
+
 ---
 
 ## Reference target
