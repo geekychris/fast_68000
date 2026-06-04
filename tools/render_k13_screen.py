@@ -161,6 +161,17 @@ class CopperSim:
             # MOVE: target[8:1] = reg offset (0..510 step 2)
             reg = target & 0x1FE
             self.regs[reg] = data
+            # For BPLCON0, also track the max BPU seen during the frame —
+            # K1.3 sets BPLCON0=$A302 (BPU=2 HIRES) for the screen body
+            # then BPLCON0=$0302 (BPU=0) for the post-display blanking
+            # region.  The end-of-frame regs read gives us BPU=0; we want
+            # the active rendering BPU.  Stash the max.
+            if reg == 0x100:
+                prior = getattr(self, '_max_bplcon0', 0)
+                if (data >> 12) & 7 > (prior >> 12) & 7:
+                    self._max_bplcon0 = data
+                elif not hasattr(self, '_max_bplcon0'):
+                    self._max_bplcon0 = data
             self.log.append(f"  ${self.pc-4:05x}: MOVE #{data:04X} -> "
                             f"{reg_name(reg)} (${reg:03X})")
             # COPJMP2: jump to COP2LC instead.
@@ -206,9 +217,23 @@ def render(chip, cop1lc, width=320, height=200, out='k13_screen.png',
     for line in sim.log:
         print(line)
 
-    bplcon0 = sim.regs.get(0x100, 0)
+    # Prefer the max BPLCON0 BPU value seen during the Copper trace —
+    # K1.3 writes BPLCON0=$A302 (BPU=2 HIRES) for the visible portion
+    # of the frame then $0302 (BPU=0) for the blanking region.  The
+    # raw end-state has BPU=0 which underrenders.
+    end_bplcon0 = sim.regs.get(0x100, 0)
+    max_bplcon0 = getattr(sim, '_max_bplcon0', end_bplcon0)
+    end_bpu = (end_bplcon0 >> 12) & 7
+    max_bpu = (max_bplcon0 >> 12) & 7
+    if max_bpu > end_bpu:
+        bplcon0 = max_bplcon0
+        print(f"\nBPLCON0=${bplcon0:04X}  BPU={max_bpu}  "
+              f"(end-of-frame was ${end_bplcon0:04X} BPU={end_bpu}; "
+              f"using max-during-frame for render)")
+    else:
+        bplcon0 = end_bplcon0
+        print(f"\nBPLCON0=${bplcon0:04X}  BPU={end_bpu}")
     bpu = (bplcon0 >> 12) & 7
-    print(f"\nBPLCON0=${bplcon0:04X}  BPU={bpu}")
     pal = sim.palette()
     print(f"Palette: {pal[:4]}")
     for i in range(min(6, max(1, bpu))):
