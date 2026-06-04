@@ -686,7 +686,18 @@ test-kickstart-boot:
 	@echo "Running Kickstart + bootblock disk for up to $${ROMCYCLES:-1500000000} cycles..."
 	@(cd build_kick_boot && ./Vm68k_top $${ROMCYCLES:-1500000000}) > build_kick_boot/run.log 2>&1; \
 	rc=$$?; \
-	if grep -q '\[BOOTBLOCK\]' build_kick_boot/run.log; then \
+	wbench_copper_hits=$$(grep -cE '\[CPUCOP\].*pc=00fc6d6c.*wdata=000100c8' build_kick_boot/run.log 2>/dev/null); \
+	wbench_copper_hits=$${wbench_copper_hits:-0}; \
+	if [ "$$wbench_copper_hits" -gt 50 ] && \
+	   ! grep -q '\[AUTO-REQ\]' build_kick_boot/run.log && \
+	   ! grep -q '\[BAD-PC\]' build_kick_boot/run.log; then \
+	    final_retired=$$(grep -oE 'retired=[0-9]+' build_kick_boot/run.log | tail -1 | sed 's/retired=//'); \
+	    echo "PASS test-kickstart-boot (WORKBENCH REACHED: $$wbench_copper_hits Copper VBL-restart hits, retired=$$final_retired)"; \
+	    echo "  K1.3+WB1.3 boot reaches AmigaDOS CLI idle state."; \
+	    echo "  Copper at \$$FC6D6C restarts COP2LCH=\$$100C8 every VBL — Workbench list active."; \
+	    echo "  No AUTO-REQ dialog fired (\$$5E40 DOS pool intact, BLTAMOD/BLTCMOD long-write fix landed)."; \
+	    echo "  Use 'make wb-screenshot ROMFILE=... ADFFILE=...' to render the display."; \
+	elif grep -q '\[BOOTBLOCK\]' build_kick_boot/run.log; then \
 	    echo "PASS test-kickstart-boot (bootblock executed)"; \
 	    grep -E '\[OVL\]|\[DSKLEN\]|\[BOOTBLOCK\]' build_kick_boot/run.log; \
 	    tail -3 build_kick_boot/run.log; \
