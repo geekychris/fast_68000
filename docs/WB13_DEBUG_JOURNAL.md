@@ -3209,3 +3209,37 @@ benefits:
 2. The patch list is documented as code in the Makefile, not as
    an inline shell helper.
 
+
+---
+
+## §37. `make wb-pristine` smoke-test PASSED + new probe (2026-06-04)
+
+End-to-end test of the new Makefile target:
+```
+$ make wb-pristine
+... boot runs, MEM_POKE applies, render dumps ...
+Saved screenshots/20260604_122749_wb13_pristine.png
+```
+
+PNG matches the earlier manually-run pristine output byte-for-byte
+(3389 bytes both times) — confirming the target is reproducible.
+
+### §37a. BLT_START_TITLE_TRACE — find the AreaPtrn source
+
+The remaining open question (§32, task #143): WHERE in chip RAM
+does Intuition store the `$2AAA` AreaPtrn stipple pattern?  At
+idle `RastPort.AreaPtrn = NULL` (per §36), but mid-frame-draw it
+must point at the stipple data.
+
+The CLI title-bar blits' `BLTBPT` (or `BLTAPT`) at the moment of
+`BLT_START` is the answer.  Added `BLT_START_TITLE_TRACE` in
+`rtl/chipset/blitter.v` — a filtered version of `[BLT_START]` that
+only fires for blits whose `bltdpt ∈ [$60C8, $63E8]`.  Captures
+`bltcon`, `bltapt`, `bltbpt`, `bltcpt`, `bltdpt`, `bltsize`,
+modulos, A/B/C data pre-values, AFWM/ALWM.
+
+This is much smaller log volume than `KICKSTART_BOOT_TRACE=1`
+(every blit) — only the ~few-hundred blits that hit the title bar.
+
+Result lands in §38.
+

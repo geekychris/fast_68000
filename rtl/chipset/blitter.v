@@ -498,6 +498,22 @@ module blitter (
                     4'hE: begin
                         // Start a blit.  BLTSIZE write only triggers if not busy.
                         if (!blt_busy) begin
+`ifdef BLT_START_TITLE_TRACE
+                            // Filtered version of [BLT_START] that only fires
+                            // for blits whose dest pointer lands in the CLI
+                            // title bar BPL1 region ($60C8..$63E8).  Surfaces
+                            // bltapt / bltbpt / bltcpt — those tell us where
+                            // the AreaPtrn stipple pattern lives in memory
+                            // (per WB13_DEBUG_JOURNAL §32).
+                            if (bltdpt[23:0] >= 24'h00_60C8 &&
+                                bltdpt[23:0] <= 24'h00_63E8) begin
+                                $display("[BLT_START_TITLE] bltcon=%h bltapt=%h bltbpt=%h bltcpt=%h bltdpt=%h bltsize=%h bltamod=%h bltbmod=%h bltcmod=%h bltdmod=%h adat_pre=%h bdat_pre=%h cdat_pre=%h afwm=%h alwm=%h",
+                                    bltcon, bltapt, bltbpt, bltcpt, bltdpt, slv_wdata[15:0],
+                                    bltamod, bltbmod, bltcmod, bltdmod,
+                                    bltadat_pre[15:0], bltbdat_pre[15:0], bltcdat_pre[15:0],
+                                    bltafwm[15:0], bltalwm[15:0]);
+                            end
+`endif
 `ifdef KICKSTART_BOOT_TRACE
                             $display("[BLT_START] bltcon=%h bltapt=%h bltbpt=%h bltcpt=%h bltdpt=%h bltsize=%h bltamod=%h bltbmod=%h bltcmod=%h bltdmod=%h",
                                 bltcon, bltapt, bltbpt, bltcpt, bltdpt, slv_wdata[15:0],
