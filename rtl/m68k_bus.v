@@ -1951,6 +1951,19 @@ module m68k_bus #(
                         wdata[winner], is_long[winner]);
                 end
 `endif
+`ifdef CLI_TITLE_BUS_WR_TRACE
+                // Trace any bus arbiter write that lands in the CLI window's
+                // title bar BPL1 region (mem_idx $1832..$18FA = bytes $60C8..
+                // $63E8).  Fires for any winner (CPU port 0/1, blitter,
+                // DMA), so we'll definitively see who writes the $2AAA
+                // pattern.  Same probe pattern as [VEC-BUS-WR] above but
+                // for a different memory range.
+                if (mem_idx >= 'h1832 && mem_idx <= 'h18FA) begin
+                    $display("[CLI_TITLE_BUS_WR] port=%d addr=%h mem_idx=%h be=%b wdata=%h is_long=%b",
+                        winner, addr[winner], mem_idx, be[winner],
+                        wdata[winner], is_long[winner]);
+                end
+`endif
                 // [C2CC-BUS-WR] watchpoint moved to a hw_watch instance
                 // outside this always block — see u_w_c2cc below.  Same
                 // semantics (catches ALL bus writers — CPU, blitter, DMA

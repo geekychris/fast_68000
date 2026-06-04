@@ -2632,3 +2632,50 @@ the existing `[MEM-1B-CHG]` we already use elsewhere.
 
 Run in flight; result lands in §28.
 
+
+---
+
+## §28. Probe-idiom dead-end + working pattern (2026-06-04)
+
+Ran the content-change probe (`CLI_TITLE_MEM_CHG_TRACE`) — 0 hits.
+Combined with the existing always-on `[MEM-1B-CHG]` probe also
+reporting 0 hits despite chip $6C clearly being `$00FC0D14` at boot
+end (definitely changed from initial 0), it's clear the
+`if (mem[X] != prev) ... prev <= mem[X]` idiom doesn't work the
+way I expected under Verilator — the always block isn't re-reading
+the array element every cycle, even though `@(posedge clk)` should
+trigger it.
+
+The pattern that **does** work is the existing `[VEC-BUS-WR]` probe
+inside the bus arbiter's write-path always block:
+
+```verilog
+if (mem_idx == 'h1B || mem_idx == 'h0B || ...) begin
+    $display("[VEC-BUS-WR] port=%d addr=%h mem_idx=%h ...");
+end
+```
+
+This triggers on the *write event itself* (the same block that
+issues `mem[mem_idx] <= wdata[winner][...]`), not on a post-write
+comparison.  Switched to that pattern with `CLI_TITLE_BUS_WR_TRACE`
+covering `mem_idx ∈ ['h1832, 'h18FA]` (= byte addrs $60C8..$63E8).
+
+Run with this probe pattern in flight; expected to surface the
+actual winner port (CPU 0, blitter, DMA) writing the title bar
+bytes.  Result lands in §29.
+
+### §28a. The MEM-1B-CHG paradox explained
+
+The pre-existing `[MEM-1B-CHG]` probe used the value-comparison
+pattern.  It was used historically to find ExecBase ($4) corruption
+[#67 in tasks].  Re-checked: it actually watches `mem[$1B]` which
+is byte $6C, not $4 — so it watches *autovector 3*, not ExecBase.
+Autovector 3 *does* get written to $FC0D14 at boot, but the probe
+*missed it*.  Same Verilator weirdness — the value-compare pattern
+isn't reliable for array elements written via variable-index
+writes.
+
+For future probes: trigger on the write event (`mem_idx == LITERAL`
+in the same always block that writes mem[mem_idx]), not on a
+post-write read-back comparison.
+
