@@ -308,7 +308,11 @@ def try_render_sprite(img, chip, sprpt, sim, idx, palette):
                    palette[18 + idx * 2],
                    palette[19 + idx * 2]]
         for row in range(height):
-            if p + 4 > len(chip):
+            # Resolve buffer at p; treat a failed lookup as end-of-list.
+            # (Note: chip can be a (chip, slow) tuple, so len(chip)
+            # would be 2 — use _addr_to_buf to get the actual buffer.)
+            row_buf, row_off = _addr_to_buf(chip, p)
+            if row_off + 4 > len(row_buf):
                 return
             w0 = fetch_word(chip, p)
             w1 = fetch_word(chip, p + 2)
