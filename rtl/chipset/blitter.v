@@ -692,12 +692,24 @@ module blitter (
                     // had instead — producing the $2AAA inactive stipple
                     // we observed in WB1.3 boots.  See WB13_DEBUG_JOURNAL
                     // §38 + tests/t157_use_a_zero_preset.s.
+                    // For both A and B: when USE_X=0 the channel's prev and
+                    // cur words should both default to BLTxDAT_pre.  Real
+                    // Amiga / minimig semantics — the prev-word fallback
+                    // matters only when ASH/BSH > 0 (the barrel shifter
+                    // combines prev|cur into a 32-bit window before
+                    // extracting the shifted 16-bit result).  For ASH/BSH=0,
+                    // shift_x returns just cur_w, so the prev fallback is
+                    // harmless.  See WB13_DEBUG_JOURNAL §38 + t157 (A) and
+                    // t155 (B).
                     combined_w = combine(lf,
                                          shift_a(
                                             use_a ? a_prev_word   : bltadat_pre[15:0],
                                             use_a ? a_cur_word_q  : bltadat_pre[15:0],
                                             ash, desc),
-                                         shift_b(b_prev_word, use_b ? b_cur_word_q : bltbdat_pre[15:0], bsh, desc),
+                                         shift_b(
+                                            use_b ? b_prev_word   : bltbdat_pre[15:0],
+                                            use_b ? b_cur_word_q  : bltbdat_pre[15:0],
+                                            bsh, desc),
                                          use_c ? c_cur_word_q : bltcdat_pre[15:0]);
                     filled  = apply_fill(combined_w, fill_carry, ife, efe, desc);
                     final_w = filled[15:0];
