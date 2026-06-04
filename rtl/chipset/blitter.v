@@ -115,6 +115,21 @@ module blitter (
     end
 `endif
 
+`ifdef BLT_CLI_TITLE_TRACE
+    // Trace every blitter master write whose destination lands in the
+    // CLI window's title bar region in BPL1 ($60C8..$63E8 inclusive).
+    // Used to find out whether Intuition's title-bar fill blit ever
+    // issues against CLI Window @ $C05E90 in the WB1.3 boot.
+    always @(posedge clk) begin
+        if (mst_req_r && mst_we &&
+            mst_addr >= 32'h0000_60C8 && mst_addr <= 32'h0000_63E8) begin
+            $display("[BLT_CLI_TITLE] addr=%h be=%b wdata=%h state=%0d cur_word=%0d cur_row=%0d bltcon=%h bltdpt=%h",
+                mst_addr, mst_be, mst_wdata, state,
+                cur_word, cur_row, bltcon, bltdpt);
+        end
+    end
+`endif
+
     // ----- Register file -----
     reg [31:0] bltcon;
     reg [31:0] bltafwm;

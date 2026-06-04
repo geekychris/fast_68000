@@ -2316,3 +2316,161 @@ sync-strip" but rather understanding why the validator rejects
 sectors whose scan IS finding `$4489` — possibly bad header
 checksum, bad data checksum, or wrong info-bytes content.
 
+
+---
+
+## §25. Sprite renderer + CLI window struct walk (2026-06-04)
+
+### §25a. Why the Workbench cursor never appeared
+
+The mouse-pointer sprite at chip `$C80` was a valid Workbench arrow
+(62 visible pixels, palette indices 17–19, position (127, 43)).
+Standalone Python tests of `try_render_sprite()` correctly produced
+the cursor; integrating into the main render path produced *nothing*.
+
+The cause was a one-character bug. In `tools/render_k13_screen.py`:
+
+```python
+for row in range(height):
+    if p + 4 > len(chip):
+        return        # ← early return, never draws any row
+    w0 = fetch_word(chip, p)
+    w1 = fetch_word(chip, p + 2)
+```
+
+`chip` is normally a `(chip_bytes, slow_bytes)` tuple (so a render
+can resolve pointers that live in slow RAM through a single arg).
+`len((chip_bytes, slow_bytes))` is **2**, not the byte length —
+so the bounds check fires immediately for any non-trivial `p` and
+the function returns without drawing any sprite row.
+
+Fix: replace `len(chip)` with `_addr_to_buf(chip, p)`, which is the
+existing helper that picks the right buffer and offset.  Added
+`tests/test_render_sprite.py` covering both call-modes (tuple and
+plain bytes); both must report 64 red pixels.
+
+### §25b. WB-idle screenshot finally has the cursor
+
+After the fix the post-boot render shows the classic Amiga red
+arrow at lo-res (127, 43) over the WB blue backdrop, with the
+disk-icon glyphs (RAM, RAM DISK, Workbench1.3, trashcan) still in
+the upper-right area where Workbench drew them.  Saved as
+`screenshots/20260604_093923_wb13_full_screen_with_cursor.png` —
+**first appearance of the mouse cursor in any rendered output of
+this project.**
+
+### §25c. The remaining visible gap is *not* a struct gap
+
+PROGRESS.md previously hypothesised "CLI is depth-arranged behind
+WB Backdrop; if we could click its depth gadget we'd see the
+banner."  This session disproved that.
+
+Extended `tools/dump_intui_windows.py` to also walk Window structs
+whose `Title` lives in slow RAM (previously only ROM titles were
+accepted).  With that change, the scanner finds **the CLI Window
+struct at chip `$C05E90`** in our boot — Title='AmigaDOS', size
+640×200, Flags=`$00023007` (SIZE / DRAG / DEPTH / ACTIVATE /
+WINDOWACTIVE / NOCAREREFRESH).  FS-UAE's CLI Window struct is at
+the same address and the relevant fields match byte-for-byte:
+
+| Field                                  | Ours      | FS-UAE     |
+| -------------------------------------- | --------- | ---------- |
+| `Window.WScreen`                       | $C01358   | $C01358    |
+| `Window.RPort`                         | $C05FA8   | $C05FA8    |
+| `RPort.Layer`                          | $C05DF0   | $C05DF0    |
+| `RPort.BitMap`                         | $C01410   | $C01410    |
+| `BitMap.Planes[0]`                     | $60C8     | $60C8      |
+| `BitMap.Planes[1]`                     | $B0C8     | $B0C8      |
+| `Window.Border (L,T,R,B)`              | 4,11,18,2 | 4,11,18,2  |
+| `Window.Flags`                         | $00023007 | $00023007  |
+
+`BitMap.Planes[0] = $60C8` is the exact chip-RAM address our
+renderer reads as plane 0.  So the drawing **target** is correct;
+the drawing simply never happened in our boot.
+
+### §25d. Smoking gun — zero solid-white runs in chip RAM
+
+A 10-row solid-white title-bar background fill produces an 80-byte
+run of `$FF` per row.  Counted across our entire 512 KB of chip RAM:
+
+```
+Runs of 4× $FF: 22   (small font glyph interiors)
+Runs of 6× $FF: 0
+Runs of 8× $FF: 0
+Runs of 12× $FF: 0
+```
+
+FS-UAE's chip RAM has **437 runs of 8×$FF**, totalling several
+kilobytes — the CLI title bar background, the inside of each
+solid-text-glyph row, and the bottom-row icon labels.
+
+Row-by-row coverage of BPL1 in the CLI banner area (rows 11–32):
+
+```
+              row  0–9   11–32   sum of nonzero bytes in BPL1
+Ours          ✓       –       922
+FS-UAE        ✓       ✓      1908
+```
+
+We have rows 0–9 (the screen depth-gadget area, drawn as `$2A AA`
+50% stipple because Intuition's screen-init draws a depth-bar fill
+there).  We do **not** have anything in rows 11–32 — no left
+border (would be column 0–3, `$F0` bytes), no banner glyphs, no
+date line.  All zero.
+
+### §25e. Why FS-UAE has banner pixels but no CLI in the active window chain
+
+Walking `Screen.FirstWindow` in both systems:
+
+```
+OURS:   Screen $C01358.FirstWindow = $C0BBB8 (Workbench Backdrop),
+        NextWindow = NULL.
+FS-UAE: Screen $C01358.FirstWindow = $C0C0E0 (Workbench Backdrop),
+        NextWindow = NULL.
+```
+
+So **in both systems** the CLI Window is *not* in the screen's
+window chain at the idle snapshot.  Yet FS-UAE's bitplane contains
+the banner.
+
+Explanation: FS-UAE's CLI banner pixels are **leftovers** from when
+CLI was actually depth-arranged to front and active.  Intuition's
+`OpenWindow` path ran the title-bar fill blit + frame draw, the CLI
+process called `Write("Release 1.3\n…")` which painted glyphs, then
+CLI was later closed or moved out of the chain.  Removing a
+SIMPLE_REFRESH window does *not* erase its painted pixels — they
+stay in the screen bitmap until something else overwrites them.
+
+In our boot the title-bar/frame/glyph blits **never executed**, so
+when CLI was later removed there was nothing to leave behind.
+
+### §25f. Inferred next investigation
+
+The CLI Window struct is fully initialized, the WScreen pointer is
+right, the RastPort is right, the Layer is allocated, the BitMap
+points at the screen's actual bitmap planes.  All the conditions
+required for `RefreshWindowFrame()` to run successfully are present.
+But it didn't run, or it ran and returned early, or its blits issued
+to a different destination.
+
+Candidates to instrument:
+
+1. `[BLT-START]` probe filtered to `bltdpt ∈ [$60C8, $60C8+800]`
+   — would tell us whether *any* blit ever targeted the CLI title
+   bar region.  If yes, with what BLTCON0 / BLTAFWM / etc.; if no,
+   the frame-draw path branched away before the blit issued.
+2. gdbserver-attached single-step at the K1.3 ROM Intuition
+   `OpenWindow` entry (`$FDB67A`-ish — see §10b for the exec.library
+   side), follow into `RefreshWindowFrame` and see which branch we
+   take.
+3. Compare the order in which `OpenWindow` is called for CLI vs WB
+   Backdrop between ours and FS-UAE — maybe our system calls them
+   in the wrong order, leaving CLI in a covered-from-the-start
+   state where Intuition's lazy-draw optimization skips the frame
+   because "no part of the window is visible."  Layer's clip rect
+   list would reveal this.
+
+The visible-UI gap is purely a missing blit; CPU correctness and
+struct setup are both healthy.  The fix is somewhere in Intuition's
+WB1.3 frame-draw path.
+
