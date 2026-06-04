@@ -3598,3 +3598,22 @@ correctly; the CLI banner gap is one quartile of the visible
 screen, not a blocking issue.  Recording the diagnosis here so a
 future session can resume from this exact point.
 
+
+---
+
+## §43. Stack snapshot at $FE301E to find banner-clear caller (2026-06-04)
+
+Per §42c we punted the CLI-banner-clear thread but kept it as
+task #145.  Picking it up: add a *targeted* probe in
+`rtl/m68k_core.v` (`BANNER_CLEAR_PC_STACK_TRACE`) that fires when
+`ex_pc == $FE301E && retired >= 24,000,000` (the late banner-clear
+firing event we identified in §42).  Dumps D0–D7 + A0–A7.
+
+Specifically interesting: `A7` (the user-stack pointer at that
+instant) — the next-up return PC is at `mem[A7]`, and walking up
+the LINK frames identifies which routine *called* the
+graphics.library per-plane loop, which called `BltClear` /
+`RectFill` / `ScrollRaster`.
+
+Result lands in §44.
+

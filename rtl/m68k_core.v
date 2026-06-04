@@ -3063,6 +3063,22 @@ module m68k_core #(
                     retired, ex_pc, dc_wdata, dc_be);
             end
 `endif
+`ifdef BANNER_CLEAR_PC_STACK_TRACE
+            // Targeted: when the per-plane banner clear loop trigger fires
+            // (PC=\$FE301E per WB13_DEBUG_JOURNAL §42), dump all 16
+            // registers + A7 pointer.  Caller is one return-frame deep;
+            // mem[A7] is the return PC of the loop helper, mem[A7+4..] is
+            // the parent's saved PC.  Per task #145.
+            if (is_settled && ex_pc == 32'h00fe_301e && retired >= 32'd24000000) begin
+                $display("[BANNER_CLEAR_STACK] r=%d pc=%h", retired, ex_pc);
+                $display("  D0=%h D1=%h D2=%h D3=%h D4=%h D5=%h D6=%h D7=%h",
+                    u_rf.regs[0],  u_rf.regs[1],  u_rf.regs[2],  u_rf.regs[3],
+                    u_rf.regs[4],  u_rf.regs[5],  u_rf.regs[6],  u_rf.regs[7]);
+                $display("  A0=%h A1=%h A2=%h A3=%h A4=%h A5=%h A6=%h A7=%h",
+                    u_rf.regs[8],  u_rf.regs[9],  u_rf.regs[10], u_rf.regs[11],
+                    u_rf.regs[12], u_rf.regs[13], u_rf.regs[14], u_rf.regs[15]);
+            end
+`endif
 `ifdef KICKSTART_TRACKDISK_TRACE
             // Wider window trace: K1.3 trackdisk decoder PCs during the
             // validation window.  Open r=2.0M..5.0M after the snoop fix
