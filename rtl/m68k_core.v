@@ -3079,6 +3079,21 @@ module m68k_core #(
                     u_rf.regs[12], u_rf.regs[13], u_rf.regs[14], u_rf.regs[15]);
             end
 `endif
+`ifdef LATE_CLEAR_STACK_TRACE
+            // Trace the late LF=$00 full-BPL1 clear at PC=$FCB39A
+            // (per WB13_DEBUG_JOURNAL §55 — issued twice, the second
+            // erases the bottom border drawn at r=4M).  Dump regs to
+            // identify which Intuition/Workbench routine retriggers it.
+            if (is_settled && ex_pc == 32'h00fc_b39a && retired >= 32'd20000000) begin
+                $display("[LATE_CLEAR_STACK] r=%d pc=%h", retired, ex_pc);
+                $display("  D0=%h D1=%h D2=%h D3=%h D4=%h D5=%h D6=%h D7=%h",
+                    u_rf.regs[0],  u_rf.regs[1],  u_rf.regs[2],  u_rf.regs[3],
+                    u_rf.regs[4],  u_rf.regs[5],  u_rf.regs[6],  u_rf.regs[7]);
+                $display("  A0=%h A1=%h A2=%h A3=%h A4=%h A5=%h A6=%h A7=%h",
+                    u_rf.regs[8],  u_rf.regs[9],  u_rf.regs[10], u_rf.regs[11],
+                    u_rf.regs[12], u_rf.regs[13], u_rf.regs[14], u_rf.regs[15]);
+            end
+`endif
 `ifdef KICKSTART_TRACKDISK_TRACE
             // Wider window trace: K1.3 trackdisk decoder PCs during the
             // validation window.  Open r=2.0M..5.0M after the snoop fix

@@ -4498,3 +4498,89 @@ LAYERREFRESH still erases borders that don't get re-drawn.  That
 last gap is OS-driven by a deeper RTL state difference (CR-handler
 branch in CON:), not directly fixable from RTL inspection alone.
 
+
+---
+
+## §56. Late clear chain — what triggers the second-phase wipe (2026-06-04)
+
+Per `+define+LATE_CLEAR_STACK_TRACE` (new probe in `rtl/m68k_core.v`),
+the four LF=$00 full-bitplane clear events fire at:
+
+| Retired   | bltdpt    | bltsize  | Meaning                          |
+| --------- | --------- | -------- | -------------------------------- |
+| 22593930  | $9F48     | $0E28    | Inter-bitplane gap pad (BPL1)    |
+| 22599921  | $EF48     | $0E28    | Inter-bitplane gap pad (BPL2)    |
+| 24149980  | $60C8     | $3228    | **Full BPL1 wipe (200×40)**     |
+| 24170866  | $B0C8     | $3228    | **Full BPL2 wipe (200×40)**     |
+
+All four issued from the same `PC=$FCB39A` (a generic
+"clear N words" graphics.library routine).  Parent caller (stack at
+A7+$4 = $FE0EAA, just past `BSR $FE1140`).  Caller pattern at
+$FE0E8A-$FE0EAA:
+```
+LEA $10(A2), A0          ; A0 = layer bounds field
+LEA $10(A3), A1          ; A1 = cliprect bounds field
+MOVE.L (A0)+, (A1)+      ; copy bounds (2 longwords = 8 bytes)
+MOVE.L $8(A2), $8(A3)    ; copy ClipRect ptr
+MOVE.L A3, $8(A2)        ; layer.ClipRect = A3
+CLR.L -(A7)              ; push frame args
+MOVE.L A3, -(A7)         ; push ClipRect
+MOVE.L (A2), -(A7)       ; push *layer (= layer.front)
+MOVE.L A2, -(A7)         ; push layer
+BSR  $FE1140             ; call deep layer-redraw helper
+```
+
+This is a Layer-internal redraw routine — looks like a recursive
+ClipRect walker.  $FCB39A's caller chain leads through some
+RastPort-clearing primitive inside Intuition / graphics.library's
+layer-management code.
+
+### §56a. Activity timeline
+
+- **r=4M**: First-time render (title bar + body + borders + icons
+  + bottom border all drawn).
+- **r=22M**: Inter-bitplane padding clears (small, expected setup).
+- **r=24.15M**: Full BPL1 + BPL2 wipe — both bitplanes go to $0000.
+- **r=24.19M**: Title-bar fill (10 rows × 40 words at $60C8).
+- **r=24.19M**: Body backdrop fill (189 rows × 40 words at $6118).
+- **r=24.29M**: Title-bar glyph blits, ending mid-string at "fre".
+- **r=24.30M onward (159M instructions)**: NO more blits fire.
+
+The visible "Workbench release. 888272 fre" string with gadgets
+crammed beside it is the partial title-bar redraw mid-glyph.  The
+boot has gone idle waiting for an event (mouse / IDCMP /
+something) that never comes.  Bottom border, left/right border,
+icons, second half of title text — all unrendered.
+
+### §56b. Hypothesis: Workbench's IDCMP / refresh handler stalled
+
+On real Amiga the same OS code would (presumably) render the full
+screen.  Our boot completes the BPL clear + body fill + first few
+glyphs, then stops.  This looks like Workbench's redraw loop got
+to a `WaitPort(MyIDCMP)` call expecting more refresh messages, and
+none arrive.
+
+Possible upstream RTL causes:
+1. Intuition's input.device message queue not delivering
+   RefreshWindow / NewSize / similar events.
+2. CIA timer interrupts not firing at expected cadence (Workbench
+   relies on VBL + CIA timing for redraws).
+3. Some chipset register read returning a value that prematurely
+   terminates the redraw loop.
+
+### §56c. Status
+
+The §54 and §55c RTL fixes are real.  WB1.3 visible state
+incrementally improved (title-bar text extends further, icon-area
+content changes).  But the §56 gap — Workbench stalling mid-redraw
+after the second-phase wipe — is what's left between current state
+and a fully-rendered Workbench desktop.
+
+Resuming this work requires either:
+- Disassembling the K1.3 ROM at $FE1140 + $FE0EAA + caller to
+  identify the exact redraw routine and its WaitPort target signal.
+- Adding `+define+LATE_CLEAR_STACK_TRACE` (now in `rtl/m68k_core.v`)
+  one level deeper to capture the parent's parent stack frame.
+- Or accepting the current visible state as the §55c milestone and
+  treating the rest as "OS-state work" needing source-level access.
+
