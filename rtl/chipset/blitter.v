@@ -542,6 +542,20 @@ module blitter (
                                     bltafwm[15:0], bltalwm[15:0]);
                             end
 `endif
+`ifdef BLT_BORDER_TRACE
+                            // Log every blit whose D dest lands in the BPL1
+                            // region ($60C8..$B0C7 = 200 rows × 80 bytes for
+                            // a 640×200 hi-res bitmap).  Lets us identify
+                            // which blit (or which BLIT-MISS) is responsible
+                            // for the WB Backdrop left/right/bottom border
+                            // gaps observed in §54.
+                            if (bltdpt >= 32'h0000_60C8 && bltdpt < 32'h0000_B0C8)
+                                $display("[BLT_BPL1] bltcon=%h bltdpt=%h bltsize=%h bltamod=%h bltbmod=%h bltcmod=%h bltdmod=%h adat=%h bdat=%h cdat=%h afwm=%h alwm=%h",
+                                    bltcon, bltdpt, slv_wdata[15:0],
+                                    bltamod, bltbmod, bltcmod, bltdmod,
+                                    bltadat_pre[15:0], bltbdat_pre[15:0], bltcdat_pre[15:0],
+                                    bltafwm[15:0], bltalwm[15:0]);
+`endif
 `ifdef KICKSTART_BOOT_TRACE
                             $display("[BLT_START] bltcon=%h bltapt=%h bltbpt=%h bltcpt=%h bltdpt=%h bltsize=%h bltamod=%h bltbmod=%h bltcmod=%h bltdmod=%h",
                                 bltcon, bltapt, bltbpt, bltcpt, bltdpt, slv_wdata[15:0],
@@ -716,10 +730,24 @@ module blitter (
                     // shift_x returns just cur_w, so the prev fallback is
                     // harmless.  See WB13_DEBUG_JOURNAL §38 + t157 (A) and
                     // t155 (B).
+                    // Real-Amiga semantics: BLTAFWM/BLTALWM are applied to
+                    // the A-channel ALWAYS, regardless of USE_A.  When
+                    // USE_A=0 and A is sourced from BLTADAT_pre, the first
+                    // and last word masks still apply to the cur word.
+                    // Pre-fix our blitter skipped masking BLTADAT_pre,
+                    // causing Intuition's RectFill border blits (LF=$EA
+                    // USE_A=0 USE_C+D with afwm=$3FFF alwm=$FFFC) to
+                    // produce solid $FFFF instead of corner-masked output.
+                    // Diagnosed via tests/t161_blt_ea_masked.s.
                     combined_w = combine(lf,
                                          shift_a(
-                                            use_a ? a_prev_word   : bltadat_pre[15:0],
-                                            use_a ? a_cur_word_q  : bltadat_pre[15:0],
+                                            use_a ? a_prev_word
+                                                  : bltadat_pre[15:0],
+                                            use_a ? a_cur_word_q
+                                                  : apply_a_masks(
+                                                        bltadat_pre[15:0],
+                                                        cur_word == 16'd0,
+                                                        cur_word == (blt_width - 16'd1)),
                                             ash, desc),
                                          shift_b(
                                             use_b ? b_prev_word   : bltbdat_pre[15:0],
