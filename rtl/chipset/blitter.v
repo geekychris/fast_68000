@@ -800,6 +800,17 @@ module blitter (
                             mst_addr  <= d_pipe_addr;
                             mst_be    <= half_be(d_pipe_addr[1]);
                             mst_wdata <= put_half(d_pipe_data, d_pipe_addr[1]);
+`ifdef BLT_BORDER_TRACE
+                            // Trace every blitter write to BPL1 row 199 area
+                            // ($9EF8-$9F47) to see if the bottom-border blit
+                            // actually commits.  Per WB13_DEBUG_JOURNAL §55.
+                            if (d_pipe_valid && mst_ack &&
+                                d_pipe_addr >= 32'h0000_9EF8 &&
+                                d_pipe_addr <  32'h0000_9F48)
+                                $display("[BLT_WR_R199] addr=%h data=%h cur_word=%0d cur_row=%0d be=%h",
+                                    d_pipe_addr, d_pipe_data, cur_word, cur_row,
+                                    half_be(d_pipe_addr[1]));
+`endif
                             if (mst_ack) begin
 `ifdef BLT_DEBUG_FIRST_WR
                                 if (cur_row == 16'd0 && cur_word < 16'd4)
