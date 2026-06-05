@@ -4900,6 +4900,104 @@ arc, with the remaining gaps now isolated to upstream OS-state
 divergence.
 
 
+---
+
+## §58. Reusable blit-debug tooling
+
+To make the next iteration of this kind of investigation faster,
+this session also added reusable diagnostic infrastructure under
+`tools/`:
+
+### §58a. `tools/blt_trace.py` — blit-trace analyzer
+
+A CLI for parsing and querying `[BLT_BPL1]` / `[BLT_START]` /
+`[BLT_TRIGGER]` lines from a boot-trace log.  Subcommands:
+
+| Command   | Purpose                                            |
+| --------- | -------------------------------------------------- |
+| `parse`   | Dump trace as CSV or JSON                          |
+| `filter`  | Show blits matching predicates (LF, USE bits, dest range, AFWM, ALWM, ...) |
+| `touched` | Find blits whose D-write may span a chip address   |
+| `simulate`| Predict D output for a single blit (LF + masks)    |
+| `histo`   | Destination-address histogram                      |
+| `uniq`    | Unique (bltcon, afwm, alwm) tuples + counts        |
+
+Examples:
+```
+tools/blt_trace.py uniq build_kick_boot/run.log
+tools/blt_trace.py filter build_kick_boot/run.log --lf=ea --use-a=0
+tools/blt_trace.py touched build_kick_boot/run.log --addr=0x9ef8
+tools/blt_trace.py simulate \
+    --bltcon=0xea000103 --bltsize=0x0068 \
+    --afwm=0x3fff --alwm=0xfffc --c-data=0,0,0,0
+```
+
+`simulate` runs a Python reference model of the LF + AFWM/ALWM
+masking that should match our Verilog blitter post-§55c.
+Regression-tested in `tests/test_blt_trace.py` (12 tests
+covering LF=$00/$FF/$CA/$EA and AFWM/ALWM corner-masking).
+
+### §58b. `tools/chipram_diff.py` — visual chip-RAM diff
+
+Compares two chip-RAM dumps (ours vs FSU) and renders a per-bit
+colored diff PNG.  Each pixel is colored by category:
+
+| Color   | Meaning                                  |
+| ------- | ---------------------------------------- |
+| Black   | Bit matches                              |
+| Red     | Ours has it, FSU doesn't (extra render)  |
+| Green   | FSU has it, ours doesn't (missing render)|
+| Yellow  | Both have bits but they differ           |
+
+Reading the §53-§57 saga's BPL1 diff visually takes seconds
+instead of the minutes-per-row I was spending with hex dumps:
+
+```
+make wb-diff-fsu
+```
+
+The first time I ran this on the post-§55c state, it
+immediately revealed:
+- FSU's CLI banner content (green) at rows 16-49
+- Our WB Backdrop's RAM DISK + Workbench1.3 labels (red)
+- FSU's right-edge vertical border (green) at col 638-639
+- Both have the title bar with minor sub-pixel differences
+
+Same insight as §53-§57 but in one visual frame.
+
+### §58c. `make wb-trace-blits` — one-shot trace capture
+
+Convenience target that builds with `+define+BLT_BORDER_TRACE`,
+runs the WB1.3 boot, and prints the trace location:
+
+```
+$ make wb-trace-blits
+Trace saved to build_kick_boot/run.log
+    BLT_BPL1 events: 131
+    chip RAM:        /tmp/wb_chipram.bin
+    slow RAM:        /tmp/wb_slowram.bin
+```
+
+Optionally `STOP=N` to halt the sim at retired=N (see
+`STOP_AT_RETIRED` env var in `tb/sim_main.cpp` per §56):
+
+```
+make wb-trace-blits STOP=10000000   # snapshot at r=10M
+```
+
+### §58d. Net value of the new tooling
+
+What §50-§57 spent across multiple sessions doing manually with
+grep + awk + Python one-liners now collapses to a few canned
+commands.  Specifically, every "find what blits affect this
+address" or "what's the diff between our state and FSU" question
+is now a 1-liner instead of an hour of pattern-matching.
+
+The §38, §54, and §55c RTL fixes were each found through similar
+chains of manual investigation.  The next RTL bug should be much
+easier to isolate.
+
+
 
 ### §57c. Why this matters
 

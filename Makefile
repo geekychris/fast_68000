@@ -762,6 +762,50 @@ wb-screenshot:
 	@if command -v open >/dev/null 2>&1; then open /tmp/wb_screen.png; fi
 
 # ---------------------------------------------------------------------------
+# wb-trace-blits: boot WB1.3 with +define+BLT_BORDER_TRACE and save the
+# full blit trace.  Use with tools/blt_trace.py to analyse:
+#
+#     make wb-trace-blits
+#     tools/blt_trace.py uniq build_kick_boot/run.log
+#     tools/blt_trace.py touched build_kick_boot/run.log --addr=0x9ef8
+#     tools/blt_trace.py filter build_kick_boot/run.log --lf=ea --use-a=0
+#
+# STOP=N optionally stops the sim at retired=N (useful to capture state
+# before the late-clear cycle at r=24M).
+# ---------------------------------------------------------------------------
+.PHONY: wb-trace-blits
+wb-trace-blits:
+	@echo "Booting K1.3 + WB1.3 with BLT_BORDER_TRACE..."
+	BOOT_TRACE=0 \
+	    EXTRA_VERI_DEFS=+define+BLT_BORDER_TRACE \
+	    $(if $(STOP),STOP_AT_RETIRED=$(STOP),) \
+	    CHIPRAM_DUMP=/tmp/wb_chipram.bin \
+	    SLOWRAM_DUMP=/tmp/wb_slowram.bin \
+	    $(MAKE) --no-print-directory test-kickstart-boot \
+	    ADFFILE=kickstart/wb13.adf 2>&1 | tail -3 || true
+	@echo "Trace saved to build_kick_boot/run.log"
+	@echo "    BLT_BPL1 events: $$(grep -c BLT_BPL1 build_kick_boot/run.log)"
+	@echo "    chip RAM:        /tmp/wb_chipram.bin"
+	@echo "    slow RAM:        /tmp/wb_slowram.bin"
+
+# ---------------------------------------------------------------------------
+# wb-diff-fsu: render a per-bit colored diff between our last chip-RAM dump
+# and the FS-UAE reference snapshot (test_data/fsuae_wb13_idle_chip.bin).
+# Green=FSU-only, Red=ours-only, Yellow=mixed.  PNG saved + opened.
+# ---------------------------------------------------------------------------
+.PHONY: wb-diff-fsu
+wb-diff-fsu:
+	@if [ ! -f /tmp/wb_chipram.bin ]; then \
+	    echo "ERROR: /tmp/wb_chipram.bin missing — run 'make wb-screenshot' first"; \
+	    exit 1; \
+	fi
+	$(PYTHON) tools/chipram_diff.py /tmp/wb_chipram.bin \
+	    test_data/fsuae_wb13_idle_chip.bin \
+	    --start 0x60c8 --end 0x9f48 \
+	    --out /tmp/chipram_diff.png
+	@if command -v open >/dev/null 2>&1; then open /tmp/chipram_diff.png; fi
+
+# ---------------------------------------------------------------------------
 # wb-pristine: boot K1.3 + WB1.3 with MEM_POKE patches that overwrite the
 # CLI window title bar BPL1 region ($60C8..$63E8 = 10 rows × 80 bytes) with
 # solid white + WB Backdrop right border + "AmigaDOS" text bytes from the
