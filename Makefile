@@ -765,10 +765,11 @@ wb-screenshot:
 	    SLOWRAM_DUMP=/tmp/wb_slowram.bin \
 	    $(MAKE) --no-print-directory test-kickstart-boot \
 	    ADFFILE=kickstart/wb13.adf 2>&1 | tail -8 || true
-	@echo "Rendering Workbench screen..."
+	@echo "Rendering Workbench screen at 1280x400 (matches FS-UAE reference)..."
 	$(PYTHON) tools/render_k13_screen.py \
 	    --chipram /tmp/wb_chipram.bin \
 	    --slowram /tmp/wb_slowram.bin \
+	    --width 640 --height 200 \
 	    --out /tmp/wb_screen.png
 	@echo "Saved /tmp/wb_screen.png"
 	@if command -v open >/dev/null 2>&1; then open /tmp/wb_screen.png; fi
