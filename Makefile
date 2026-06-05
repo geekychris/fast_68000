@@ -1156,6 +1156,20 @@ demo-blt:
 	@echo "Launching blitter line demo. Press ESC or close the window to quit."
 	@(cd build_demo && ./Vm68k_top 200000000 --graphics)
 
+# Boing — homage to the 1984 Amiga "Boing!" demo: single 16x16
+# red/white checkered sprite ball bouncing over a blue field with a
+# horizontal grid floor.  Runs HEADLESSLY (no SDL2 needed); dumps
+# chip RAM at end and renders to PNG.
+demo-boing:
+	@mkdir -p build_boing
+	@$(MAKE) --no-print-directory build BUILD=build_boing N_CORES=1 USE_CACHE=1 MEM_WORDS=131072 >/dev/null
+	$(PYTHON) $(TB_DIR)/asm68k.py $(DEMO_DIR)/boing_demo.s build_boing/program.hex
+	@echo "Running boing demo..."
+	@(cd build_boing && CHIPRAM_DUMP=/tmp/boing_chip.bin ./Vm68k_top 50000000) 2>&1 | tail -3
+	@echo "Rendering ball + floor..."
+	$(PYTHON) tools/render_boing.py --chipram /tmp/boing_chip.bin --out /tmp/boing.png
+	@if command -v open >/dev/null 2>&1; then open /tmp/boing.png; fi
+
 demo: demo-os
 
 clean:
