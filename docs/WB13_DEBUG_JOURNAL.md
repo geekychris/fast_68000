@@ -4750,6 +4750,70 @@ border is missing because the BLTAPT pointer fed to the
 border-fill blit is wrong, and the wrongness traces back to a
 memory inconsistency we don't currently understand.
 
+### §57h. Update: the "garbage" $0280000A is a ROM TABLE entry
+
+Searched all of chip RAM, slow RAM, and the K1.3 ROM for the value
+`$0280000A`.  Found in exactly ONE location — the K1.3 ROM at
+**`$FC8E82`**.  Context:
+
+```
+$FC8E70: $000A $0258      ; entries: $000A xxxx
+$FC8E74: $000A $0262
+$FC8E78: $000A $026C
+$FC8E7C: $000A $0276
+$FC8E80: $000A $0280      <-- 4-byte longword $0280_000A read here
+$FC8E84: $000A $028A      ;     (if read straddling $FC8E82)
+$FC8E88: $000A $0294
+```
+
+The values $0258/$0262/$026C/$0276/$0280 increment by `$0A = 10`,
+and $0280 = decimal 640 = hi-res screen width.  This is **a K1.3
+ROM coordinate / blit-parameter table** — not garbage at all.
+
+So the CPU reads `$0280000A` from `*(A1+$10)` with A1 pointing
+into this ROM table, and writes that intentional value to BLTAPT.
+The subsequent low-half override of `$FF39` gives the final
+BLTAPT = `$0280FF38`.
+
+### §57i. The actual question is "where does the left border get drawn"
+
+If `$0280000A` is **intentional** K1.3 setup data, then the
+EA00010B blit at $FC5DF2 is NOT the left-border draw.  Real
+Amiga's chip RAM at the 21-bit truncated address `$0FF38` is also
+all zeros (verified against FSU's reference dump) — so even with
+proper address truncation, this blit's A source is empty and
+LF=$EA with A=0/B=$FFFF gives D=C (no change to destination).
+
+The actual left-border blit is something else — possibly:
+1. A line-mode blit drawing a vertical 2-pixel-wide line down the
+   left edge (analogous to how the bottom border probably draws
+   via copy fill).
+2. A different copy-mode blit later in the boot that I haven't
+   yet identified in the trace.
+3. The pixels at byte 0 are part of a wider blit that I'm
+   misinterpreting.
+
+The §57 chain led to a real finding but mis-identified the
+LEFT-BORDER mechanism.  The actual mechanism remains open.
+
+### §57j. The diagnostic infrastructure is valuable
+
+Even though the §57 chain didn't land an RTL fix this session, it
+built reusable instrumentation:
+
+- `BLT_BORDER_TRACE` — full BPL1-area blit logging with A/B/C/D
+  pointers
+- `BLT_TRIGGER_PC_TRACE` — CPU PC at every BLTSIZE trigger
+- `LATE_CLEAR_STACK_TRACE` — register dump at the late clear PC
+- `BLT_PTR_WR_TRACE` — CPU writes to BLTAPT
+- `SLOW_C07138_WR_TRACE` — slow-RAM struct-field writes
+- `STOP_AT_RETIRED` — mid-boot chip-RAM snapshots
+
+Future work can use these to systematically scan every BPL1-write
+blit in r=4M-25M and pinpoint which one(s) write to byte 0 of each
+row.  That's a concrete next step, just one we ran out of time
+for.
+
 
 
 ### §57c. Why this matters
