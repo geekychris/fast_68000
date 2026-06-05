@@ -4395,3 +4395,106 @@ bug was hiding behind the §53 "OS-side" framing.
 There are likely more such bugs.  Each visible pixel-level divergence
 between our boot and FS-UAE/real-Amiga is a candidate.
 
+
+---
+
+## §55. Border-blit trace + second RTL bug — BLTAFWM/BLTALWM not applied to BLTADAT_pre (2026-06-04)
+
+Following the user's framing in §54 ("OS works on real hardware →
+divergence is RTL"), instrumented every blit hitting BPL1 ($60C8 -
+$B0C7) via `+define+BLT_BORDER_TRACE` to identify what produces the
+WB Backdrop's bottom border at row 199 ($9EF8) and why it ends up
+empty in our boot.
+
+### §55a. The intended bottom-border blit fires correctly
+
+Log line 32391 (early in boot):
+
+```
+[BLT_BPL1] bltcon=ea000103 bltdpt=00009ef8 bltsize=0068
+  bltamod=fffffe72 bltbmod=0 bltcmod=0050 bltdmod=0
+  adat=ffff bdat=ffff cdat=5555 afwm=3fff alwm=fffc
+```
+
+Decoded: 1 row × 40 words at $9EF8 = full bottom row of BPL1.
+LF=$EA + A=BLTADAT_pre=$FFFF + B=BLTBDAT_pre=$FFFF + USE_C/D → solid
+$FFFF, with BLTAFWM=$3FFF masking corners of first word and
+BLTALWM=$FFFC masking corners of last word.
+
+### §55b. Pre-mask-fix output (matches WB chip-RAM)
+
+Per `tests/t161_blt_ea_masked.s` (replicates the blit in isolation),
+pre-fix our blitter wrote `$FFFF, $FFFF*38, $FFFF` instead of the
+expected `$3FFF, $FFFF*38, $FFFC` — the masks weren't applied because
+the USE_A=0 arm of `combine()` skipped `apply_a_masks()`.
+
+But chip-RAM row 199 ended up **zero**, not solid $FFFF.  So the
+mask bug alone wasn't enough — something else was clearing the row.
+
+### §55c. Second RTL fix: route BLTADAT_pre through apply_a_masks
+
+Patched `rtl/chipset/blitter.v` to apply BLTAFWM/BLTALWM to
+BLTADAT_pre when USE_A=0:
+
+```verilog
+combined_w = combine(lf,
+                     shift_a(
+                        use_a ? a_prev_word : bltadat_pre[15:0],
+                        use_a ? a_cur_word_q
+                              : apply_a_masks(
+                                    bltadat_pre[15:0],
+                                    cur_word == 16'd0,
+                                    cur_word == (blt_width - 16'd1)),
+                        ash, desc),
+                     ...);
+```
+
+Test suite: 153/153 (t161 lands as regression).  Visible effect on
+WB1.3 boot: **title-bar text now renders further** ("Workbench
+release. 888272 fre..." vs prior "888272 [end]") and icon-area
+graphics on the Workbench1.3 row change shape.
+
+### §55d. The late LF=$00 clear at line 211116
+
+Per-write trace via `[BLT_WR_R199]`: the bottom-border fill writes
+`data=$3FFF/...$FFFC` at log line 32430 (cur_row=0).  Then **much
+later** at log line 211116, a `bltcon=$0A000103 bltsize=$3228`
+(200 rows × 40 words = full BPL1) erases everything, including
+row 199.
+
+After that erase, the title bar gets redrawn (lines 221515-221928)
+but the **bottom border, left border, and right border are NOT
+re-drawn**.  Final chip-RAM row 199 = $0000 in our boot.
+
+### §55e. Same root cause as §40-§45 (CLI banner gap)
+
+The late LF=$00 clear at line 211116 is the same class of
+LAYERREFRESH-triggered refill-cycle described in §40-§45.  The
+journal's earlier conclusion ("OS-side state mismatch") was wrong
+in the same way §53's "OS-side icon gap" was wrong — both are
+upstream-of-blitter, but the upstream cause is RTL behavior
+difference that drives the OS to take a different branch.
+
+The triggering CPU PC chain in §45 ended at
+`CMPI.B #$0D, $0008(A0)` at `$FE495A`.  The value at A0+$8 must
+differ between our sim and real Amiga, taking the CR path on ours
+and skipping it on real.  Finding what populates A0+$8 (= some
+console.device input field) and why it has $0D on ours requires
+deep OS-state tracing — out of scope for this session's RTL focus.
+
+### §55f. Session arc
+
+Two real RTL fixes landed this session, both regression-tested:
+
+| Fix                                                     | Test             |
+| ------------------------------------------------------- | ---------------- |
+| §54: blitter line-mode SUD/SUL/AUL bit mapping in m68k_bus.v | t160_line_vertical.s |
+| §55c: BLTAFWM/BLTALWM applied to BLTADAT_pre when USE_A=0 | t161_blt_ea_masked.s |
+
+Test suite progressed 151 → 152 → 153 all passing.  WB1.3 visible
+state has incrementally improved (title-bar text reach + icon-area
+shape changes), but the full-Backdrop redraw cycle on
+LAYERREFRESH still erases borders that don't get re-drawn.  That
+last gap is OS-driven by a deeper RTL state difference (CR-handler
+branch in CON:), not directly fixable from RTL inspection alone.
+
