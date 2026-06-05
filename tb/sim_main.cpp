@@ -709,7 +709,25 @@ static int run_regression(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
         gdb.wait_for_client_if_enabled();
     }
 
+    // STOP_AT_RETIRED: optional env var to halt the regression sim early
+    // at a specific retired-instruction count.  Used in
+    // WB13_DEBUG_JOURNAL §56 to snapshot chip RAM after the first WB
+    // render (r=4M) but before the second-phase wipe (r=24M).
+    uint32_t stop_at_retired = 0;
+    if (const char* s = std::getenv("STOP_AT_RETIRED")) {
+        stop_at_retired = (uint32_t)std::strtoul(s, nullptr, 0);
+    }
+
     while (cycle < max_cycles && !all_halted()) {
+        if (stop_at_retired) {
+            const uint32_t* r_arr =
+                reinterpret_cast<const uint32_t*>(&top->retired_flat);
+            if (r_arr[0] >= stop_at_retired) {
+                printf("[sim] STOP_AT_RETIRED=%u reached (cycle=%llu)\n",
+                       stop_at_retired, (unsigned long long)cycle);
+                break;
+            }
+        }
         // gdbserver tick.  If a debugger is attached and we're halted,
         // spin here draining packets until it sends `c` or `s`.
         if (gdb.enabled()) {
