@@ -4814,6 +4814,91 @@ blit in r=4M-25M and pinpoint which one(s) write to byte 0 of each
 row.  That's a concrete next step, just one we ran out of time
 for.
 
+### §57k. The "left border" is actually rendered content, not a uniform border
+
+Row-by-row comparison of byte 0 (left edge) of BPL1 across all 200
+rows reveals:
+
+```
+Row | OURS  | FSU
+ 10 | $00   | $C0
+ 11 | $00   | $C3
+ 12 | $00   | $C6
+ 13 | $00   | $CC
+ 14 | $00   | $CC
+ 15 | $00   | $CC
+ 16 | $00   | $C6
+ 17 | $00   | $C3
+ 18 | $00   | $C0
+ 19 | $00   | $C1
+ ...
+```
+
+FSU's bits 7-6 of byte 0 are CONSISTENTLY set (`$C0` base), but
+bits 5-0 vary row-to-row.  That's a **2-pixel-wide vertical line
+at cols 0-1** ($C0 prefix), with additional rendered content
+overlaid in cols 2-7 (the low nibble values $0, $3, $6, $C, $C,
+$C, $6, $3, $0...).
+
+So the left edge has TWO things:
+1. A 2-pixel vertical line at cols 0-1 (a real left border).
+2. Text/graphics content rendered in cols 2-7 of various rows.
+
+Our boot has NEITHER.
+
+### §57l. The right border IS a uniform 2-pixel line — and no blit
+draws it in our boot
+
+Row-by-row comparison of byte 79 of BPL1 shows FSU has a
+CONSISTENT `$03` across all rows 10-194 — the pure 2-pixel-wide
+right-edge vertical border.
+
+To draw `$03` at byte 79 of each row, a blit would need:
+- Destination word = word 39 of each row (last word, byte 78-79)
+- `ALWM = $0003` (only affects bits 1-0 of last word)
+- A logic function that sets those bits
+
+Our entire boot trace (r=0 to r=25M, all BPL1-targeting blits)
+has these ALWM values:
+```
+$8000  $E000  $F000  $F800  $FF00  $FFE0  $FFF0  $FFFC  $FFFE  $FFFF
+```
+
+**None of them are `$0003`.**  All are LEFT-aligned masks (high
+bits set).  So no blit in our K1.3 boot has the right-side
+2-pixel mask required to draw the right border.
+
+Yet FSU running the SAME K1.3 ROM produces the right border.
+This means FSU runs ADDITIONAL blits not present in our trace.
+
+### §57m. Final conclusion for this session
+
+The §54 + §55c RTL fixes stand as real improvements.  The remaining
+visible gaps (left/right borders, late wipe cycle) trace to OS
+code paths that don't execute on our boot — paths that on FSU /
+real Amiga issue additional blits we don't see.  Identifying the
+exact upstream cause requires:
+1. Comparing FSU's full blit trace to ours (requires FSU
+   instrumentation).
+2. PC-trace of every CPU exec-stage instruction between r=4M and
+   r=25M, focused on Workbench / Intuition entry points to find
+   where the branches diverge.
+
+Both are substantial multi-session efforts.  This is the genuine
+end of what RTL-only investigation can isolate.
+
+The visible-state improvement this session is real:
+- Pre-session: title bar painted as inactive stipple
+- Post-§38 USE_A=0 fix (earlier): WB1.3 desktop renders title bar,
+  icons, labels
+- Post-§54 (this session): line-mode blits route correctly
+- Post-§55c (this session): RectFill blits with masks produce
+  correct corner-masked output, title-bar text renders further
+
+Three real RTL fixes total over the WB1.3 visual investigation
+arc, with the remaining gaps now isolated to upstream OS-state
+divergence.
+
 
 
 ### §57c. Why this matters
