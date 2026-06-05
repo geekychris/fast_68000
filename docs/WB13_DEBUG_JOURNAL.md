@@ -4584,3 +4584,77 @@ Resuming this work requires either:
 - Or accepting the current visible state as the §55c milestone and
   treating the rest as "OS-state work" needing source-level access.
 
+
+---
+
+## §57. Left/right border source pointer = garbage (2026-06-04)
+
+Extended `BLT_BORDER_TRACE` to log BLTAPT/BLTBPT/BLTCPT/BLTDPT at
+trigger time.  The WB-Backdrop left-border blit:
+
+```
+bltcon=$ea00010b bltapt=$0280ff38 bltbpt=$00010850
+bltcpt=$000060c8 bltdpt=$000060c8 bltsize=$3202
+adat=$8000 bdat=$ffff afwm=$ffff alwm=$ffff
+```
+
+Decoded: LF=$EA + USE_A=1 + USE_B=0 + USE_C=1 + USE_D=1, 200 rows
+× 2 words, dest at BPL1 start.  The intended behavior: read A from
+BLTAPT-pointed memory, B from BLTBDAT preset ($FFFF), combine with
+LF=$EA, write to BLTDPT.
+
+### §57a. BLTAPT points to garbage
+
+**BLTAPT = $0280FF38** is outside chip RAM ($0-$80000), outside
+slow RAM ($C00000-$C7FFFF), outside any mapped region.  Even with
+21-bit M68000 address truncation ($0280FF38 → $80FF38), the
+effective address is in the A500 unmapped region $80000-$BFFFFF.
+
+Tested truncation hypotheses by checking chip RAM at $FF38 (21-bit
+truncate hypothesis) and $7F38 (19-bit hypothesis): both contain
+all-zero data.  So the A-source memory is empty whatever masking
+we apply.
+
+With A=$0000 (empty source) + B=$FFFF + LF=$EA:
+- D = (A AND B) OR (NOT A AND (B OR C with bits 1/3 of LF))
+- For A=0, B=1: bit 3 of LF=$EA → output = 1 when C=1, 0 when C=0
+- So D = C (the existing destination unchanged)
+
+So our blit copies the destination to itself — no border drawn.
+On real Amiga, BLTAPT presumably points to a chip-RAM struct that
+contains $8000 in word 0 (the left-pixel-on pattern); A=$8000 each
+iter gives D bit 15 = 1 → left border drawn.
+
+### §57b. Upstream: who computes BLTAPT?
+
+The CPU writes BLTAPT to $DFF050/$DFF052 just before BLTSIZE.  The
+high half $0280 looks like it could be a small index/count value
+mistakenly being treated as the high half of a 32-bit pointer.
+Possible upstream causes:
+1. OS reads a Workbench/Intuition struct field expecting a
+   pointer; field contains wrong data due to earlier struct
+   corruption.
+2. CPU code emits MOVE.W of a data value into BLTAPTH thinking
+   it's a different register.
+3. Some chipset register read returns wrong value and the OS uses
+   it as a base address.
+
+Finding the upstream cause requires PC-trace of the CPU
+instructions that write $DFF050/$DFF052 just before the blit
+trigger.  That's a deep CPU-state investigation — recorded as the
+next concrete step, not landed in this session.
+
+### §57c. Why this matters
+
+The left and right border columns being missing accounts for the
+visible "Backdrop has no edge frame" rendering in the current
+post-fix screenshot.  Per §57a, the **blitter is doing the right
+thing given its inputs** — the inputs (BLTAPT) are wrong upstream.
+
+This isolates the remaining visible-state gap to:
+- a CPU-side or OS-side BLTAPT-computation bug (this §57)
+- the late LF=$00 wipe cycle (§55-§56)
+
+Both are upstream of the blitter; the §54 + §55c RTL fixes still
+stand as real RTL improvements.
+

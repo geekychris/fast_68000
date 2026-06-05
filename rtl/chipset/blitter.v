@@ -548,10 +548,11 @@ module blitter (
                             // a 640×200 hi-res bitmap).  Lets us identify
                             // which blit (or which BLIT-MISS) is responsible
                             // for the WB Backdrop left/right/bottom border
-                            // gaps observed in §54.
+                            // gaps observed in §54.  Now includes A/B/C
+                            // pointers for source-data investigation (§57).
                             if (bltdpt >= 32'h0000_60C8 && bltdpt < 32'h0000_B0C8)
-                                $display("[BLT_BPL1] bltcon=%h bltdpt=%h bltsize=%h bltamod=%h bltbmod=%h bltcmod=%h bltdmod=%h adat=%h bdat=%h cdat=%h afwm=%h alwm=%h",
-                                    bltcon, bltdpt, slv_wdata[15:0],
+                                $display("[BLT_BPL1] bltcon=%h bltapt=%h bltbpt=%h bltcpt=%h bltdpt=%h bltsize=%h bltamod=%h bltbmod=%h bltcmod=%h bltdmod=%h adat=%h bdat=%h cdat=%h afwm=%h alwm=%h",
+                                    bltcon, bltapt, bltbpt, bltcpt, bltdpt, slv_wdata[15:0],
                                     bltamod, bltbmod, bltcmod, bltdmod,
                                     bltadat_pre[15:0], bltbdat_pre[15:0], bltcdat_pre[15:0],
                                     bltafwm[15:0], bltalwm[15:0]);
