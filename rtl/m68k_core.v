@@ -3094,6 +3094,16 @@ module m68k_core #(
                     u_rf.regs[12], u_rf.regs[13], u_rf.regs[14], u_rf.regs[15]);
             end
 `endif
+`ifdef BLT_PTR_WR_TRACE
+            // Trace every CPU write to BLTAPT ($DFF050/$DFF052) so we
+            // can find the routine computing $0280FF38 (the bad
+            // pointer for the WB Backdrop left-border blit per §57).
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h00DF_F050 && dc_addr <= 32'h00DF_F053)
+                $display("[BLTAPT-WR] r=%d pc=%h addr=%h wdata=%h be=%b D0=%h A0=%h A1=%h",
+                    retired, ex_pc, dc_addr, dc_wdata, dc_be,
+                    u_rf.regs[0], u_rf.regs[8], u_rf.regs[9]);
+`endif
 `ifdef KICKSTART_TRACKDISK_TRACE
             // Wider window trace: K1.3 trackdisk decoder PCs during the
             // validation window.  Open r=2.0M..5.0M after the snoop fix

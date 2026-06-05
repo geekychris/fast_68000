@@ -4644,6 +4644,69 @@ instructions that write $DFF050/$DFF052 just before the blit
 trigger.  That's a deep CPU-state investigation — recorded as the
 next concrete step, not landed in this session.
 
+### §57d. PC chain that loads the bad BLTAPT
+
+Added `+define+BLT_PTR_WR_TRACE` to `rtl/m68k_core.v` — logs every
+CPU write to $DFF050-$DFF053.  Two writers fire repeatedly:
+
+```
+[BLTAPT-WR] r=4131043 pc=00fc5df2 addr=00dff050 wdata=0280000a be=1111
+[BLTAPT-WR] r=4134598 pc=00fc576a addr=00dff052 wdata=0000ff39 be=0011
+```
+
+Decoding the K1.3 ROM at those PCs:
+
+```
+$FC5DF2:  2169 0010 0050   MOVE.L $10(A1), $50(A0)   ; A0=$DFF000
+                                                     ; → BLTAPT = *(A1+$10)
+$FC576A:  314B 0052        MOVE.W A3, $52(A0)        ; → BLTAPTL = A3
+```
+
+So a single 32-bit pointer is loaded from `*(A1+$10)` into BLTAPT
+at $FC5DF2, then later $FC576A's low-half write of `A3=$FF39`
+overwrites the low 16 bits, producing the final `$0280FF38` seen
+in the blit trace.
+
+A1 = $C07128 at the trigger; the loaded pointer comes from slow
+RAM `$C07138 = $0280000A` at r=4M.
+
+### §57e. $C07138 is uninitialized struct memory
+
+Snapshot of slow RAM at r=10M shows `$C07138 = $00002EC0` — a
+proper chip-RAM pointer.  So the value at `$C07138` changes
+between r=4M and r=10M.  The r=4M write of `$0280000A` to BLTAPT
+must use the **uninitialized state** of `$C07138` before some
+initialization routine populates it correctly.
+
+`$C07128` is in the slow-RAM struct allocation area used by
+graphics.library / intuition.library.  `+$10` could be:
+- BitMap.Planes[2] (3rd bitplane pointer in a 1-2 plane bitmap;
+  WB Backdrop uses only Planes[0] and Planes[1])
+- RastPort or Layer struct field at that offset
+- Some union/private field
+
+The pattern matches §40-§45's "uninitialized field used as
+pointer" class of bug.  Real Amiga likely zero-initializes this
+struct field via `AllocMem(MEMF_CLEAR)` or explicit clearing;
+our boot may skip the clear, or the AllocMem in our exec is not
+honoring MEMF_CLEAR.
+
+### §57f. Next concrete step
+
+Trace what writes to `$C07138` during the boot.  If the field gets
+populated (by initialization code) only AFTER the first border
+blit triggers, the blit reads garbage.  If we can identify the
+initializing PC, we can determine whether it's:
+- Workbench-side code that should run earlier (OS state)
+- AllocMem-related (exec memory clearing failure — would be RTL)
+- Some other init dependency
+
+A `+define+SLOW_RAM_C07138_WR_TRACE` probe added to
+`rtl/m68k_bus.v` (similar to existing watchpoint patterns) would
+fire on every write to `$C07138` with the PC + value.
+
+
+
 ### §57c. Why this matters
 
 The left and right border columns being missing accounts for the
