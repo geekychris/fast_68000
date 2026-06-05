@@ -1170,6 +1170,46 @@ demo-boing:
 	$(PYTHON) tools/render_boing.py --chipram /tmp/boing_chip.bin --out /tmp/boing.png
 	@if command -v open >/dev/null 2>&1; then open /tmp/boing.png; fi
 
+# ---------------------------------------------------------------------------
+# real-boing-disk: assemble a bootable ADF from kickstart/wb13.adf + the
+# REAL 1986 boing! executable.  Requires:
+#   - amitools installed (pip install amitools)
+#   - BOING_SRC= path to the boing! binary (default: ~/Downloads/...)
+#
+# After running, boot with:
+#   make test-kickstart-boot ADFFILE=kickstart/boing_disk.adf
+# Or build + render with `make demo-real-boing`.
+#
+# Current status: boot reaches ">>> Launching Boing... <<<" text but
+# boing's Intuition screen never renders — likely blocked by the
+# upstream OS-state issue tracked as task #150.
+# ---------------------------------------------------------------------------
+BOING_SRC ?= /Users/chris/Downloads/workbench_demos/animations/boing!
+
+real-boing-disk: kickstart/boing_disk.adf
+kickstart/boing_disk.adf: $(BOING_SRC) kickstart/wb13.adf
+	@if ! command -v xdftool >/dev/null 2>&1; then \
+	    echo "amitools not installed — run: pip install amitools"; exit 1; \
+	fi
+	@cp kickstart/wb13.adf $@
+	@printf 'c:SetPatch >NIL:\ncd c:\necho "*N*N>>> Launching Boing... <<<*N"\nboing\necho "*N>>> Boing exited <<<"\nendcli >NIL:\n' > /tmp/boing_startup.txt
+	@xdftool $@ delete S/Startup-Sequence 2>&1 | tail -1
+	@xdftool $@ write /tmp/boing_startup.txt S/Startup-Sequence 2>&1 | tail -1
+	@xdftool $@ write "$(BOING_SRC)" 'C/boing' 2>&1 | tail -1
+	@echo "Built $@"
+	@ls -la $@
+
+# demo-real-boing: boot the boing-disk ADF, render the final frame.
+demo-real-boing: kickstart/boing_disk.adf
+	@rm -rf build_kick_boot
+	BOOT_TRACE=0 CHIPRAM_DUMP=/tmp/boing_disk_chip.bin SLOWRAM_DUMP=/tmp/boing_disk_slow.bin \
+	    $(MAKE) --no-print-directory test-kickstart-boot \
+	    ADFFILE=kickstart/boing_disk.adf 2>&1 | tail -5 || true
+	$(PYTHON) tools/render_k13_screen.py \
+	    --chipram /tmp/boing_disk_chip.bin --slowram /tmp/boing_disk_slow.bin \
+	    --width 640 --height 200 --out /tmp/boing_disk.png
+	@if command -v open >/dev/null 2>&1; then open /tmp/boing_disk.png; fi
+
 demo: demo-os
 
 clean:
