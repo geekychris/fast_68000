@@ -287,3 +287,52 @@ summary:
 
 WB1.3 desktop is **substantively correct** with no further blitter
 work needed.  Remaining gaps are CLI/Intuition-side.
+
+### 2026-06-04 PM (later) — peak render at r=23M is essentially complete
+
+![](20260604_194343_wb13_r23M_peak_render.png)
+
+`STOP_AT_RETIRED=23000000` snapshots chip RAM at the peak-render
+moment — after CLI banner draws, before a late `LF=$00` clear
+cycle at r=24.15M (per `docs/WB13_DEBUG_JOURNAL.md` §55-§56)
+erases most of the bitmap.
+
+At r=23M our boot shows the full CLI banner:
+```
+AmigaDOS
+Copyright (c)1987 Commodore-Amiga, Inc.
+All rights reserved.
+Release 1.3
+A500/A2000 U.K. Workbench disk. Release 1.3 version 34.20
+Battery Backed up Clock not found
+[CLI 2]
+_
+```
+
+**Byte-for-byte comparison of text row 5 vs FS-UAE** shows the
+following differences across all 80 bytes:
+- Byte 0 (left border column): ours $0C0C, FSU $CCCC
+- Byte 79 (right border column): ours $0000, FSU $0303
+
+All 78 bytes of text content are **identical**.  The apparent
+text-overlap in earlier screenshots was a small-render-size
+visual artifact; the chip RAM is actually correct.
+
+**Two real RTL fixes landed this session** ([§54](../docs/WB13_DEBUG_JOURNAL.md#§54)
++ [§55c](../docs/WB13_DEBUG_JOURNAL.md#§55c)):
+1. Blitter line-mode SUD/SUL/AUL bit-mapping in `m68k_bus.v`
+   (off-by-one + AUL convention inverted).  Vertical lines drew
+   as horizontal pre-fix.  Regression: `tests/t160_line_vertical.s`.
+2. BLTAFWM/BLTALWM masks now applied to BLTADAT_pre when USE_A=0.
+   RectFill border blits (LF=$EA + USE_A=0 + AFWM=$3FFF / ALWM=$FFFC)
+   now produce corner-masked output.  Regression: `tests/t161_blt_ea_masked.s`.
+
+**Remaining gaps** (all isolated by the §55-§56 traces):
+- Left border column (col 0-1, every row 10-198): never gets
+  bit 15 set despite the bltcon=$EA00010B 200×2 blit at $60C8 firing.
+- Right border column (col 638-639): same — never set.
+- The r=24M wipe is a Layer-redraw cycle (per `PC=$FCB39A` parent
+  at `$FE0EAA`) — would need K1.3 ROM disasm to identify which
+  upstream Intuition state difference is triggering the redraw.
+
+Test suite: **153 / 153** passing.
