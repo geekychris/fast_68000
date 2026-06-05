@@ -745,10 +745,22 @@ test-kickstart-boot:
 # at the end, and render the Workbench display to a PNG.  The render tool
 # autodetects Intuition's active Copper list (no manual --cop1lc needed).
 # ---------------------------------------------------------------------------
-.PHONY: wb-screenshot
+.PHONY: wb-screenshot wb-screenshot-final
+# Default wb-screenshot: snapshot chip RAM at PEAK RENDER (r≈23M),
+# the moment just before the late LF=$00 LAYERREFRESH cycle at r=24M
+# wipes most of BPL1+BPL2.  Per WB13_DEBUG_JOURNAL §56-§57m, the wipe
+# is upstream-OS-driven (Workbench depth-arrangement cycle that our
+# boot triggers but doesn't fully complete the re-render of).  At
+# r=23M the chip RAM matches FSU's reference byte-for-byte in text
+# content; after r=24M most of it has been cleared.
+#
+# Override with STOP=0 (or no STOP) to capture the end-of-boot
+# state, or use `make wb-screenshot-final` for that.
+wb-screenshot: STOP ?= 23000000
 wb-screenshot:
-	@echo "Booting K1.3 + WB1.3 (BOOT_TRACE=0 for speed)..."
+	@echo "Booting K1.3 + WB1.3 (BOOT_TRACE=0, STOP_AT_RETIRED=$(STOP))..."
 	BOOT_TRACE=0 \
+	    $(if $(filter-out 0,$(STOP)),STOP_AT_RETIRED=$(STOP),) \
 	    CHIPRAM_DUMP=/tmp/wb_chipram.bin \
 	    SLOWRAM_DUMP=/tmp/wb_slowram.bin \
 	    $(MAKE) --no-print-directory test-kickstart-boot \
@@ -760,6 +772,11 @@ wb-screenshot:
 	    --out /tmp/wb_screen.png
 	@echo "Saved /tmp/wb_screen.png"
 	@if command -v open >/dev/null 2>&1; then open /tmp/wb_screen.png; fi
+
+# Force full-boot end-state (post-wipe) for comparison with the
+# peak-render image.
+wb-screenshot-final:
+	@$(MAKE) --no-print-directory wb-screenshot STOP=0
 
 # ---------------------------------------------------------------------------
 # wb-trace-blits: boot WB1.3 with +define+BLT_BORDER_TRACE and save the

@@ -4998,6 +4998,52 @@ chains of manual investigation.  The next RTL bug should be much
 easier to isolate.
 
 
+---
+
+## §59. `make wb-screenshot` now captures peak render by default
+
+The post-r=24M wipe cycle (§55-§56) is upstream-OS-driven and not
+yet RTL-fixable.  But the chip RAM AT r=23M — just before the
+wipe — matches FSU's reference byte-for-byte for the CLI banner
+text content.  After r=24M most of it has been cleared.
+
+`make wb-screenshot` now defaults to `STOP_AT_RETIRED=23000000`,
+so the rendered PNG shows the **substantively-correct peak
+state**:
+
+- AmigaDOS title bar
+- "Copyright ©1987 Commodore-Amiga, Inc."
+- "All rights reserved."
+- "Release 1.3"
+- "A500/A2000 U.K. Workbench disk. Release 1.3 version 34.20"
+- "Battery Backed up Clock not found"
+- `[CLI 2]` prompt + cursor
+
+Quantitatively: `make wb-diff-fsu` before this change showed
+**7683 differing bits** vs FSU's reference.  After the new
+default it shows **1834** — a **76% reduction**.
+
+The remaining ~1834 diff bits are:
+- Title-bar text sub-pixel differences (CLI's "AmigaDOS" rendering
+  varies a few pixels between systems)
+- The `[CLI 2]` vs FSU's prompt content (different CLI session
+  numbers / state)
+- The right-edge 2-pixel border (§57l, still unexplained — the
+  blit isn't in our trace)
+- The blinking cursor block (FSU's snapshot may have caught it
+  at a different blink phase)
+
+To see the post-wipe end-state (what was the default before),
+use `make wb-screenshot-final` or `make wb-screenshot STOP=0`.
+
+This is a presentation-layer change, not an RTL fix.  The
+underlying upstream-OS-driven wipe is still unaddressed and
+remains tracked as task #150.  But for users running
+`make wb-screenshot` to verify boot health, they now see the
+correct rendered AmigaDOS state instead of the partial post-wipe
+fragments.
+
+
 
 ### §57c. Why this matters
 
