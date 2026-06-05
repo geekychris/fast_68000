@@ -4705,6 +4705,51 @@ A `+define+SLOW_RAM_C07138_WR_TRACE` probe added to
 `rtl/m68k_bus.v` (similar to existing watchpoint patterns) would
 fire on every write to `$C07138` with the PC + value.
 
+### §57g. The $C07138 mystery — CPU reads $0280000A but slow RAM has different value
+
+Added `+define+SLOW_C07138_WR_TRACE` to `rtl/m68k_core.v`.  Captured
+187 CPU writes to $C07138 during boot.  Writers + values:
+
+| r        | PC      | Value      | Likely role                     |
+| -------- | ------- | ---------- | ------------------------------- |
+| 276850   | $FC060E | $00000000 | exec init (early zero)          |
+| 4015911  | $FC1810 | $00000000 | AllocMem clear                  |
+| 4018223  | $FF441C | $ABABABAB | Exec "allocated-not-used" mark  |
+| 4024663+ | $FE491E | $00C07210 | Layer/struct init               |
+| 4039964  | $FE0CCC | $00001000 | Chip-RAM pointer (icon source?) |
+| 4162050  | $FDA8DC | $00000028 | Some struct size                |
+| 4163247  | $FD5368 | $00FD536E | ROM PC backed up to slot        |
+| 4164716+ | $FD559A | $00C0721C | Forward-pointer init            |
+| 4166220  | $FC9C1C | $00FC748A | Initialization function         |
+| 4183988+ | $FC5CAC | $00002EC0 | Final value (matches sim-end)   |
+
+At sim-end (r=11M+ via SLOWRAM_DUMP) `$C07138 = $00002EC0` — the
+final write at r=4183988.
+
+But the BLTAPT-WR trace at PC=$FC5DF2 r=4131043 captured the CPU
+reading and writing `$0280000A` to BLTAPT — a value that does NOT
+appear in any of the 187 captured writes to $C07138.
+
+**Possible explanations**:
+1. The CPU's read isn't actually from $C07138 (i.e., A1 != $C07128
+   at the moment of read, despite the trace showing it that way).
+   The trace logs `u_rf.regs[9]` which is A1 at the write-ack
+   cycle — but the source read happened earlier in the instruction.
+2. There's a CPU/memory consistency issue where the read returns
+   stale data not reflected in the slow-RAM snapshot.
+3. The slow-RAM array has bus-aliasing or addressing bug that
+   causes `$10(A1)` with A1=$C07128 to actually read a different
+   physical location.
+
+None of these are easy to diagnose without more probes — a mem-read
+trace at the EXACT moment the instruction executes would help.
+
+This is the genuine RTL-side investigation boundary for this
+session.  The §57 finding stands: the WB Backdrop's left/right
+border is missing because the BLTAPT pointer fed to the
+border-fill blit is wrong, and the wrongness traces back to a
+memory inconsistency we don't currently understand.
+
 
 
 ### §57c. Why this matters

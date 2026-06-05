@@ -3104,6 +3104,15 @@ module m68k_core #(
                     retired, ex_pc, dc_addr, dc_wdata, dc_be,
                     u_rf.regs[0], u_rf.regs[8], u_rf.regs[9]);
 `endif
+`ifdef SLOW_C07138_WR_TRACE
+            // Trace every write to slow RAM $C07138 — the struct field
+            // that supplies the bad BLTAPT high-half $0280 (per §57e).
+            // Identifies the routine that initializes this field correctly.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h00C0_7138 && dc_addr <= 32'h00C0_713B)
+                $display("[SLOW_C07138-WR] r=%d pc=%h addr=%h wdata=%h be=%b A1=%h",
+                    retired, ex_pc, dc_addr, dc_wdata, dc_be, u_rf.regs[9]);
+`endif
 `ifdef KICKSTART_TRACKDISK_TRACE
             // Wider window trace: K1.3 trackdisk decoder PCs during the
             // validation window.  Open r=2.0M..5.0M after the snoop fix
