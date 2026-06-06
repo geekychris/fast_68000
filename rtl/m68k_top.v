@@ -916,6 +916,22 @@ module m68k_top #(
                 dbg_regs_flat[0+:32],
                 dbg_regs_flat[8*32+:32],
                 dbg_regs_flat[15*32+:32]);
+        // [ALLOC-RET]: Allocate at $FC16D8 returned.  PC=$FC17FC is the
+        // TST.L D0 right after `BSR.W Allocate` at $FC17F8 (inside
+        // exec.AllocMem).  At this point:
+        //   D0 = returned memory pointer (or 0 if Allocate failed)
+        //   A2 = MemHeader pointer (saved by AllocMem before call)
+        //   D3 = original request size (preserved across the call)
+        // Capturing D0 here gives us the actual placement address that
+        // K1.3's Allocate decided on — needed to compare ours vs
+        // FS-UAE-no-UAEFS for divergence-bisection (task #173).
+        if (core_pc_flat[31:0] == 32'h00FC_17FC)
+            $display("[ALLOC-RET] r=%0d size=%0d ret=%h A2=%h SP=%h",
+                retired_flat[31:0],
+                dbg_regs_flat[3*32+:32],     // D3 (size)
+                dbg_regs_flat[0+:32],        // D0 (returned ptr)
+                dbg_regs_flat[10*32+:32],    // A2 (memheader)
+                dbg_regs_flat[15*32+:32]);   // SP
     end
 `endif
 
