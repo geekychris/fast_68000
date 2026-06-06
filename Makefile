@@ -501,6 +501,36 @@ crosscheck-minimig-blt: $(MINIMIG_BLT_BUILD)/Vminimig_blt_xcheck_top
 	@(cd $(MINIMIG_BLT_BUILD) && ./Vminimig_blt_xcheck_top) | tee $(MINIMIG_BLT_BUILD)/last.log
 
 # ---------------------------------------------------------------------------
+# Copper cross-check vs minimig copper.  Phase 1 scope: drives both
+# modules with the same Copper list, compares the SEQUENCE of MOVE
+# target-register addresses each emits.  Does not attempt cycle-perfect
+# comparison (the two modules have different raster-position interfaces
+# and bus-arbitration models).  See tb/minimig_cop_xcheck_top.sv header
+# for details.
+# ---------------------------------------------------------------------------
+MINIMIG_COP_BUILD := build_minimig_cop
+minimig-cop: $(MINIMIG_COP_BUILD)/Vminimig_cop_xcheck_top
+$(MINIMIG_COP_BUILD)/Vminimig_cop_xcheck_top: \
+        $(MINIMIG_DIR)/rtl/minimig/agnus_copper.v \
+        $(TB_DIR)/minimig_cop_xcheck_top.sv \
+        $(TB_DIR)/minimig_cop_xcheck.cpp \
+        $(RTL_DIR)/chipset/copper.v
+	@mkdir -p $(MINIMIG_COP_BUILD)
+	$(VERILATOR) -Wno-fatal --cc --exe --build --no-timing \
+	    --noassert -CFLAGS "-std=c++17 -O1" \
+	    -I$(RTL_DIR) -I$(MINIMIG_DIR)/rtl/minimig \
+	    --top-module minimig_cop_xcheck_top \
+	    -Mdir $(MINIMIG_COP_BUILD) \
+	    -o Vminimig_cop_xcheck_top \
+	    $(TB_DIR)/minimig_cop_xcheck_top.sv \
+	    $(RTL_DIR)/chipset/copper.v \
+	    $(MINIMIG_DIR)/rtl/minimig/agnus_copper.v \
+	    $(TB_DIR)/minimig_cop_xcheck.cpp
+
+crosscheck-minimig-cop: $(MINIMIG_COP_BUILD)/Vminimig_cop_xcheck_top
+	@(cd $(MINIMIG_COP_BUILD) && ./Vminimig_cop_xcheck_top) | tee $(MINIMIG_COP_BUILD)/last.log
+
+# ---------------------------------------------------------------------------
 # C multicore demos.  Each demos/c/*.c is compiled inside the m68k-elf-gcc
 # Docker image (tools/cc68k/) and run through the default 2-core build.
 # Each demo halts every core with a halt code (0 = pass).
