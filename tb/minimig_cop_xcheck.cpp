@@ -46,6 +46,15 @@ static void copper_wait(uint8_t vp, uint8_t hp,
     *ir2 = ((uint16_t)0x7F << 8) | ((uint16_t)(0x3F) << 1) | 0;
 }
 
+// SKIP instruction: if the raster has already passed (VP, HP), skip the
+// next 4 bytes (one instruction).  Same encoding as WAIT but with the
+// SKIP bit (IR2[0]) set.
+static void copper_skip(uint8_t vp, uint8_t hp,
+                        uint16_t* ir1, uint16_t* ir2) {
+    *ir1 = ((uint16_t)vp << 8) | ((uint16_t)(hp & 0x7F) << 1) | 1;
+    *ir2 = ((uint16_t)0x7F << 8) | ((uint16_t)(0x3F) << 1) | 1;
+}
+
 static void copper_wait_end(uint16_t* ir1, uint16_t* ir2) {
     // Unreachable end-of-list sentinel: IR1=$FFFF (WAIT/SKIP bit set),
     // IR2=$FFFE (WAIT — low bit clear, not SKIP).  Decodes as
@@ -58,16 +67,24 @@ static void copper_wait_end(uint16_t* ir1, uint16_t* ir2) {
 // Run a test: pre-load chip RAM with a Copper list at byte 0,
 // kick both coppers, tick for `cycles`, then compare captured MOVEs.
 struct CopperEntry {
-    enum Kind { MOVE, WAIT } kind = MOVE;
+    enum Kind { MOVE, WAIT, SKIP } kind = MOVE;
     uint16_t reg_off = 0;   // MOVE: chipset offset
     uint16_t value   = 0;   // MOVE: 16-bit value to write
-    uint8_t  vp      = 0;   // WAIT: vertical target
-    uint8_t  hp      = 0;   // WAIT: horizontal target
+    uint8_t  vp      = 0;   // WAIT/SKIP: vertical target
+    uint8_t  hp      = 0;   // WAIT/SKIP: horizontal target
+    bool     skipped = false; // MOVE: true if expected to be skipped by a preceding SKIP
     static CopperEntry mov(uint16_t r, uint16_t v) {
         CopperEntry e; e.kind = MOVE; e.reg_off = r; e.value = v; return e;
     }
+    static CopperEntry mov_skipped(uint16_t r, uint16_t v) {
+        CopperEntry e; e.kind = MOVE; e.reg_off = r; e.value = v;
+        e.skipped = true; return e;
+    }
     static CopperEntry wait(uint8_t v, uint8_t h) {
         CopperEntry e; e.kind = WAIT; e.vp = v; e.hp = h; return e;
+    }
+    static CopperEntry skip(uint8_t v, uint8_t h) {
+        CopperEntry e; e.kind = SKIP; e.vp = v; e.hp = h; return e;
     }
 };
 
@@ -93,8 +110,10 @@ static int run_test(Vminimig_cop_xcheck_top* dut,
         uint16_t ir1, ir2;
         if (e.kind == CopperEntry::MOVE)
             copper_move(e.reg_off, e.value, &ir1, &ir2);
-        else
+        else if (e.kind == CopperEntry::WAIT)
             copper_wait(e.vp, e.hp, &ir1, &ir2);
+        else
+            copper_skip(e.vp, e.hp, &ir1, &ir2);
         init_mem(dut, word++, ir1);
         init_mem(dut, word++, ir2);
     }
@@ -147,10 +166,12 @@ static int run_test(Vminimig_cop_xcheck_top* dut,
         dut->eval();
     }
 
-    // Build the EXPECTED MOVE-target sequence (ignore WAIT entries).
+    // Build the EXPECTED MOVE-target sequence (ignore WAIT/SKIP entries,
+    // and exclude MOVEs marked as skipped — those are expected to be
+    // consumed by a preceding SKIP).
     std::vector<uint8_t> expected;
     for (auto& e : list) {
-        if (e.kind == CopperEntry::MOVE)
+        if (e.kind == CopperEntry::MOVE && !e.skipped)
             expected.push_back(e.reg_off & 0xFE);
     }
     printf("  Expected MOVE targets (from list):\n   ");
@@ -245,6 +266,35 @@ int main(int argc, char** argv) {
             CopperEntry::mov(0x182, 0x000F),  // COLOR01
         },
         8000);
+
+    // -----------------------------------------------------------------
+    // Test 4: SKIP that succeeds (always true with vp_target=0).  The
+    // MOVE immediately after the SKIP is consumed (not executed).
+    // Expected MOVE sequence: BPLCON0, COLOR01 (the middle COLOR00 is
+    // skipped).
+    // -----------------------------------------------------------------
+    fails += run_test(dut, "Test 4: MOVE / SKIP(VP=0, always true) / MOVE_skipped / MOVE",
+        {
+            CopperEntry::mov(0x100, 0xA200),         // BPLCON0
+            CopperEntry::skip(0, 0),
+            CopperEntry::mov_skipped(0x180, 0x0F00), // COLOR00 — skipped
+            CopperEntry::mov(0x182, 0x000F),         // COLOR01
+        },
+        4000);
+
+    // -----------------------------------------------------------------
+    // Test 5: SKIP that does NOT trigger (vp_target=$F0 > raster at
+    // start).  All MOVEs execute, including the one after the SKIP.
+    // Expected: BPLCON0, COLOR00, COLOR01.
+    // -----------------------------------------------------------------
+    fails += run_test(dut, "Test 5: MOVE / SKIP(VP=$F0, never satisfied early) / MOVE / MOVE",
+        {
+            CopperEntry::mov(0x100, 0xA200),  // BPLCON0
+            CopperEntry::skip(0xF0, 0),       // raster hasn't reached $F0 yet
+            CopperEntry::mov(0x180, 0x0F00),  // COLOR00 — should execute
+            CopperEntry::mov(0x182, 0x000F),  // COLOR01
+        },
+        2000);  // short run, vbeam stays well below $F0
 
     delete dut;
 
