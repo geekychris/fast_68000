@@ -1244,6 +1244,42 @@ demo-real-boing: kickstart/boing_disk.adf
 	    --width 640 --height 200 --out /tmp/boing_disk.png
 	@if command -v open >/dev/null 2>&1; then open /tmp/boing_disk.png; fi
 
+# ---------------------------------------------------------------------------
+# demo-real-boing-patched: HACK target that pre-patches the K1.3 chip-RAM
+# free-list to push boing's 49,896-byte audio buffer past the dangerous
+# $4CA60 region.  See docs/BOOT_AND_PORTING.md "Boing heap-layout race".
+#
+# Background: with FSUAE_NO_UAEFS=1 + same K1.3 ROM + same boing-disk ADF,
+# FS-UAE places boing's audio buffer at chip $4B3E0+ (because UAE Boot ROM
+# pre-consumes ~$30000 bytes of chip RAM).  Our bare-A500 sim doesn't have
+# that consumer, so the same allocation lands at $11C38 — and a later
+# graphics.library blit at $FC761A clears $4CA38-$4CBC9, corrupting the
+# free-chunk header at $4CA60 → orphans 210 KB → AllocMem fails → boing
+# crashes to Romwack.  See `project_boing_chip_freelist.md` sixteenth
+# session for the full diagnosis.
+#
+# The patches below rewrite the chip free-list at cycle 30M (after K1.3
+# init, before boing's allocs at retired ~8.8M) so that MH_FIRST chains
+# directly to a chunk at $4B3E0 — orphaning the lower-address chunks so
+# boing's CHIP alloc lands at $4B3E0+ and covers $4CA60 with its own
+# (harmless) audio sample data.
+#
+# **THIS IS A HACK.**  Values are heuristic — heap state at patch time
+# may differ between runs.  Task #174 captures the proper fix
+# (implement chip-RAM autoconfig consumer that mimics UAE Boot ROM
+# pre-allocations).  Use this target only for screenshot/demo work.
+demo-real-boing-patched: kickstart/boing_disk.adf
+	@rm -rf build_kick_boot
+	BOOT_TRACE=0 CHIPRAM_DUMP=/tmp/boing_disk_chip.bin SLOWRAM_DUMP=/tmp/boing_disk_slow.bin \
+	    MEM_POKE="0x19A0=0x0004B3E0,0x4B3E0=0x00000000,0x4B3E4=0x00034040,0x10170=0x00000000" \
+	    MEM_POKE_CYCLE=30000000 \
+	    $(MAKE) --no-print-directory test-kickstart-boot \
+	    ADFFILE=kickstart/boing_disk.adf 2>&1 | tail -5 || true
+	$(PYTHON) tools/render_k13_screen.py \
+	    --chipram /tmp/boing_disk_chip.bin --slowram /tmp/boing_disk_slow.bin \
+	    --width 640 --height 200 --out /tmp/boing_disk_patched.png
+	@if command -v open >/dev/null 2>&1; then open /tmp/boing_disk_patched.png; fi
+
 demo: demo-os
 
 clean:
