@@ -1184,10 +1184,34 @@ demo-boing:
 # boing's Intuition screen never renders — likely blocked by the
 # upstream OS-state issue tracked as task #150.
 # ---------------------------------------------------------------------------
-BOING_SRC ?= /Users/chris/Downloads/workbench_demos/animations/boing!
+BOING_SRC     ?= /Users/chris/Downloads/workbench_demos/animations/boing!
+BOING_SAMPLES ?= /Users/chris/Downloads/workbench_demos/animations/boing.samples
+
+# hello-disk: same wb13.adf + deletions baseline as boing-disk, but the
+# Startup-Sequence is just `echo "hello"` instead of running boing.  Used
+# to isolate "is the trap caused by boing specifically?" vs "is something
+# broken about our ADF / file deletions / OFS path?".
+hello-disk: kickstart/hello_disk.adf
+kickstart/hello_disk.adf: kickstart/wb13.adf
+	@cp kickstart/wb13.adf $@
+	@printf 'c:SetPatch >NIL:\ncd c:\necho "*N*N>>> HELLO from the sim <<<*N"\necho "*N>>> done <<<"\nendcli >NIL:\n' > /tmp/hello_startup.txt
+	@xdftool $@ delete S/Startup-Sequence 2>&1 | tail -1
+	@xdftool $@ write /tmp/hello_startup.txt S/Startup-Sequence 2>&1 | tail -1
+	@echo "Built $@"
+
+demo-hello: kickstart/hello_disk.adf
+	@rm -rf build_kick_boot
+	BOOT_TRACE=0 STOP_AT_RETIRED=80000000 PC_HISTOGRAM=1 PC_HISTOGRAM_INTERVAL=512 PC_HISTOGRAM_TOP=20 \
+	    CHIPRAM_DUMP=/tmp/hello_chip.bin SLOWRAM_DUMP=/tmp/hello_slow.bin \
+	    $(MAKE) --no-print-directory test-kickstart-boot \
+	    ADFFILE=kickstart/hello_disk.adf > /tmp/hello.log 2>&1 || true
+	@grep -E "STOP_AT_RETIRED|retired=|samples" build_kick_boot/run.log | head -25
+	$(PYTHON) tools/render_k13_screen.py \
+	    --chipram /tmp/hello_chip.bin --slowram /tmp/hello_slow.bin \
+	    --width 640 --height 200 --out /tmp/hello.png
 
 real-boing-disk: kickstart/boing_disk.adf
-kickstart/boing_disk.adf: $(BOING_SRC) kickstart/wb13.adf
+kickstart/boing_disk.adf: $(BOING_SRC) $(BOING_SAMPLES) kickstart/wb13.adf
 	@if ! command -v xdftool >/dev/null 2>&1; then \
 	    echo "amitools not installed — run: pip install amitools"; exit 1; \
 	fi
@@ -1195,7 +1219,17 @@ kickstart/boing_disk.adf: $(BOING_SRC) kickstart/wb13.adf
 	@printf 'c:SetPatch >NIL:\ncd c:\necho "*N*N>>> Launching Boing... <<<*N"\nboing\necho "*N>>> Boing exited <<<"\nendcli >NIL:\n' > /tmp/boing_startup.txt
 	@xdftool $@ delete S/Startup-Sequence 2>&1 | tail -1
 	@xdftool $@ write /tmp/boing_startup.txt S/Startup-Sequence 2>&1 | tail -1
+	@# Make room for boing.samples (~25KB): delete unused Workbench utilities.
+	@for f in System/Preferences System/Notepad System/Clock System/Diskcopy \
+	          System/FastFileSystem System/CMD System/Calculator System/More \
+	          Devs/printer.device Devs/narrator.device \
+	          Libs/info.library Libs/mathieeedoubtrans.library Libs/translator.library \
+	          C/Ed C/Edit C/Format C/List; do \
+	    xdftool $@ delete $$f >/dev/null 2>&1 || true; \
+	done
 	@xdftool $@ write "$(BOING_SRC)" 'C/boing' 2>&1 | tail -1
+	@xdftool $@ write "$(BOING_SAMPLES)" 'C/boing.samples' 2>&1 | tail -1
+	@xdftool $@ info 2>&1 | grep -E "free|used"
 	@echo "Built $@"
 	@ls -la $@
 

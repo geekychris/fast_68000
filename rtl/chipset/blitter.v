@@ -527,6 +527,28 @@ module blitter (
                                     bltafwm[15:0], bltalwm[15:0]);
                             end
 `endif
+`ifdef BLT_CA60_TRACE
+                            // Per project_boing_chip_freelist.md: the
+                            // blit that writes 0 to chip $4CA60..$4CA67
+                            // at r=11150283 orphans 210 KB of CHIP free
+                            // memory and prevents boing from loading.
+                            // Catches any blit whose destination range
+                            // would include $4CA60.  bltsize encodes
+                            // height in upper bits + width-in-words in
+                            // lower bits, so a blit at bltdpt=$4CA00 of
+                            // ~3 rows wide can reach $4CA60.  We log
+                            // anything pointing into a ±$200 window
+                            // around the trouble address.
+                            if (bltdpt[23:0] >= 24'h00_4C000 &&
+                                bltdpt[23:0] <= 24'h00_50000) begin
+                                $display("[BLT_START_CA60] cycle=%0t bltcon=%h bltapt=%h bltbpt=%h bltcpt=%h bltdpt=%h bltsize=%h bltamod=%h bltbmod=%h bltcmod=%h bltdmod=%h adat=%h bdat=%h cdat=%h afwm=%h alwm=%h",
+                                    $time,
+                                    bltcon, bltapt, bltbpt, bltcpt, bltdpt, slv_wdata[15:0],
+                                    bltamod, bltbmod, bltcmod, bltdmod,
+                                    bltadat_pre[15:0], bltbdat_pre[15:0], bltcdat_pre[15:0],
+                                    bltafwm[15:0], bltalwm[15:0]);
+                            end
+`endif
 `ifdef BLT_START_ICON_TRACE
                             // Same shape but for the Workbench disk-icon
                             // area: BPL1 rows 17..30 = $6618..$6A78.

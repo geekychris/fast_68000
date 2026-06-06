@@ -3543,6 +3543,37 @@ module m68k_core #(
                 dc_addr >= 32'h0000_5E3E && dc_addr <= 32'h0000_5E43)
                 $display("[5E40-WR] r=%d pc=%h kind=%d addr=%h be=%b wdata=%h",
                     retired, ex_pc, ex_kind, dc_addr, dc_be, dc_wdata);
+            // [CHIP-MC-CPU-WR]: capture CPU writes to chip $19A0..$19A7
+            // — the corrupting write at r=11255412 that zeros MC_NEXT
+            // of the free-list chunk and severs the chain.  PC + reg
+            // state tells us which exec.AllocMem/FreeMem code path
+            // mis-handles the split.  See project_boing_chip_freelist.md.
+            // (ALLOC_TRACE moved below — was inside KICKSTART_BOOT_TRACE)
+
+`ifdef CHIP_MC_WATCH
+            // Broadened: any chip-RAM write in $1990..$19BF window.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h0000_1990 && dc_addr <= 32'h0000_19BF)
+                $display("[CHIP-MC-CPU-WR] r=%d pc=%h kind=%d addr=%h be=%b wdata=%h A0=%h A1=%h A2=%h A6=%h",
+                    retired, ex_pc, ex_kind, dc_addr, dc_be, dc_wdata,
+                    u_rf.regs[8], u_rf.regs[9], u_rf.regs[10], u_rf.regs[14]);
+            // Sanity: dump EVERY write retiring in the corruption
+            // window so we can see what the CPU was doing.  Use the
+            // bus-side dc_we; if 0 hits, our dc_* signal interpretation
+            // is wrong.
+            if (dc_req_r && dc_we && dc_ack &&
+                retired >= 32'd11254000 && retired <= 32'd11256000)
+                $display("[CHIP-MC-NARROW] r=%d pc=%h kind=%d addr=%h be=%b wdata=%h",
+                    retired, ex_pc, ex_kind, dc_addr, dc_be, dc_wdata);
+            // Also instrument the BUS side — sometimes the cache
+            // shadows dc_we for already-cached writes.  cur_pc_q is
+            // the CPU's currently-executing PC; this fires on the
+            // bus_we pulse, capturing the PC at that wall-clock cycle.
+            if (retired >= 32'd11254000 && retired <= 32'd11256000)
+                $display("[CHIP-MC-PCDUMP] r=%d pc=%h opcode=%h ex_kind=%d is_settled=%b dc_req_r=%b dc_we=%b dc_ack=%b dc_addr=%h",
+                    retired, ex_pc, ex_opcode, ex_kind, is_settled,
+                    dc_req_r, dc_we, dc_ack, dc_addr);
+`endif
             // [Y-FIELD-CHK]: at every $FEA548 (MOVEA.L $56(A3), A0)
             // dump A3 + (A3+$56) so we can see whose struct field is
             // zero in the bad case.

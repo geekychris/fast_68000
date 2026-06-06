@@ -98,6 +98,11 @@ module paula (
     wire vblank_edge = vblank_int_i & ~vblank_int_last;
     wire dskblk_edge = dskblk_int_i & ~dskblk_int_last;
     wire dsksyn_edge = dsksyn_int_i & ~dsksyn_int_last;
+`ifdef PAULA_INTREQ_TRACE
+    always @(posedge clk) if (rst_n && dsksyn_edge)
+        $display("[DSKSYN-EDGE] dsksyn_int_i=%b dsksyn_int_last=%b intena=%h",
+            dsksyn_int_i, dsksyn_int_last, intena);
+`endif
 `ifdef KICKSTART_BOOT_TRACE
     always @(posedge clk) if (rst_n) begin
         if (dsksyn_edge)
@@ -114,9 +119,17 @@ module paula (
     end
 `endif
 
+    // TEST FIX: gate DSKSYN setting on INTENA[12] being enabled.
+    // Real Paula raises INTREQ[12] unconditionally on sync match, but
+    // K1.3 1.3 with INTENA[12]=0 never clears the latched bit, leaving
+    // it pending forever in our sim.  FS-UAE shows INTREQ[12]=0 at
+    // steady state — either via different K1.3 path or auto-clear.
+    // This narrows it: only latch DSKSYN if it would actually fire an
+    // interrupt.  See task #164.
+    wire dsksyn_edge_gated = dsksyn_edge & intena[12];
     wire [13:0] intreq_hw_set = {
         cia_b_edge,           // 13 EXTER
-        dsksyn_edge,          // 12 DSKSYN
+        dsksyn_edge_gated,    // 12 DSKSYN (gated, see above)
         1'b0,                 // 11 RBF
         1'b0,                 // 10 AUD3
         1'b0,                 // 9 AUD2
@@ -361,6 +374,13 @@ module paula (
                     8'h9C: begin
                         if (wdata_w[15]) intreq <= (intreq | wdata_w[13:0]) | intreq_hw_set;
                         else             intreq <= (intreq & ~wdata_w[13:0]) | intreq_hw_set;
+`ifdef PAULA_INTREQ_TRACE
+                        $display("[PAULA-INTREQ-WR] %s wdata=%h cur=%h hw_set=%h next=%h",
+                            wdata_w[15] ? "SET" : "CLR",
+                            wdata_w[13:0], intreq, intreq_hw_set,
+                            wdata_w[15] ? ((intreq | wdata_w[13:0]) | intreq_hw_set)
+                                        : ((intreq & ~wdata_w[13:0]) | intreq_hw_set));
+`endif
 `ifdef KICKSTART_BOOT_TRACE
                         $display("[INTREQ-WR] %s wdata=%h cur=%h hw_set=%h",
                             wdata_w[15] ? "SET " : "CLR ",

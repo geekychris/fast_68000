@@ -1,5 +1,5 @@
 diff --git a/Makefile.am b/Makefile.am
-index 234a66e3..e7755ce5 100644
+index 234a66e32..e7755ce5a 100644
 --- a/Makefile.am
 +++ b/Makefile.am
 @@ -252,6 +252,7 @@ libuae_a_SOURCES = \
@@ -10,15 +10,119 @@ index 234a66e3..e7755ce5 100644
  	src/custom.cpp \
  	src/debug.cpp \
  	src/debuginfo.cpp \
+diff --git a/src/debug.cpp b/src/debug.cpp
+index 18cb5e0b4..48249bf8c 100644
+--- a/src/debug.cpp
++++ b/src/debug.cpp
+@@ -55,11 +55,11 @@
+ 
+ int debugger_active;
+ static uaecptr skipaddr_start, skipaddr_end;
+-static int skipaddr_doskip;
++int skipaddr_doskip;
+ static uae_u32 skipins;
+ static int do_skip;
+ static int debug_rewind;
+-static int memwatch_triggered;
++int memwatch_triggered;
+ int memwatch_enabled;
+ static uae_u16 sr_bpmask, sr_bpvalue;
+ int debugging;
+@@ -81,6 +81,25 @@ static uaecptr debug_copper_pc;
+ extern int audio_channel_mask;
+ extern int inputdevice_logging;
+ 
++/* claude_rpc trace-BP hook (defined in claude_rpc.cpp).  Declared at
++ * file scope with C linkage so debug() can call it from the BP-match
++ * block without an in-function `extern "C"` (illegal in C++). */
++extern "C" int claude_rpc_trace_bp_hook (int slot, uae_u32 pc);
++
++/* claude_rpc: arm the BP machinery from outside debug.cpp.  The
++ * in-process debugger normally sets `do_skip = 1` + SPCFLAG_BRK when
++ * the user types `g` to resume from a paused state.  When the RPC
++ * client installs a BP without ever entering the debugger, that
++ * priming step never happens, and the CPU loop never calls debug() to
++ * check BPs.  This helper wires it up so externally-installed BPs fire
++ * normally. */
++extern "C" void claude_rpc_arm_bp_skip (void)
++{
++	do_skip = 1;
++	debugging = 1;
++	set_special (SPCFLAG_BRK);
++}
++
+ void deactivate_debugger (void)
+ {
+ 	debugger_active = 0;
+@@ -2167,7 +2186,7 @@ struct breakpoint_node bpnodes[BREAKPOINT_TOTAL];
+ static addrbank **debug_mem_banks;
+ static addrbank *debug_mem_area;
+ struct memwatch_node mwnodes[MEMWATCH_TOTAL];
+-static struct memwatch_node mwhit;
++struct memwatch_node mwhit;
+ 
+ static uae_u8 *illgdebug, *illghdebug;
+ static int illgdebug_break;
+@@ -2320,7 +2339,7 @@ static void smc_free (void)
+ 	smc_table = NULL;
+ }
+ 
+-static void initialize_memwatch (int mode);
++void initialize_memwatch (int mode);
+ static void smc_detect_init (TCHAR **c)
+ {
+ 	int v, i;
+@@ -2914,7 +2933,7 @@ static void memwatch_remap (uaecptr addr)
+ 	}
+ }
+ 
+-static void memwatch_setup (void)
++void memwatch_setup (void)
+ {
+ 	memwatch_reset ();
+ 	for (int i = 0; i < MEMWATCH_TOTAL; i++) {
+@@ -2950,7 +2969,7 @@ static int deinitialize_memwatch (void)
+ 	return oldmode;
+ }
+ 
+-static void initialize_memwatch (int mode)
++void initialize_memwatch (int mode)
+ {
+ 	membank_total = currprefs.address_space_24 ? 256 : 65536;
+ 	deinitialize_memwatch ();
+@@ -5332,10 +5351,22 @@ void debug (void)
+ 					continue;
+ 				if (bpnodes[i].addr == pc) {
+ 					bp = 1;
+-					console_out_f (_T("Breakpoint at %08X\n"), pc);
+ 					break;
+ 				}
+ 			}
++			/* claude_rpc trace-BP hook: a trace BP captures regs to a
++			 * file and silently auto-resumes — no console output, no
++			 * interactive debugger, no client poll required.  When no
++			 * trace BPs are installed, the hook returns 0 immediately
++			 * (single conditional + return), so this is zero-cost
++			 * when the trace feature is unused. */
++			if (bp) {
++				if (claude_rpc_trace_bp_hook (i, pc)) {
++					bp = 0;
++				} else {
++					console_out_f (_T("Breakpoint at %08X\n"), pc);
++				}
++			}
+ 
+ 			if (skipaddr_doskip) {
+ 				if (skipaddr_start == pc)
 diff --git a/src/main.cpp b/src/main.cpp
-index 7040dfe4..1f4f41f5 100644
+index 7040dfe42..59e166245 100644
 --- a/src/main.cpp
 +++ b/src/main.cpp
 @@ -742,6 +742,8 @@ static int restart_program;
  static TCHAR restart_config[MAX_DPATH];
  static int default_config;
  
-+extern "C" void claude_rpc_init(void);
++extern "C" void fsuae_rpc_init(void);
 +
  void uae_reset (int hardreset, int keyboardreset)
  {
@@ -27,7 +131,24 @@ index 7040dfe4..1f4f41f5 100644
  			}
  			currprefs.produce_sound = 0;
  		}
-+		claude_rpc_init();
++		fsuae_rpc_init();
  		start_program ();
  	}
  	return 0;
+diff --git a/include/uae.h b/include/uae.h
+index 2f0a91840..bf0ca04b4 100644
+--- a/include/uae.h
++++ b/include/uae.h
+@@ -16,9 +16,9 @@ extern void start_program (void);
+ extern void leave_program (void);
+ extern void real_main (int, TCHAR **);
+ extern void usage (void);
+-extern int sleep_millis (int ms);
+-extern int sleep_millis_main(int ms);
+-extern int sleep_millis_amiga(int ms);
++extern void sleep_millis (int ms);
++extern void sleep_millis_main(int ms);
++extern void sleep_millis_amiga(int ms);
+ extern void sleep_cpu_wakeup(void);
+ extern int sleep_resolution;
+ 

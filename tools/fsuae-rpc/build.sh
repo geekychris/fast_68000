@@ -72,6 +72,21 @@ step "Applying claude_rpc patch"
 cp -f "$HERE/claude_rpc.cpp" "$FSUAE_SRC/src/claude_rpc.cpp"
 info "Copied claude_rpc.cpp -> src/"
 
+# claude_rpc.cpp references a generated `web_index.inc` that's normally
+# produced from web/index.html; the FS-UAE v3.2.35 tag doesn't ship that
+# generator.  Write a minimal stub so the include resolves.  The web UI
+# becomes a single placeholder page, which is fine for headless RPC work.
+cat > "$FSUAE_SRC/src/web_index.inc" <<'WEB_EOF'
+/* Stub web_index.inc — replace with generated content if/when the
+ * web debugger UI source is checked in.  Not used by RPC or alloc-trace. */
+static const char WEB_UI_HTML[] =
+    "<!DOCTYPE html><html><head><title>FS-UAE RPC</title></head>"
+    "<body><h1>FS-UAE RPC</h1>"
+    "<p>Web UI disabled in this build.  Use the v1/* endpoints directly.</p>"
+    "</body></html>";
+WEB_EOF
+info "Wrote web_index.inc stub"
+
 # `git apply --check` first so we fail fast on stale patches
 if git -C "$FSUAE_SRC" apply --check "$HERE/0001-claude-rpc-hook.patch" 2>/dev/null; then
     git -C "$FSUAE_SRC" apply "$HERE/0001-claude-rpc-hook.patch"

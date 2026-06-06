@@ -2219,15 +2219,22 @@ module m68k_bus #(
             granted_paula_ro_val_q <=
                 (addr[winner] == SERDATR_ADDR) ? SERDATR_VAL
               : (addr[winner] == POTGOR_ADDR)  ? potgor_live
-              : (addr[winner] == ADKCONR_ADDR) ? ADKCONR_VAL
+              : (addr[winner] == ADKCONR_ADDR) ? {1'b0, adkcon}
               : (addr[winner] == POT0DAT_ADDR) ? POT_DAT_VAL
               : (addr[winner] == POT1DAT_ADDR) ? POT_DAT_VAL
               : (addr[winner] == JOY0DAT_ADDR) ? joy0dat_live
               : (addr[winner] == JOY1DAT_ADDR) ? JOY_DAT_VAL
-              // DSKBYTR: bit 14 = DMAON tracks blk_busy.  Bit 15
-              // (DSKBYT = byte ready) we leave 0; K1.3 doesn't poll
-              // it under DMA mode.  Last data byte 0.
-              : (addr[winner] == DSKBYTR_ADDR) ? {1'b0, blk_busy, 14'd0}
+              // DSKBYTR:
+              //   bit 15 = DSKBYT (1 = data byte ready)
+              //   bit 14 = DMAON  (tracks blk_busy)
+              //   bit 13 = DSKWRITE (we don't model write)
+              //   bit 12 = WORDEQUAL (1 = last word matched DSKSYNC).
+              //            Set when blk_busy active in word-sync mode,
+              //            since our model pre-aligns to sync.  Matters
+              //            for K1.3 polling paths that consult WORDEQUAL.
+              : (addr[winner] == DSKBYTR_ADDR) ?
+                  {1'b0, blk_busy, 1'b0,
+                   (blk_busy & adkcon_wordsync), 12'd0}
               // DSKDATR: returns last disk word.  We don't track it
               // (data flows via DMA), so return 0.
               : (addr[winner] == DSKDATR_ADDR) ? 16'd0
@@ -2550,6 +2557,90 @@ module m68k_bus #(
         .retired (cosim_retired_i),
         .hit_o   ()
     );
+
+    // [CA60-WR]: every write to chip $4CA60..$4CA67 — the chunk
+    // header that gets corrupted (size 210336 → 0) between r=11150000
+    // and r=11150500 in the boing-disk run.  Captures wdata for
+    // bus-side analysis.
+`ifdef CHIP_MC_WATCH
+    hw_watch #(
+        .LABEL      ("CA60-WR"),
+        .ADDR_LO    (32'h0000_4CA60),
+        .ADDR_HI    (32'h0000_4CA67),
+        .MATCH_WE   (1),
+        .MATCH_RE   (0)
+    ) u_w_ca60 (
+        .clk     (clk),
+        .rst_n   (rst_n),
+        .valid   (bus_we_now),
+        .we      (1'b1),
+        .addr    (addr[winner]),
+        .wdata   (wdata[winner]),
+        .be      (be[winner]),
+        .src_id  (bus_src),
+        .pc      (32'd0),
+        .retired (cosim_retired_i),
+        .hit_o   ()
+    );
+`endif
+
+    // [MH-WR]: every write to the chip-RAM MemHeader at $400..$41F.
+    // Captures wdata so we can see MH_FIRST and MH_FREE updates with
+    // values, not just PCs (which the top-level snoop already gives
+    // us).  See project_boing_chip_freelist.md.
+`ifdef CHIP_MC_WATCH
+    hw_watch #(
+        .LABEL      ("MH-WR"),
+        .ADDR_LO    (32'h0000_0400),
+        .ADDR_HI    (32'h0000_041F),
+        .MATCH_WE   (1),
+        .MATCH_RE   (0)
+    ) u_w_mh (
+        .clk     (clk),
+        .rst_n   (rst_n),
+        .valid   (bus_we_now),
+        .we      (1'b1),
+        .addr    (addr[winner]),
+        .wdata   (wdata[winner]),
+        .be      (be[winner]),
+        .src_id  (bus_src),
+        .pc      (32'd0),
+        .retired (cosim_retired_i),
+        .hit_o   ()
+    );
+`endif
+
+    // [CHIP-MC-WR]: every write to chip $1998..$19A7 — the CHIP-RAM
+    // MemChunk free-list header that gets corrupted during boing's
+    // LoadSeg.  Hello-disk baseline: MH_FIRST=$1998 with chunk(72,
+    // next=$10170).  Boing-disk: MH_FIRST=$19A0 with chunk(64, next=0)
+    // — i.e. an AllocMem(8) split the front of $1998 into $19A0 but
+    // failed to copy MC_NEXT.  This watch logs every writer (CPU,
+    // blitter, DMA) at this address so we can identify the corrupter.
+    // Always-on; the range is 16 bytes and writes are rare outside
+    // exec.AllocMem so it won't spam the log.  See
+    // project_boing_chip_freelist.md.
+`ifdef CHIP_MC_WATCH
+    hw_watch #(
+        .LABEL      ("CHIP-MC-WR"),
+        .ADDR_LO    (32'h0000_1998),
+        .ADDR_HI    (32'h0000_19A7),
+        .MATCH_WE   (1),
+        .MATCH_RE   (0)
+    ) u_w_chip_mc (
+        .clk     (clk),
+        .rst_n   (rst_n),
+        .valid   (bus_we_now),
+        .we      (1'b1),
+        .addr    (addr[winner]),
+        .wdata   (wdata[winner]),
+        .be      (be[winner]),
+        .src_id  (bus_src),
+        .pc      (32'd0),
+        .retired (cosim_retired_i),
+        .hit_o   ()
+    );
+`endif
 
     // [MH-ATTRS-WR]: every write to chip $40E — the mh_Attributes
     // field of the chip-RAM MemHeader at chip $400.  FS-UAE writes

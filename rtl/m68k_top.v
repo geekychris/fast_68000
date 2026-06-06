@@ -875,6 +875,91 @@ module m68k_top #(
     endgenerate
 
     // ----------------------------------------------------------------
+    // [CHIP-MC-WR-PC]: top-level probe at the bus-arbiter port for
+    // chip $1998..$19A7 writes, with CPU PC piped in from core 0's
+    // exposed cur_pc.  Identifies the exec.AllocMem/FreeMem PC that
+    // breaks the chip-RAM free-list chain at $19A0 (the corrupting
+    // write at r=11255412 in the boing-disk boot, per
+    // project_boing_chip_freelist.md).  Always-on; the address range
+    // is narrow so it doesn't spam.
+`ifdef DMACON_TRACE
+    // Periodically print DMACON, INTENA, INTREQ.  Sample every ~2M cyc.
+    reg [31:0] dmacon_sample_cyc;
+    always @(posedge clk) if (rst_n) begin
+        dmacon_sample_cyc <= dmacon_sample_cyc + 1;
+        if (dmacon_sample_cyc[20:0] == 0)
+            $display("[CHIPSET-PROBE] r=%0d dmacon=%h intena=%h intreq=%h",
+                retired_flat[31:0], u_bus.dmacon,
+                u_pau.intena, u_pau.intreq);
+    end
+`endif
+
+`ifdef ALLOC_TRACE
+    // Trace exec.Allocate/FreeMem update sites in K1.3 ROM.  Also dump
+    // A7 so we can extract the caller PC from chip RAM offline.
+    always @(posedge clk) if (rst_n) begin
+        if (core_pc_flat[31:0] == 32'h00FC_171C)
+            $display("[ALLOC-DEC] r=%0d D0=%0d A0=%h SP=%h",
+                retired_flat[31:0],
+                dbg_regs_flat[0+:32],
+                dbg_regs_flat[8*32+:32],
+                dbg_regs_flat[15*32+:32]);
+        if (core_pc_flat[31:0] == 32'h00FC_17B0)
+            $display("[FREE-ADD] r=%0d D0=%0d A0=%h SP=%h",
+                retired_flat[31:0],
+                dbg_regs_flat[0+:32],
+                dbg_regs_flat[8*32+:32],
+                dbg_regs_flat[15*32+:32]);
+        if (core_pc_flat[31:0] == 32'h00FC_1716)
+            $display("[ALLOC-SPLIT] r=%0d D0=%0d A0=%h SP=%h",
+                retired_flat[31:0],
+                dbg_regs_flat[0+:32],
+                dbg_regs_flat[8*32+:32],
+                dbg_regs_flat[15*32+:32]);
+    end
+`endif
+
+`ifdef CHIP_MC_WATCH
+    always @(posedge clk) if (rst_n) begin
+        // Inner watch: free-list header at $1998..$19A7 (kept for
+        // backwards compat with prior session logs).
+        if (snoop_valid &&
+            snoop_addr >= 32'h0000_1998 && snoop_addr <= 32'h0000_19A7) begin
+            $display("[CHIP-MC-WR-PC] r=%0d src=%0d cpu_pc=%h snoop_addr=%h",
+                retired_flat[31:0], snoop_src_id,
+                core_pc_flat[31:0], snoop_addr);
+        end
+        // Wider watch: the chip-RAM MemHeader at $400..$41F covers
+        // both MH_FIRST ($410) and MH_FREE ($41C).  Catches every
+        // AllocMem/FreeMem update to the chain head + accounting.
+        if (snoop_valid &&
+            snoop_addr >= 32'h0000_0400 && snoop_addr <= 32'h0000_041F) begin
+            $display("[MH-WR-PC] r=%0d src=%0d cpu_pc=%h snoop_addr=%h",
+                retired_flat[31:0], snoop_src_id,
+                core_pc_flat[31:0], snoop_addr);
+        end
+        // Even narrower: the orphaned chunk header at $4CA60..$4CA67.
+        // We KNOW $4CA64 transitions from 210336 to 0 between
+        // r=11150000 and r=11150500 — this catches the exact PC of
+        // the corrupting write.
+        if (snoop_valid &&
+            snoop_addr >= 32'h0000_4CA60 && snoop_addr <= 32'h0000_4CA67) begin
+            $display("[CA60-WR-PC] r=%0d src=%0d cpu_pc=%h snoop_addr=%h",
+                retired_flat[31:0], snoop_src_id,
+                core_pc_flat[31:0], snoop_addr);
+        end
+        // Window probe: every src=2 (blitter) write in the corruption
+        // window r=11140000..11155000 covering full blit sequence.
+        if (snoop_valid && snoop_src_id == 2 &&
+            retired_flat[31:0] >= 32'd11140000 &&
+            retired_flat[31:0] <= 32'd11155000 &&
+            snoop_addr < 32'h0008_0000) begin
+            $display("[BLT-WIN] r=%0d snoop_addr=%h",
+                retired_flat[31:0], snoop_addr);
+        end
+    end
+`endif
+    // ----------------------------------------------------------------
     // Snapshot-at-PC breakpoint.
     //
     // Set +snap_pc=0xFEA970 +snap_dir=build_kick_boot/snap on the
