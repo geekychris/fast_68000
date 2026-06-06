@@ -534,6 +534,45 @@ crosscheck-minimig-cop: $(MINIMIG_COP_BUILD)/Vminimig_cop_xcheck_top
 	@(cd $(MINIMIG_COP_BUILD) && ./Vminimig_cop_xcheck_top) | tee $(MINIMIG_COP_BUILD)/last.log
 
 # ---------------------------------------------------------------------------
+# Minimig fullsys Phase 0 — smoke test for the m68k_core-based testbench.
+# Builds tb/minimig_fullsys_top.sv hosting our CPU + minimal bus arbiter +
+# flat memory model + K1.3 ROM.  Phase 0 deliverable: prove m68k_core can
+# boot K1.3 ROM in a NEW testbench (not via the existing m68k_top stack).
+# See docs/MINIMIG_FULLSYS_PLAN.md.
+# ---------------------------------------------------------------------------
+FULLSYS_BUILD := build_fullsys
+ROMFILE ?= kickstart/kick_13.bin
+
+minimig-fullsys: $(FULLSYS_BUILD)/Vminimig_fullsys_top
+$(FULLSYS_BUILD)/Vminimig_fullsys_top: \
+        $(TB_DIR)/minimig_fullsys_top.sv \
+        $(TB_DIR)/minimig_fullsys_main.cpp \
+        $(RTL_DIR)/m68k_core.v \
+        $(RTL_DIR)/m68k_decoder.v \
+        $(RTL_DIR)/m68k_alu.v \
+        $(RTL_DIR)/m68k_regfile.v
+	@mkdir -p $(FULLSYS_BUILD)
+	@if [ ! -f "$(ROMFILE)" ]; then \
+	    echo "ROMFILE=$(ROMFILE) does not exist."; exit 1; \
+	fi
+	$(PYTHON) tools/bin2rom.py --mem-words 65536 $(ROMFILE) $(FULLSYS_BUILD)/rom.hex
+	$(VERILATOR) -Wno-fatal --cc --exe --build --no-timing \
+	    +define+KICKSTART_BOOT $(FULLSYS_DEFS) --noassert -CFLAGS "-std=c++17 -O1" \
+	    -I$(RTL_DIR) -GMEM_HEXFILE_ROM='"rom.hex"' \
+	    --top-module minimig_fullsys_top \
+	    -Mdir $(FULLSYS_BUILD) \
+	    -o Vminimig_fullsys_top \
+	    $(TB_DIR)/minimig_fullsys_top.sv \
+	    $(RTL_DIR)/m68k_core.v \
+	    $(RTL_DIR)/m68k_decoder.v \
+	    $(RTL_DIR)/m68k_alu.v \
+	    $(RTL_DIR)/m68k_regfile.v \
+	    $(TB_DIR)/minimig_fullsys_main.cpp
+
+fullsys-smoke: $(FULLSYS_BUILD)/Vminimig_fullsys_top
+	@(cd $(FULLSYS_BUILD) && ./Vminimig_fullsys_top) | tee $(FULLSYS_BUILD)/last.log
+
+# ---------------------------------------------------------------------------
 # C multicore demos.  Each demos/c/*.c is compiled inside the m68k-elf-gcc
 # Docker image (tools/cc68k/) and run through the default 2-core build.
 # Each demo halts every core with a halt code (0 = pass).
