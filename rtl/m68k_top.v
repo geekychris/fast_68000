@@ -919,6 +919,72 @@ module m68k_top #(
     end
 `endif
 
+`ifdef BLT_DISPATCH_TRACE
+    // Trace the K1.3 graphics.library blit-queue dispatcher at $FC7600.
+    // This is the function that pops a 28-byte blit-config struct from
+    // a queue and writes BLTBPT/BLTCPT/BLTDPT/BLTAMOD/BLTSIZE.  In our
+    // sim with boing-disk, it issues the corrupting blit at r=11.15M
+    // with bltdpt=$4CA38.  In FS-UAE-no-UAEFS it NEVER fires (proven
+    // 2026-06-05 tenth session) — so finding what calls it pins down
+    // the chipset divergence.
+    //
+    // Snapshot: PC entry + A0 (chipset base) + A1 (queue head?)
+    //         + A2 (config struct ptr) + SP (caller's return frame)
+    //         + CALLER PC = mem[SP] (read directly from chip/slow).
+    //         + BLTDPT = mem[A2+$14] (read from chip/slow).
+    //
+    // Address-bank routing for the offline-dump-free read:
+    //   - addr < $80000  -> chip RAM (u_bus.mem[])
+    //   - $C00000..$C80000 -> slow RAM (u_bus.slowmem[])
+    //   - other  -> 0
+    // Read a 16-bit word from an address.  Routes to chip or slow RAM.
+    function [15:0] read_mem_w;
+        input [31:0] a;
+        reg [31:0] aw;
+        reg [31:0] full;
+        begin
+            aw = a & 32'hFFFFFFFE;          // word-aligned
+            if (aw < 32'h0008_0000) begin
+                full = u_bus.mem[aw[18:2]];
+            end else if (aw >= 32'h00C0_0000 && aw < 32'h00C8_0000) begin
+                full = u_bus.slowmem[(aw - 32'h00C0_0000) >> 2];
+            end else begin
+                full = 32'h0;
+            end
+            // Word slot within the longword: bit 1 = 0 -> high, bit 1 = 1 -> low
+            read_mem_w = aw[1] ? full[15:0] : full[31:16];
+        end
+    endfunction
+
+    // Read a 32-bit longword (potentially crossing two longword slots).
+    function [31:0] read_mem_l;
+        input [31:0] a;
+        begin
+            read_mem_l = {read_mem_w(a), read_mem_w(a + 32'd2)};
+        end
+    endfunction
+    reg [31:0] dbg_sp, dbg_a2, dbg_caller_pc, dbg_bltdpt;
+    always @(posedge clk) if (rst_n) begin
+        // Probe a few insns in, AFTER the push has committed.  Picked
+        // $FC7606 which is the second insn of the dispatcher ($FC7600
+        // sets BLTAFWM, $FC7606 moves BLTBPT from struct).  By then the
+        // stack writeback is settled.
+        if (core_pc_flat[31:0] == 32'h00FC_7606) begin
+            dbg_sp = dbg_regs_flat[15*32+:32];
+            dbg_a2 = dbg_regs_flat[10*32+:32];
+            dbg_caller_pc = read_mem_l(dbg_sp);
+            dbg_bltdpt = read_mem_l(dbg_a2 + 32'h14);
+            $display("[BLT_DISP] r=%0d A0=%h A1=%h A2=%h A6=%h SP=%h caller_pc=%h bltdpt=%h",
+                retired_flat[31:0],
+                dbg_regs_flat[8*32+:32],     // A0
+                dbg_regs_flat[9*32+:32],     // A1
+                dbg_a2,                      // A2
+                dbg_regs_flat[14*32+:32],    // A6
+                dbg_sp, dbg_caller_pc, dbg_bltdpt);
+        end
+    end
+`endif
+
 `ifdef CHIP_MC_WATCH
     always @(posedge clk) if (rst_n) begin
         // Inner watch: free-list header at $1998..$19A7 (kept for
