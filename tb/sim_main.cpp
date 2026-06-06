@@ -555,10 +555,27 @@ static int run_regression(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
             printf("[sim]   $%08X <- $%08X\n", pp.first, pp.second);
     }
 
+    // MEM_POKE_AT_PC=hex — alternative trigger to MEM_POKE_CYCLE.  When
+    // set, arms the poke loop to fire as soon as core 0's PC first
+    // reaches this 24-bit value (rising edge, single fire).  Useful for
+    // patching chip-RAM free-list state at a known boot moment without
+    // needing to know cycle-count precision (which varies with
+    // STOP-fast-forward + DMA contention).
+    bool     poke_armed_by_pc = false;
+    uint32_t poke_trigger_pc  = 0;
+    if (const char* s = std::getenv("MEM_POKE_AT_PC")) {
+        if (s[0] == '$') s++;
+        poke_trigger_pc  = (uint32_t)std::strtoul(s, nullptr, 16) & 0xFFFFFFu;
+        poke_armed_by_pc = !pokes.empty();
+        if (poke_armed_by_pc)
+            printf("[sim] MEM_POKE_AT_PC=$%06X (overrides MEM_POKE_CYCLE)\n",
+                   poke_trigger_pc);
+    }
+
     uint32_t host_tail = 0;
     uint64_t cycle = 0;
     size_t   poke_idx = 0;
-    uint64_t poke_next_cycle = poke_cycle;
+    uint64_t poke_next_cycle = poke_armed_by_pc ? ~0ULL : poke_cycle;
 
     // CHIPRAM_SNAP_PCS - PC-triggered chip-RAM snapshot list.
     //
@@ -825,6 +842,21 @@ static int run_regression(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
 
         // gdbserver: after each clock advance, check breakpoints / step.
         if (gdb.enabled()) gdb.notify_step(top, cycle);
+
+        // MEM_POKE_AT_PC: arm the poke loop on first rising-edge entry
+        // into the trigger PC.  After that, the per-cycle poke loop runs
+        // normally from the current cycle, one poke per cycle.
+        if (poke_armed_by_pc) {
+            const uint32_t* pc_arr =
+                reinterpret_cast<const uint32_t*>(&top->core_pc_flat);
+            uint32_t cur_pc = pc_arr[0] & 0xFFFFFFu;
+            if (cur_pc == poke_trigger_pc) {
+                poke_next_cycle  = cycle;
+                poke_armed_by_pc = false;
+                printf("[sim] MEM_POKE_AT_PC fired at cycle %llu (pc=$%06X)\n",
+                       (unsigned long long)cycle, cur_pc);
+            }
+        }
 
         // CHIPRAM_SNAP: check core 0's EX-stage PC each cycle.  Fire on
         // the rising edge (PC transitions INTO a configured value) so a

@@ -1245,36 +1245,36 @@ demo-real-boing: kickstart/boing_disk.adf
 	@if command -v open >/dev/null 2>&1; then open /tmp/boing_disk.png; fi
 
 # ---------------------------------------------------------------------------
-# demo-real-boing-patched: HACK target that pre-patches the K1.3 chip-RAM
-# free-list to push boing's 49,896-byte audio buffer past the dangerous
-# $4CA60 region.  See docs/BOOT_AND_PORTING.md "Boing heap-layout race".
+# demo-real-boing-patched: HACK target — pre-patches the K1.3 chip-RAM
+# free-list at the first K1.3 idle (PC=$FC0F94) to redirect MH_FIRST past
+# the corrupting-blit region.  Uses MEM_POKE_AT_PC (PC-triggered MEM_POKE,
+# see tb/sim_main.cpp).
 #
-# Background: with FSUAE_NO_UAEFS=1 + same K1.3 ROM + same boing-disk ADF,
-# FS-UAE places boing's audio buffer at chip $4B3E0+ (because UAE Boot ROM
-# pre-consumes ~$30000 bytes of chip RAM).  Our bare-A500 sim doesn't have
-# that consumer, so the same allocation lands at $11C38 — and a later
-# graphics.library blit at $FC761A clears $4CA38-$4CBC9, corrupting the
-# free-chunk header at $4CA60 → orphans 210 KB → AllocMem fails → boing
-# crashes to Romwack.  See `project_boing_chip_freelist.md` sixteenth
-# session for the full diagnosis.
+# **DOES NOT WORK as a standalone fix.**  Empirical confirmation (session 17):
+# even with the poke firing cleanly at cycle 5.97M, boing still doesn't
+# render.  Two independent problems:
 #
-# The patches below rewrite the chip free-list at cycle 30M (after K1.3
-# init, before boing's allocs at retired ~8.8M) so that MH_FIRST chains
-# directly to a chunk at $4B3E0 — orphaning the lower-address chunks so
-# boing's CHIP alloc lands at $4B3E0+ and covers $4CA60 with its own
-# (harmless) audio sample data.
+# 1. K1.3 does many small allocs between the first idle and boing's
+#    49,896-byte alloc at r=8.82M, draining the pre-consumed chunk
+#    (starts at $4B3E0 size $34040, ends ~5KB by boing time).
+# 2. `boing.samples` doesn't load into chip RAM in the first place.
+#    The 49KB audio buffer at $4C800+ contains ~30 bytes of partial
+#    garbage instead of the smooth waveform FS-UAE-no-UAEFS produces.
+#    Trackdisk / MFM-decode failure — see task #176.
 #
-# **THIS IS A HACK.**  Values are heuristic — heap state at patch time
-# may differ between runs.  Task #174 captures the proper fix
-# (implement chip-RAM autoconfig consumer that mimics UAE Boot ROM
-# pre-allocations).  Use this target only for screenshot/demo work.
+# So the HACK target's premise (chip-RAM pre-consumption alone fixes
+# boing) is incomplete.  Real fix needs BOTH (a) trackdisk MFM-decode for
+# boing.samples AND (b) heap layout matching UAE Boot ROM's consumption
+# pattern.  Kept here as a placeholder + a demonstration of the
+# MEM_POKE_AT_PC infrastructure.  See `project_boing_chip_freelist.md`
+# for the long-form diagnosis.
 demo-real-boing-patched: kickstart/boing_disk.adf
 	@rm -rf build_kick_boot
 	BOOT_TRACE=0 CHIPRAM_DUMP=/tmp/boing_disk_chip.bin SLOWRAM_DUMP=/tmp/boing_disk_slow.bin \
 	    MEM_POKE="0x19A0=0x0004B3E0,0x4B3E0=0x00000000,0x4B3E4=0x00034040,0x10170=0x00000000" \
-	    MEM_POKE_CYCLE=30000000 \
+	    MEM_POKE_AT_PC=0xFC0F94 \
 	    $(MAKE) --no-print-directory test-kickstart-boot \
-	    ADFFILE=kickstart/boing_disk.adf 2>&1 | tail -5 || true
+	    ADFFILE=kickstart/boing_disk.adf 2>&1 | tail -10 || true
 	$(PYTHON) tools/render_k13_screen.py \
 	    --chipram /tmp/boing_disk_chip.bin --slowram /tmp/boing_disk_slow.bin \
 	    --width 640 --height 200 --out /tmp/boing_disk_patched.png
