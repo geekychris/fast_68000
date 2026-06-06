@@ -10,6 +10,23 @@ index 234a66e32..e7755ce5a 100644
  	src/custom.cpp \
  	src/debug.cpp \
  	src/debuginfo.cpp \
+diff --git a/include/uae.h b/include/uae.h
+index 2f0a91840..bf0ca04b4 100644
+--- a/include/uae.h
++++ b/include/uae.h
+@@ -16,9 +16,9 @@ extern void start_program (void);
+ extern void leave_program (void);
+ extern void real_main (int, TCHAR **);
+ extern void usage (void);
+-extern int sleep_millis (int ms);
+-extern int sleep_millis_main(int ms);
+-extern int sleep_millis_amiga(int ms);
++extern void sleep_millis (int ms);
++extern void sleep_millis_main(int ms);
++extern void sleep_millis_amiga(int ms);
+ extern void sleep_cpu_wakeup(void);
+ extern int sleep_resolution;
+ 
 diff --git a/src/debug.cpp b/src/debug.cpp
 index 18cb5e0b4..48249bf8c 100644
 --- a/src/debug.cpp
@@ -114,6 +131,28 @@ index 18cb5e0b4..48249bf8c 100644
  
  			if (skipaddr_doskip) {
  				if (skipaddr_start == pc)
+diff --git a/src/expansion.cpp b/src/expansion.cpp
+index 5e739a679..930a3979c 100644
+--- a/src/expansion.cpp
++++ b/src/expansion.cpp
+@@ -2105,6 +2105,17 @@ void expamem_reset (void)
+ 	if (uae_boot_rom_type <= 0)
+ 		do_mount = 0;
+ 
++	/* claude_rpc: FSUAE_NO_UAEFS=1 suppresses the K1.2/1.3-specific
++	 * filesys_bank mapping (KS12_BOOT_HACK) so K1.3 doesn't see the
++	 * UAE FS autoconfig card.  Used for apples-to-apples alloc-trace
++	 * comparison against bare-A500 RTL implementations. */
++	{
++		const char *no_uaefs = getenv("FSUAE_NO_UAEFS");
++		if (no_uaefs && (no_uaefs[0]=='1' || no_uaefs[0]=='y' || no_uaefs[0]=='Y')) {
++			do_mount = 0;
++			write_log("[claude_rpc] FSUAE_NO_UAEFS=1: suppressed UAEFS\n");
++		}
++	}
+ 	/* check if Kickstart version is below 1.3 */
+ 	if (ks12orolder() && do_mount) {
+ 		/* warn user */
 diff --git a/src/main.cpp b/src/main.cpp
 index 7040dfe42..59e166245 100644
 --- a/src/main.cpp
@@ -135,20 +174,3 @@ index 7040dfe42..59e166245 100644
  		start_program ();
  	}
  	return 0;
-diff --git a/include/uae.h b/include/uae.h
-index 2f0a91840..bf0ca04b4 100644
---- a/include/uae.h
-+++ b/include/uae.h
-@@ -16,9 +16,9 @@ extern void start_program (void);
- extern void leave_program (void);
- extern void real_main (int, TCHAR **);
- extern void usage (void);
--extern int sleep_millis (int ms);
--extern int sleep_millis_main(int ms);
--extern int sleep_millis_amiga(int ms);
-+extern void sleep_millis (int ms);
-+extern void sleep_millis_main(int ms);
-+extern void sleep_millis_amiga(int ms);
- extern void sleep_cpu_wakeup(void);
- extern int sleep_resolution;
- 
