@@ -105,8 +105,11 @@ test:
 	echo "Result: $$pass passed, $$fail failed"; \
 	[ $$fail -eq 0 ]
 
-# All tests including special-build OVL test.
-test-all: test test-ovl test-dma-snoop
+# All tests including special-build OVL test + minimig crosschecks.
+# The crosscheck-minimig-{blt,cop} targets exit non-zero on any divergence
+# from minimig's reference modules, so they act as regression guards on
+# any chipset-RTL change.
+test-all: test test-ovl test-dma-snoop crosscheck-minimig-blt crosscheck-minimig-cop
 
 # ---------------------------------------------------------------------------
 # External Musashi 68000 core (https://github.com/kstenerud/Musashi).  Fetched
