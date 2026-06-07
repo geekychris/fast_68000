@@ -546,6 +546,7 @@ ROMFILE ?= kickstart/kick_13.bin
 minimig-fullsys: $(FULLSYS_BUILD)/Vminimig_fullsys_top
 $(FULLSYS_BUILD)/Vminimig_fullsys_top: \
         $(TB_DIR)/minimig_fullsys_top.sv \
+        $(TB_DIR)/m68k_to_amiga_bus.sv \
         $(TB_DIR)/minimig_fullsys_main.cpp \
         $(RTL_DIR)/m68k_core.v \
         $(RTL_DIR)/m68k_decoder.v \
@@ -563,6 +564,7 @@ $(FULLSYS_BUILD)/Vminimig_fullsys_top: \
 	    -Mdir $(FULLSYS_BUILD) \
 	    -o Vminimig_fullsys_top \
 	    $(TB_DIR)/minimig_fullsys_top.sv \
+	    $(TB_DIR)/m68k_to_amiga_bus.sv \
 	    $(RTL_DIR)/m68k_core.v \
 	    $(RTL_DIR)/m68k_decoder.v \
 	    $(RTL_DIR)/m68k_alu.v \
