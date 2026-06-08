@@ -109,17 +109,52 @@ module minimig_phase1_top (
         .dtack_n    (cpu_dtack_n)
     );
 
-    // ---------------- Clock enables (minimig expects 28 MHz w/ 7 MHz en) -----
-    // Simplest: drive all enables high every cycle.  This makes minimig's
-    // chipset run at the master clock rate, which is wrong-but-functional
-    // for early bring-up.  TODO: implement proper 4:1 7 MHz enable + c1/c3
-    // / cck cycle.
-    wire clk7_en   = 1'b1;
-    wire clk7n_en  = 1'b1;
-    wire c1        = 1'b1;
-    wire c3        = 1'b0;
-    wire cck       = 1'b1;
-    wire [9:0] eclk = 10'b1000000000;
+    // ---------------- Clock enables (mirrors external/minimig/rtl/clock/amiga_clk.v) -----
+    // Real Amiga: 28.37516 MHz master, 7 MHz CPU, c1/c3 quadrature phases.
+    // We treat our `clk` as the 28 MHz clock; clk7_en pulses every 4
+    // cycles (28/4 = 7 MHz), clk7n_en is 180° out of phase.
+    reg [1:0] clk7_cnt;
+    reg       clk7_en_r, clk7n_en_r;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            clk7_cnt    <= 2'b10;
+            clk7_en_r   <= 1'b1;
+            clk7n_en_r  <= 1'b1;
+        end else begin
+            clk7_cnt    <= clk7_cnt + 2'b01;
+            clk7_en_r   <= (clk7_cnt == 2'b00);
+            clk7n_en_r  <= (clk7_cnt == 2'b10);
+        end
+    end
+    wire clk7_en   = clk7_en_r;
+    wire clk7n_en  = clk7n_en_r;
+
+    // c3 = clk_7 delayed 1 cycle.  c1 = ~c3 delayed 1 cycle.
+    wire clk_7 = clk7_cnt[1];
+    reg  c3_r, c1_r;
+    always @(posedge clk) begin
+        c3_r <= clk_7;
+        c1_r <= ~c3_r;
+    end
+    wire c1 = c1_r;
+    wire c3 = c3_r;
+
+    // cck: 3.54 MHz (~half of 7 MHz).  Toggled every clk7_en pulse.
+    reg cck_r;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)            cck_r <= 1'b0;
+        else if (clk7_en_r)    cck_r <= ~cck_r;
+    end
+    wire cck = cck_r;
+
+    // eclk: 1/10 of CLK (ECLK enable pattern from amiga_clk.v).
+    // Cycles through 10 states with one position hot.
+    reg [9:0] eclk_r;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)         eclk_r <= 10'b1000000000;
+        else if (clk7_en_r) eclk_r <= {eclk_r[8:0], eclk_r[9]};
+    end
+    wire [9:0] eclk = eclk_r;
 
     // ---------------- SRAM model ----------------
     // minimig drives [21:1] ram_address.  A 2 MiB address space, with
