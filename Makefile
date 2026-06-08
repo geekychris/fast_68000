@@ -575,6 +575,47 @@ fullsys-smoke: $(FULLSYS_BUILD)/Vminimig_fullsys_top
 	@(cd $(FULLSYS_BUILD) && ./Vminimig_fullsys_top) | tee $(FULLSYS_BUILD)/last.log
 
 # ---------------------------------------------------------------------------
+# Minimig fullsys Phase 1a — instantiate REAL minimig.v with our CPU
+# driving its cpu_* bus.  Pulls in the whole external/minimig/rtl/minimig
+# subdirectory.  Phase 1a goal: get it to compile + run a few cycles.
+# Real K1.3 boot reachability comes in 1b/1c.
+# ---------------------------------------------------------------------------
+PHASE1_BUILD := build_phase1
+minimig-phase1: $(PHASE1_BUILD)/Vminimig_phase1_top
+$(PHASE1_BUILD)/Vminimig_phase1_top: \
+        $(TB_DIR)/minimig_phase1_top.sv \
+        $(TB_DIR)/m68k_to_amiga_bus.sv \
+        $(TB_DIR)/minimig_phase1_main.cpp \
+        $(RTL_DIR)/m68k_core.v
+	@mkdir -p $(PHASE1_BUILD)
+	@if [ ! -f "$(ROMFILE)" ]; then \
+	    echo "ROMFILE=$(ROMFILE) does not exist."; exit 1; \
+	fi
+	$(PYTHON) tools/bin2rom.py --mem-words 65536 $(ROMFILE) $(PHASE1_BUILD)/rom.hex
+	$(VERILATOR) -Wno-fatal -Wno-WIDTH -Wno-UNOPTFLAT -Wno-CASEINCOMPLETE \
+	    -Wno-UNUSED -Wno-MULTIDRIVEN -Wno-INITIALDLY \
+	    --cc --exe --build --no-timing \
+	    +define+KICKSTART_BOOT --noassert -CFLAGS "-std=c++17 -O1" \
+	    -I$(RTL_DIR) -I$(MINIMIG_DIR)/rtl/minimig \
+	    -GMEM_HEXFILE_ROM='"rom.hex"' \
+	    --top-module minimig_phase1_top \
+	    -Mdir $(PHASE1_BUILD) \
+	    -o Vminimig_phase1_top \
+	    -y $(MINIMIG_DIR)/rtl/minimig \
+	    -y $(MINIMIG_DIR)/rtl/fifo \
+	    $(TB_DIR)/minimig_phase1_top.sv \
+	    $(TB_DIR)/m68k_to_amiga_bus.sv \
+	    $(TB_DIR)/altsyncram_stub.v \
+	    $(RTL_DIR)/m68k_core.v \
+	    $(RTL_DIR)/m68k_decoder.v \
+	    $(RTL_DIR)/m68k_alu.v \
+	    $(RTL_DIR)/m68k_regfile.v \
+	    $(TB_DIR)/minimig_phase1_main.cpp
+
+phase1-smoke: $(PHASE1_BUILD)/Vminimig_phase1_top
+	@(cd $(PHASE1_BUILD) && ./Vminimig_phase1_top) | tee $(PHASE1_BUILD)/last.log
+
+# ---------------------------------------------------------------------------
 # C multicore demos.  Each demos/c/*.c is compiled inside the m68k-elf-gcc
 # Docker image (tools/cc68k/) and run through the default 2-core build.
 # Each demo halts every core with a halt code (0 = pass).

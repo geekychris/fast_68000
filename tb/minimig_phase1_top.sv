@@ -1,0 +1,251 @@
+// Minimig fullsys Phase 1: instantiate REAL minimig.v with our
+// m68k_core driving its CPU bus.
+//
+// Phase 1a goal: get the integration to compile + run with all
+// minimig sub-modules pulled in.  Boot may not progress past Phase
+// 0.5's chipset-stub limit, but compiling proves the port-mapping
+// surface is correct.
+//
+// All "uninteresting" minimig ports (PS2, SPI, video, audio, joystick,
+// OSD) are tied off to safe defaults.  We drive only what's needed
+// for K1.3 to execute: CPU bus, SRAM bus (for chip RAM + ROM), clocks,
+// reset.
+
+module minimig_phase1_top (
+    input  wire        clk,            // ~28 MHz (we drive 1:1 for now)
+    input  wire        rst_n,
+    output wire [31:0] cur_pc,
+    output wire [31:0] retired,
+    output wire        halted,
+    output wire [15:0] halt_code,
+    output wire        cpu_in_stop
+);
+
+    parameter MEM_HEXFILE_ROM = "rom.hex";
+
+    // ---------------- CPU ----------------
+    wire        ic_req, ic_we, ic_lock;
+    wire [31:0] ic_addr, ic_wdata;
+    wire [3:0]  ic_be;
+    wire        ic_ack;
+    wire [31:0] ic_rdata;
+
+    wire        dc_req, dc_we, dc_lock;
+    wire [31:0] dc_addr, dc_wdata;
+    wire [3:0]  dc_be;
+    wire        dc_is_long;
+    wire        dc_ack;
+    wire [31:0] dc_rdata;
+
+    // Convert minimig's [2:0]_cpu_ipl (active low) to our [2:0] ipl_i
+    // (active high).
+    wire [2:0] cpu_ipl_n;
+    wire [2:0] ipl_i_eff = ~cpu_ipl_n;
+
+    m68k_core u_cpu (
+        .clk           (clk),
+        .rst_n         (rst_n),
+        .reset_a7      (32'h0000_4000),
+        .ipl_i         (ipl_i_eff),
+        .ic_req        (ic_req),
+        .ic_we         (ic_we),
+        .ic_lock       (ic_lock),
+        .ic_addr       (ic_addr),
+        .ic_wdata      (ic_wdata),
+        .ic_be         (ic_be),
+        .ic_ack        (ic_ack),
+        .ic_rdata      (ic_rdata),
+        .dc_req        (dc_req),
+        .dc_we         (dc_we),
+        .dc_lock       (dc_lock),
+        .dc_addr       (dc_addr),
+        .dc_wdata      (dc_wdata),
+        .dc_be         (dc_be),
+        .dc_is_long    (dc_is_long),
+        .dc_ack        (dc_ack),
+        .dc_rdata      (dc_rdata),
+        .halted        (halted),
+        .halt_code     (halt_code),
+        .retired       (retired),
+        .cpu_in_stop   (cpu_in_stop),
+        .cur_pc        (cur_pc),
+        .dbg_regs_flat (),
+        .dbg_sr        ()
+    );
+
+    // ---------------- Bus adapter (CPU → 68000-style) ----------------
+    wire [23:1] cpu_address;
+    wire [15:0] cpudata_in;     // CPU → minimig
+    wire [15:0] cpu_data;       // minimig → CPU
+    wire        cpu_as_n;
+    wire        cpu_uds_n;
+    wire        cpu_lds_n;
+    wire        cpu_rw;
+    wire        cpu_dtack_n;
+
+    m68k_to_amiga_bus u_bus_adapter (
+        .clk        (clk),
+        .rst_n      (rst_n),
+        .ic_req     (ic_req),
+        .ic_addr    (ic_addr),
+        .ic_be      (ic_be),
+        .ic_ack     (ic_ack),
+        .ic_rdata   (ic_rdata),
+        .dc_req     (dc_req),
+        .dc_we      (dc_we),
+        .dc_addr    (dc_addr),
+        .dc_wdata   (dc_wdata),
+        .dc_be      (dc_be),
+        .dc_is_long (dc_is_long),
+        .dc_ack     (dc_ack),
+        .dc_rdata   (dc_rdata),
+        .addr_o     (cpu_address),
+        .data_o     (cpudata_in),
+        .data_i     (cpu_data),
+        .as_n       (cpu_as_n),
+        .uds_n      (cpu_uds_n),
+        .lds_n      (cpu_lds_n),
+        .rw         (cpu_rw),
+        .dtack_n    (cpu_dtack_n)
+    );
+
+    // ---------------- Clock enables (minimig expects 28 MHz w/ 7 MHz en) -----
+    // Simplest: drive all enables high every cycle.  This makes minimig's
+    // chipset run at the master clock rate, which is wrong-but-functional
+    // for early bring-up.  TODO: implement proper 4:1 7 MHz enable + c1/c3
+    // / cck cycle.
+    wire clk7_en   = 1'b1;
+    wire clk7n_en  = 1'b1;
+    wire c1        = 1'b1;
+    wire c3        = 1'b0;
+    wire cck       = 1'b1;
+    wire [9:0] eclk = 10'b1000000000;
+
+    // ---------------- SRAM model ----------------
+    // minimig drives [21:1] ram_address.  A 2 MiB address space, with
+    // chip RAM in low region and ROM mapped near the top by minimig's
+    // bank mapper.  Phase 1a just gives it 2 MiB of flat memory and
+    // pre-loads ROM at the top quadrant where the bank mapper expects it.
+    wire [15:0] ram_data;        // minimig → SRAM
+    wire [15:0] ramdata_in;      // SRAM → minimig
+    wire [21:1] ram_address;
+    wire        ram_bhe_n, ram_ble_n, ram_we_n, ram_oe_n;
+
+    reg [15:0] sram [0:2097151];  // 2 MiB / 2 = 1Mi words
+    initial begin
+        if (MEM_HEXFILE_ROM != "")
+            $readmemh(MEM_HEXFILE_ROM, sram, 21'h180000);  // load ROM at $300000-$37FFFF (word addr)
+    end
+
+    // SRAM read/write logic.
+    reg [15:0] sram_rdata_q;
+    always @(posedge clk) begin
+        if (!ram_oe_n && ram_we_n) begin
+            sram_rdata_q <= sram[ram_address];
+        end
+        if (!ram_we_n) begin
+            if (!ram_bhe_n) sram[ram_address][15:8] <= ram_data[15:8];
+            if (!ram_ble_n) sram[ram_address][7:0]  <= ram_data[7:0];
+        end
+    end
+    assign ramdata_in = sram_rdata_q;
+
+    // ---------------- minimig.v ----------------
+    minimig u_minimig (
+        // m68k pins
+        .cpu_address    (cpu_address),
+        .cpu_data       (cpu_data),
+        .cpudata_in     (cpudata_in),
+        ._cpu_ipl       (cpu_ipl_n),
+        ._cpu_as        (cpu_as_n),
+        ._cpu_uds       (cpu_uds_n),
+        ._cpu_lds       (cpu_lds_n),
+        .cpu_r_w        (cpu_rw),
+        ._cpu_dtack     (cpu_dtack_n),
+        ._cpu_reset     (),
+        ._cpu_reset_in  (rst_n),
+        .cpu_vbr        (32'd0),
+        .ovr            (),
+
+        // sram pins
+        .ram_data       (ram_data),
+        .ramdata_in     (ramdata_in),
+        .ram_address    (ram_address),
+        ._ram_bhe       (ram_bhe_n),
+        ._ram_ble       (ram_ble_n),
+        ._ram_we        (ram_we_n),
+        ._ram_oe        (ram_oe_n),
+        .chip48         (48'd0),
+
+        // system pins
+        .rst_ext        (~rst_n),
+        .rst_out        (),
+        .clk            (clk),
+        .clk7_en        (clk7_en),
+        .clk7n_en       (clk7n_en),
+        .c1             (c1),
+        .c3             (c3),
+        .cck            (cck),
+        .eclk           (eclk),
+
+        // rs232 — tie off
+        .rxd            (1'b1),
+        .txd            (),
+        .cts            (1'b1),
+        .rts            (),
+
+        // I/O — tie off
+        ._joy1          (8'hFF),
+        ._joy2          (8'hFF),
+        .mouse_btn1     (1'b1),
+        .mouse_btn2     (1'b1),
+        .mouse_btn      (3'b111),
+        .kbd_mouse_strobe (1'b0),
+        .kms_level      (1'b0),
+        .kbd_mouse_type (2'b00),
+        .kbd_mouse_data (8'h00),
+        ._15khz         (1'b1),
+        .pwrled         (),
+        .msdat          (),
+        .msclk          (),
+        .kbddat         (),
+        .kbdclk         (),
+
+        // SPI — tie off (no disk for Phase 1a)
+        ._scs           (3'b111),
+        .direct_sdi     (1'b0),
+        .sdi            (1'b0),
+        .sdo            (),
+        .sck            (1'b0),
+
+        // video — unused outputs
+        ._hsync         (),
+        ._vsync         (),
+        .red            (),
+        .green          (),
+        .blue           (),
+
+        // audio — unused outputs
+        .left           (),
+        .right          (),
+        .ldata          (),
+        .rdata          (),
+
+        // user i/o — unused outputs
+        .cpu_config     (),
+        .memcfg         (),
+        .turbochipram   (),
+        .turbokick      (),
+        .init_b         (),
+        .fifo_full      (),
+        .trackdisp      (),
+        .secdisp        (),
+        .floppy_fwr     (),
+        .floppy_frd     (),
+        .hd_fwr         (),
+        .hd_frd         ()
+    );
+
+    wire _unused = &{ic_we, ic_lock, ic_wdata, dc_lock, 1'b0};
+
+endmodule
