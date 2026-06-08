@@ -289,17 +289,27 @@ module minimig_phase1_top (
     // sram_bridge in reset, or _ta_n gated by an unprogrammed setting.
 `ifdef PHASE1_PROBE
     reg [31:0] probe_count;
+    reg [31:0] dtack_count;
     reg cpu_as_n_d;
+    reg cpu_dtack_n_d;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             probe_count <= 0;
+            dtack_count <= 0;
             cpu_as_n_d  <= 1'b1;
+            cpu_dtack_n_d <= 1'b1;
         end else begin
             cpu_as_n_d <= cpu_as_n;
+            cpu_dtack_n_d <= cpu_dtack_n;
             if (cpu_as_n_d && !cpu_as_n && probe_count < 20) begin
                 $display("[probe] AS falling: addr=%h rw=%b uds=%b lds=%b cpudata_in=%h",
                     {cpu_address, 1'b0}, cpu_rw, ~cpu_uds_n, ~cpu_lds_n, cpudata_in);
                 probe_count <= probe_count + 1;
+            end
+            if (cpu_dtack_n_d && !cpu_dtack_n && dtack_count < 20) begin
+                $display("[probe] DTACK falling at cycle (addr=%h rdata=%h)",
+                    {cpu_address, 1'b0}, cpu_data);
+                dtack_count <= dtack_count + 1;
             end
         end
     end

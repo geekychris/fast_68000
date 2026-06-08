@@ -595,7 +595,7 @@ $(PHASE1_BUILD)/Vminimig_phase1_top: \
 	$(VERILATOR) -Wno-fatal -Wno-WIDTH -Wno-UNOPTFLAT -Wno-CASEINCOMPLETE \
 	    -Wno-UNUSED -Wno-MULTIDRIVEN -Wno-INITIALDLY \
 	    --cc --exe --build --no-timing \
-	    +define+KICKSTART_BOOT --noassert -CFLAGS "-std=c++17 -O1" \
+	    +define+KICKSTART_BOOT $(PHASE1_DEFS) --noassert -CFLAGS "-std=c++17 -O1" \
 	    -I$(RTL_DIR) -I$(MINIMIG_DIR)/rtl/minimig \
 	    -GMEM_HEXFILE_ROM='"rom.hex"' \
 	    --top-module minimig_phase1_top \
