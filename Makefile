@@ -535,6 +535,35 @@ crosscheck-minimig-cop: $(MINIMIG_COP_BUILD)/Vminimig_cop_xcheck_top
 	@(cd $(MINIMIG_COP_BUILD) && ./Vminimig_cop_xcheck_top) | tee $(MINIMIG_COP_BUILD)/last.log
 
 # ---------------------------------------------------------------------------
+# Phase B/C/D slot reservation unit test — built with SLOT_ACCURATE_AGNUS.
+# Verifies that rtl/chipset/agnus_arbiter.v denies grants on refresh
+# (hpos 0/2/4/6), disk (hpos 7/9/11 when dsk_active), and audio
+# (hpos 13/15/17/19 when AUDxEN) slots, and that off-slot cycles still
+# grant via round-robin.
+# ---------------------------------------------------------------------------
+ARB_BUILD := build_arb_xcheck
+
+agnus-arbiter-xcheck: $(ARB_BUILD)/Vagnus_arbiter_xcheck_top
+$(ARB_BUILD)/Vagnus_arbiter_xcheck_top: \
+        $(RTL_DIR)/chipset/agnus_arbiter.v \
+        $(TB_DIR)/agnus_arbiter_xcheck_top.sv \
+        $(TB_DIR)/agnus_arbiter_xcheck.cpp
+	@mkdir -p $(ARB_BUILD)
+	$(VERILATOR) -Wno-fatal --cc --exe --build --no-timing \
+	    --noassert -CFLAGS "-std=c++17 -O1" \
+	    -I$(RTL_DIR) \
+	    +define+SLOT_ACCURATE_AGNUS \
+	    --top-module agnus_arbiter_xcheck_top \
+	    -Mdir $(ARB_BUILD) \
+	    -o Vagnus_arbiter_xcheck_top \
+	    $(TB_DIR)/agnus_arbiter_xcheck_top.sv \
+	    $(RTL_DIR)/chipset/agnus_arbiter.v \
+	    $(TB_DIR)/agnus_arbiter_xcheck.cpp
+
+crosscheck-arbiter: $(ARB_BUILD)/Vagnus_arbiter_xcheck_top
+	@(cd $(ARB_BUILD) && ./Vagnus_arbiter_xcheck_top) | tee $(ARB_BUILD)/last.log
+
+# ---------------------------------------------------------------------------
 # Minimig fullsys Phase 0 — smoke test for the m68k_core-based testbench.
 # Builds tb/minimig_fullsys_top.sv hosting our CPU + minimal bus arbiter +
 # flat memory model + K1.3 ROM.  Phase 0 deliverable: prove m68k_core can
