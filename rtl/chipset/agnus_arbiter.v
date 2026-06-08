@@ -18,7 +18,10 @@
 
 module agnus_arbiter #(
     parameter N_PORTS  = 4,
-    parameter PID_BITS = 2
+    parameter PID_BITS = 2,
+    // Phase C: ID of the disk DMA port (Paula master in m68k_top
+    // layout, = N_PORTS - 1 for the K1.3 build).
+    parameter DSK_PORT_ID = 3
 ) (
     input  wire                       clk,
     input  wire                       rst_n,
@@ -29,6 +32,10 @@ module agnus_arbiter #(
     // Phase A this was unused.  Tie to 0 if the caller doesn't have
     // it yet — refresh reservation is gated by SLOT_ACCURATE_AGNUS.
     input  wire [9:0]                 hpos,
+    // Phase C: disk DMA is active (DSKEN + DMAEN + DSKLEN != 0).
+    // When high, cycles 7/9/11 of each line are reserved for the disk
+    // port.  When low, those cycles are free.
+    input  wire                       dsk_active,
     output reg  [PID_BITS-1:0]        winner,
     output reg                        winner_valid,
     output reg  [N_PORTS-1:0]         grant
@@ -45,8 +52,14 @@ module agnus_arbiter #(
                            (hpos[8:1] == 8'd1) ||   // hpos = 2 or 3
                            (hpos[8:1] == 8'd2) ||   // hpos = 4 or 5
                            (hpos[8:1] == 8'd3);     // hpos = 6 or 7
+    // Phase C: disk DMA owns cycles 7, 9, 11 (one CCK each) when active.
+    wire is_disk_slot = dsk_active &&
+                        ( (hpos[9:0] == 10'd7)  ||
+                          (hpos[9:0] == 10'd9)  ||
+                          (hpos[9:0] == 10'd11) );
 `else
     wire is_refresh_slot = 1'b0;
+    wire is_disk_slot    = 1'b0;
 `endif
 
     // ---------------- Internal state ----------------
@@ -68,6 +81,16 @@ module agnus_arbiter #(
             // Phase B: deny all grants on refresh slots regardless of
             // pending lock.  A lock_holder will re-win as soon as the
             // next non-refresh cycle arrives.
+            winner = {PID_BITS{1'b0}};
+            winner_valid = 1'b0;
+        end else if (is_disk_slot) begin
+            // Phase C: disk DMA owns this slot.  In our impl the disk
+            // DMA state machine lives inside m68k_bus.v (not behind a
+            // port), so we simply reserve the slot from every
+            // requester.  Real effect: CPU+DMA pause at these cycles
+            // when disk DMA is active, shifting CPU timing relative
+            // to the internal MFM-decode state machine.  That's the
+            // hypothesis test for the cyl-53 trackdisk-rejection wall.
             winner = {PID_BITS{1'b0}};
             winner_valid = 1'b0;
         end else if (lock_pending) begin

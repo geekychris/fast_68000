@@ -771,14 +771,16 @@ module m68k_bus #(
     wire [N_PORTS-1:0]  arb_grant;
 
     agnus_arbiter #(
-        .N_PORTS  (N_PORTS),
-        .PID_BITS (PID_BITS)
+        .N_PORTS     (N_PORTS),
+        .PID_BITS    (PID_BITS),
+        .DSK_PORT_ID (N_PORTS - 1)     // Paula master is last port
     ) u_arb (
         .clk          (clk),
         .rst_n        (rst_n),
         .req          (req),
         .lock         (lock),
         .hpos         (agnus_h),
+        .dsk_active   (blk_busy),       // disk DMA running
         .winner       (winner),
         .winner_valid (winner_valid),
         .grant        (arb_grant)
