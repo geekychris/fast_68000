@@ -22,6 +22,7 @@ RTL_SRCS := $(RTL_DIR)/debug/hw_watch.v \
             $(RTL_DIR)/m68k_cache.v \
             $(RTL_DIR)/m68k_passthrough.v \
             $(RTL_DIR)/m68k_bus.v \
+            $(RTL_DIR)/chipset/agnus_arbiter.v \
             $(RTL_DIR)/chipset/blitter.v \
             $(RTL_DIR)/chipset/copper.v \
             $(RTL_DIR)/chipset/denise.v \

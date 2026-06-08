@@ -759,48 +759,31 @@ module m68k_bus #(
         end
     endgenerate
 
-    // Lock tracking.
-    reg               lock_pending;
-    reg [PID_BITS-1:0] lock_holder;
+    // ------------------------------------------------------------------
+    // Bus arbitration — extracted to rtl/chipset/agnus_arbiter.v as
+    // Phase A of #4 (slot-accurate Agnus arbiter).  See
+    // docs/SLOT_ACCURATE_AGNUS_PLAN.md.  Subsequent phases will
+    // replace this module's body with slot-position-aware priority
+    // without touching the surrounding bus logic.
+    // ------------------------------------------------------------------
+    wire [PID_BITS-1:0] winner;
+    wire                winner_valid;
+    wire [N_PORTS-1:0]  arb_grant;
 
-    // Round-robin pointer.
-    reg [PID_BITS-1:0] rrobin;
+    agnus_arbiter #(
+        .N_PORTS  (N_PORTS),
+        .PID_BITS (PID_BITS)
+    ) u_arb (
+        .clk          (clk),
+        .rst_n        (rst_n),
+        .req          (req),
+        .lock         (lock),
+        .winner       (winner),
+        .winner_valid (winner_valid),
+        .grant        (arb_grant)
+    );
 
-    // Choose winner combinationally.
-    reg [PID_BITS-1:0] winner;
-    reg                winner_valid;
-    integer            k;
-    reg [PID_BITS:0]   cand_ext;     // one extra bit so + cannot wrap silently
-    reg [PID_BITS-1:0] cand;
-
-    always @* begin
-        winner = {PID_BITS{1'b0}};
-        winner_valid = 1'b0;
-        cand = {PID_BITS{1'b0}};
-        cand_ext = {(PID_BITS+1){1'b0}};
-        if (lock_pending) begin
-            winner = lock_holder;
-            winner_valid = req[lock_holder];
-        end else begin
-            for (k = 0; k < N_PORTS; k = k + 1) begin
-                cand_ext = {1'b0, rrobin} + k[PID_BITS:0];
-                cand = (cand_ext >= N_PORTS[PID_BITS:0])
-                       ? cand_ext[PID_BITS-1:0] - N_PORTS[PID_BITS-1:0]
-                       : cand_ext[PID_BITS-1:0];
-                if (!winner_valid && req[cand]) begin
-                    winner = cand;
-                    winner_valid = 1'b1;
-                end
-            end
-        end
-    end
-
-    // Grant signals.
-    integer pp;
-    always @* begin
-        grant = {N_PORTS{1'b0}};
-        if (winner_valid) grant[winner] = 1'b1;
-    end
+    always @* grant = arb_grant;
 
     // Response routing: 1-cycle delay.
     reg                 granted_valid_q;
@@ -1339,9 +1322,7 @@ module m68k_bus #(
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            lock_pending <= 1'b0;
-            lock_holder  <= {PID_BITS{1'b0}};
-            rrobin       <= {PID_BITS{1'b0}};
+            // lock_pending / lock_holder / rrobin now in agnus_arbiter.v
             granted_valid_q <= 1'b0;
             granted_port_q  <= {PID_BITS{1'b0}};
             granted_we_q    <= 1'b0;
@@ -2110,24 +2091,8 @@ module m68k_bus #(
                 ovl_just_cleared <= 1'b0;
             end
 
-            // Round-robin advance.
-            if (winner_valid && !lock_pending) begin
-                if (winner == (N_PORTS-1))
-                    rrobin <= {PID_BITS{1'b0}};
-                else
-                    rrobin <= winner + 1'b1;
-            end
-
-            // Lock update.
-            if (winner_valid) begin
-                if (lock_pending) begin
-                    // Granted second txn of an RMW; release lock.
-                    lock_pending <= 1'b0;
-                end else if (lock[winner]) begin
-                    lock_pending <= 1'b1;
-                    lock_holder  <= winner;
-                end
-            end
+            // Round-robin advance + lock update moved into agnus_arbiter.v
+            // (Phase A of #4).  See docs/SLOT_ACCURATE_AGNUS_PLAN.md.
         end
     end
 
