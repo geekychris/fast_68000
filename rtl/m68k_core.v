@@ -3104,6 +3104,31 @@ module m68k_core #(
                     retired, ex_pc, dc_addr, dc_wdata, dc_be,
                     u_rf.regs[0], u_rf.regs[8], u_rf.regs[9]);
 `endif
+`ifdef FE3014_PROBE
+            // Print A4/D0/D4 right BEFORE the dangerous read at $FE3014
+            // (MOVE.L $08(A4, D0.W), D0).  Identifies the actual source
+            // struct address `A4 + 8 + sign_extend(D0[15:0])` that the
+            // K1.3 layer-refresh code reads to get bltdpt.  See
+            // project_boing_post_validator_chain.md for context.
+            if (is_settled && ex_pc == 32'h00fe_3014)
+                $display("[FE3014] r=%0d A4=%h D0=%h D4=%h  → addr=A4+8+D0.W=%h",
+                    retired, u_rf.regs[12], u_rf.regs[0], u_rf.regs[4],
+                    u_rf.regs[12] + 32'd8 +
+                    {{16{u_rf.regs[0][15]}}, u_rf.regs[0][15:0]});
+`endif
+`ifdef BPLPTR_C01418_WR_TRACE
+            // Trace every write to BitMap.Planes[0..7] at slow $C01418-$C01437.
+            // Investigation of the boing-disk rogue blit at $FE301A
+            // (project_boing_post_validator_chain.md): the K1.3 LAYER
+            // refresh path reads BitMap.Planes[idx] from $C01418+idx*4
+            // and writes it to BLTDPT.  At r=11153359 the read returned
+            // the corrupted value $6438.  Find who wrote $6438 there.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h00C0_1418 && dc_addr < 32'h00C0_1438)
+                $display("[BPLPTR-WR] r=%0d pc=%h addr=%h wdata=%h be=%b A0=%h A1=%h D0=%h",
+                    retired, ex_pc, dc_addr, dc_wdata, dc_be,
+                    u_rf.regs[8], u_rf.regs[9], u_rf.regs[0]);
+`endif
 `ifdef SLOW_C07138_WR_TRACE
             // Trace every write to slow RAM $C07138 — the struct field
             // that supplies the bad BLTAPT high-half $0280 (per §57e).
