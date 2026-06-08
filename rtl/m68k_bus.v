@@ -778,6 +778,7 @@ module m68k_bus #(
         .rst_n        (rst_n),
         .req          (req),
         .lock         (lock),
+        .hpos         (agnus_h),
         .winner       (winner),
         .winner_valid (winner_valid),
         .grant        (arb_grant)

@@ -24,10 +24,30 @@ module agnus_arbiter #(
     input  wire                       rst_n,
     input  wire [N_PORTS-1:0]         req,
     input  wire [N_PORTS-1:0]         lock,
+    // Beam position from Agnus.  Used by Phase B+ to deny grants on
+    // refresh slots (and later disk/audio/sprite/bitplane slots).  In
+    // Phase A this was unused.  Tie to 0 if the caller doesn't have
+    // it yet — refresh reservation is gated by SLOT_ACCURATE_AGNUS.
+    input  wire [9:0]                 hpos,
     output reg  [PID_BITS-1:0]        winner,
     output reg                        winner_valid,
     output reg  [N_PORTS-1:0]         grant
 );
+
+    // ---------------- Refresh-slot reservation (Phase B) ----------------
+    // Real Agnus reserves cycles 0, 2, 4, 6 of every line for DRAM
+    // refresh.  CPU + DMA channels are denied during those cycles.
+    // Our memory model doesn't need refresh, but reserving the slots
+    // shifts CPU timing to match real-hardware cadence.  Gated behind
+    // a `define so Phase A and earlier callers see no change.
+`ifdef SLOT_ACCURATE_AGNUS
+    wire is_refresh_slot = (hpos[8:1] == 8'd0) ||   // hpos = 0 or 1
+                           (hpos[8:1] == 8'd1) ||   // hpos = 2 or 3
+                           (hpos[8:1] == 8'd2) ||   // hpos = 4 or 5
+                           (hpos[8:1] == 8'd3);     // hpos = 6 or 7
+`else
+    wire is_refresh_slot = 1'b0;
+`endif
 
     // ---------------- Internal state ----------------
     reg                  lock_pending;
@@ -44,7 +64,13 @@ module agnus_arbiter #(
         winner_valid = 1'b0;
         cand = {PID_BITS{1'b0}};
         cand_ext = {(PID_BITS+1){1'b0}};
-        if (lock_pending) begin
+        if (is_refresh_slot) begin
+            // Phase B: deny all grants on refresh slots regardless of
+            // pending lock.  A lock_holder will re-win as soon as the
+            // next non-refresh cycle arrives.
+            winner = {PID_BITS{1'b0}};
+            winner_valid = 1'b0;
+        end else if (lock_pending) begin
             winner = lock_holder;
             winner_valid = req[lock_holder];
         end else begin
