@@ -281,6 +281,30 @@ module minimig_phase1_top (
         .hd_frd         ()
     );
 
+    // Per-cycle probe for bus activity — first few AS-falling events.
+    // Enable with +define+PHASE1_PROBE.  Diagnostic: confirms CPU does
+    // assert AS at $FC00D2 exactly once, then waits forever because
+    // minimig never asserts _cpu_dtack (= _ta_n).  Next diagnostic
+    // pass needs to bisect the dtack chain — likely syscontrol holding
+    // sram_bridge in reset, or _ta_n gated by an unprogrammed setting.
+`ifdef PHASE1_PROBE
+    reg [31:0] probe_count;
+    reg cpu_as_n_d;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            probe_count <= 0;
+            cpu_as_n_d  <= 1'b1;
+        end else begin
+            cpu_as_n_d <= cpu_as_n;
+            if (cpu_as_n_d && !cpu_as_n && probe_count < 20) begin
+                $display("[probe] AS falling: addr=%h rw=%b uds=%b lds=%b cpudata_in=%h",
+                    {cpu_address, 1'b0}, cpu_rw, ~cpu_uds_n, ~cpu_lds_n, cpudata_in);
+                probe_count <= probe_count + 1;
+            end
+        end
+    end
+`endif
+
     wire _unused = &{ic_we, ic_lock, ic_wdata, dc_lock, 1'b0};
 
 endmodule

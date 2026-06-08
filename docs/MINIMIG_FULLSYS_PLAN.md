@@ -255,6 +255,48 @@ state and can be either stubbed or omitted:
 - **Verilator-compile time**: 16K LOC of minimig + our 8K LOC + harness
   ≈ 30-60s build.  Reasonable.
 
+## Phase 1b — concrete findings from first attempt
+
+Landed in this session: clock-enable cadence (commit `abba5d8`) +
+build infrastructure (Phase 1a, commit `7a2b65c`).
+
+**Confirmed via `+define+PHASE1_PROBE` in tb/minimig_phase1_top.sv**:
+- Our CPU asserts `_AS` at `$FC00D2` exactly once on first instruction
+  fetch (correct: that's the K1.3 RESET_PC).
+- Minimig **never** asserts `_cpu_dtack` (= `_ta_n` internally), so
+  our bus wrapper waits forever in `S_HI_W`.
+- Result: `retired=0` permanently; CPU never progresses past first
+  fetch attempt.
+
+**Hypotheses for the next session** (ordered by likelihood):
+
+1. **minimig_syscontrol holds internal reset.**  `minimig_syscontrol.v`
+   expects an SD-card-driven boot sequence from a microcontroller over
+   SPI.  Without that, its internal "boot complete" / "kickstart
+   loaded" signals likely never assert, gating the SRAM bridge state
+   machine.  Verify by probing `bridge_dis` / `nrdy` / `usrrst` /
+   `bootrst` signals inside syscontrol.
+
+2. **SRAM bridge needs the AS-sync chain to clock.**  `minimig_m68k_bridge.v`
+   sample line: `assign enable = (~l_as & ~l_dtack & ~cck & ~turbo) | ...`
+   The `l_as` is a synchronizer flop on `_as`.  If clock enables stop
+   l_as from latching, the bridge never starts.  Our cadence drives
+   28 MHz master; check whether `clk` is actually clk_28 in the bridge
+   or some derived clock.
+
+3. **ROM mapping wrong.**  Even if dtack asserts, the data read from
+   SRAM would be garbage unless K1.3 ROM is at the SRAM offset
+   `minimig_bankmapper` translates `$F8/$FC/$FF` into.  Bank map for
+   "0.5M chip + 256K kick" likely puts ROM at SRAM `$1F_8000+`
+   (= word `$0F_C000+`), not the `$18_0000` guess we used.
+
+**Suggested next-session attack path**: tackle (1) first via either
+(a) a syscontrol bypass module that asserts "boot complete" from cycle
+0, or (b) a minimal SPI-master testbench peripheral that simulates the
+microcontroller's boot-load sequence.  Option (a) is fast; option (b)
+is closer to the spec'd "Option B" disk path and would also unlock the
+SD-card-based disk plan.
+
 ## Open questions for next session
 
 - Do we actually want Phase 4 to be a *live* per-cycle differ, or a
