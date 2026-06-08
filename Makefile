@@ -601,6 +601,7 @@ $(PHASE1_BUILD)/Vminimig_phase1_top: \
 	    --top-module minimig_phase1_top \
 	    -Mdir $(PHASE1_BUILD) \
 	    -o Vminimig_phase1_top \
+	    -y $(TB_DIR) \
 	    -y $(MINIMIG_DIR)/rtl/minimig \
 	    -y $(MINIMIG_DIR)/rtl/fifo \
 	    $(TB_DIR)/minimig_phase1_top.sv \
