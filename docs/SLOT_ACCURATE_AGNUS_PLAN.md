@@ -118,24 +118,29 @@ moment and rejects it.
 - Verify: t86_dsksyn_irq + WB1.3 boot reach unchanged.  This is the
   ONE that should unblock cyl-53.
 
-### Phase D — Audio + Sprite slots [LANDED]
+### Phase D — Audio slots [LANDED]
 
 - AUDxEN gates per-channel audio slots at hpos 13/15/17/19.
-- SPREN gates 16 sprite-fetch slots at hpos 0x15..0x33 odd
-  (21..51 in decimal), 2 cycles per sprite × 8 sprites.
-- Gated by master DMAEN (DMACON bit 9) — caller passes zero
-  when DMAEN low so the arbiter doesn't have to re-check.
+- Gated by master DMAEN (DMACON bit 9) — caller passes zero when
+  DMAEN low so the arbiter doesn't have to re-check.
 - Verified: 153/153 tests pass with and without
   `+define+SLOT_ACCURATE_AGNUS`.
 
 Implementation lives in `rtl/chipset/agnus_arbiter.v` `is_audio_slot`
-and `is_sprite_slot` wires + the `audn_en` / `spr_en` input ports
-threaded from m68k_bus.v's `dmacon[5]` / `dmacon[3:0]`.
+wire + the `audn_en` input port threaded from m68k_bus.v's
+`dmacon[3:0]`.
 
-The sprite reservation fires on every line (visible + VBL) since
-modeling visible-vs-blank is unnecessary at this fidelity step.
-Real Agnus only fetches sprites on visible lines.  Should be revisited
-if a sprite-heavy demo shows timing artifacts.
+Sprite slot reservation was attempted in a first draft as `is_sprite_slot`
+gated by SPREN, but SPREN alone over-reserves: real Agnus only fetches
+sprites on lines where a sprite is active (within its vstart/vstop
+range).  Even gating on "visible lines" still over-reserves by ~10× for
+typical OS usage (1-sprite mouse pointer).  Deferred to Phase E along
+with bitplane slots — both need vertical state to be fidelity-correct.
+
+Also fidelity-fixed during this phase: refresh slot reservation was
+`hpos[8:1] < 4` (= hpos 0..7, 8 cycles), 2× the real-hardware value.
+Per HRM appendix C, refresh occupies cycles 0, 2, 4, 6 only (4 cycles
+per line).  Corrected to `!hpos[0] && hpos[9:1] < 4`.
 
 ### Phase E — Bitplane slots (2-3 sessions)
 

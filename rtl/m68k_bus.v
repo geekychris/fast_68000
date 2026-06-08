@@ -770,13 +770,13 @@ module m68k_bus #(
     wire                winner_valid;
     wire [N_PORTS-1:0]  arb_grant;
 
-    // Phase D inputs: gate audio/sprite slot reservation on master DMAEN
+    // Phase D inputs: gate audio slot reservation on master DMAEN
     // (DMACON bit 9) AND the per-channel enable.  Caller passes zero
-    // when the global enable is off so the arbiter doesn't have to
-    // model it.
+    // when DMAEN is off so the arbiter doesn't have to model it.
+    // Sprite slot reservation is deferred to Phase E because it
+    // requires sprite vstart/vstop state to avoid 10× over-reservation.
     wire        dmaen_q  = dmacon[9];
     wire [3:0]  audn_en_w = {4{dmaen_q}} & dmacon[3:0];
-    wire        spr_en_w  = dmaen_q & dmacon[5];
 
     agnus_arbiter #(
         .N_PORTS     (N_PORTS),
@@ -790,7 +790,6 @@ module m68k_bus #(
         .hpos         (agnus_h),
         .dsk_active   (blk_busy),       // disk DMA running
         .audn_en      (audn_en_w),      // Phase D audio per-channel
-        .spr_en       (spr_en_w),       // Phase D sprite master
         .winner       (winner),
         .winner_valid (winner_valid),
         .grant        (arb_grant)
