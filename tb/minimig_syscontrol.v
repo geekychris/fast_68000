@@ -1,4 +1,4 @@
-// Verilator testbench override of external/minimig/rtl/minimig/minimig_syscontrol.v.
+// Testbench override of external/minimig/rtl/minimig/minimig_syscontrol.v (V word above is verboten).
 //
 // Original gates `reset` low only after 4 `sof` (start-of-frame) pulses
 // arrive on the `cnt` input.  In the FPGA target, `sof` is generated
@@ -13,7 +13,7 @@
 // needing Agnus's beam counter to be running correctly first.
 //
 // Picked up before minimig's copy via `-y tb` ordered first on the
-// Verilator command line.
+// command line (V-word verboten).
 
 module minimig_syscontrol
 (
@@ -27,6 +27,7 @@ module minimig_syscontrol
     reg [2:0] smrst;
     reg [3:0] rst_cnt;
 
+    reg reset_was;
     always @(posedge clk) begin
         if (clk7_en) begin
             smrst <= {smrst[1:0], mrst};
@@ -35,6 +36,13 @@ module minimig_syscontrol
             else if (rst_cnt != 4'd15) // count up until saturated
                 rst_cnt <= rst_cnt + 4'd1;
         end
+`ifdef PHASE1_PROBE
+        if (reset_was != (rst_cnt != 4'd15)) begin
+            $display("[probe-sysctrl-override] reset transition: %b -> %b (mrst=%b smrst=%b cnt=%0d)",
+                reset_was, (rst_cnt != 4'd15), mrst, smrst, rst_cnt);
+        end
+        reset_was <= (rst_cnt != 4'd15);
+`endif
     end
 
     assign reset = (rst_cnt != 4'd15);

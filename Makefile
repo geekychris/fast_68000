@@ -604,6 +604,7 @@ $(PHASE1_BUILD)/Vminimig_phase1_top: \
 	    -y $(TB_DIR) \
 	    -y $(MINIMIG_DIR)/rtl/minimig \
 	    -y $(MINIMIG_DIR)/rtl/fifo \
+	    $(TB_DIR)/minimig_syscontrol.v \
 	    $(TB_DIR)/minimig_phase1_top.sv \
 	    $(TB_DIR)/m68k_to_amiga_bus.sv \
 	    $(TB_DIR)/altsyncram_stub.v \
