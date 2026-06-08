@@ -78,10 +78,17 @@ module agnus_arbiter #(
                          (audn_en[1] && (hpos[9:0] == 10'd15)) ||
                          (audn_en[2] && (hpos[9:0] == 10'd17)) ||
                          (audn_en[3] && (hpos[9:0] == 10'd19));
+    // Phase F (partial): E-clock peripheral slot at hpos $E0 = 224.
+    // Real Agnus reserves this cycle for 6800-bus-compatible peripheral
+    // access (CIAs, anything on the E-clock).  Single slot per line.
+    // Independent of any DMACON bit — reservation is always-on under
+    // SLOT_ACCURATE_AGNUS.
+    wire is_eclk_slot = (hpos[9:0] == 10'd224);
 `else
     wire is_refresh_slot = 1'b0;
     wire is_disk_slot    = 1'b0;
     wire is_audio_slot   = 1'b0;
+    wire is_eclk_slot    = 1'b0;
 `endif
 
     // ---------------- Internal state ----------------
@@ -121,6 +128,14 @@ module agnus_arbiter #(
             // simply deny all requesters.  CPU+blitter+copper pause
             // on these cycles when the corresponding AUDxEN+DMAEN is
             // high, recreating real-Agnus stalls.
+            winner = {PID_BITS{1'b0}};
+            winner_valid = 1'b0;
+        end else if (is_eclk_slot) begin
+            // Phase F (partial): E-clock peripheral access slot at
+            // hpos $E0.  Reserved unconditionally — like refresh, it
+            // happens every line.  Denies all requesters; the slot
+            // gives the CIAs an exclusive bus moment matching real
+            // 6800-compatible cycle behavior.
             winner = {PID_BITS{1'b0}};
             winner_valid = 1'b0;
         end else if (lock_pending) begin

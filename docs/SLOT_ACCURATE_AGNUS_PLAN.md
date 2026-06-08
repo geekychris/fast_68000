@@ -150,12 +150,27 @@ per line).  Corrected to `!hpos[0] && hpos[9:1] < 4`.
 - Verify: WB1.3 render byte-identical to current at idle.
 
 ### Phase F — Even/odd slot enforcement for blitter/copper/CPU
-       (1-2 sessions)
+       (1-2 sessions, PARTIAL)
 
 - Blitter + Copper request slots numbered even; only granted on
-  even-cycle phases.
-- CPU on odd slots (with $E0 reserved for ECLK).
+  even-cycle phases.  **Deferred** — needs port-type info threaded to
+  the arbiter (which ports are CPU vs blitter/copper).  Skipping for
+  now because the existing arbiter already gives blitter/copper fair
+  shots via round-robin; the missing parity restriction has mild
+  fidelity impact.
+- CPU on odd slots.  **Deferred** same reason as above.
+- $E0 reserved for ECLK.  **LANDED.**  Single-cycle reservation at
+  hpos = 224 in `is_eclk_slot`, denied unconditionally under
+  `SLOT_ACCURATE_AGNUS`.  Matches real Agnus's 6800-bus-compatible
+  peripheral slot, giving CIAs an exclusive bus moment.
 - Verify: cpu_fuzz.py still clean (no instruction-timing bugs).
+
+ECLK reservation is verified by the `crosscheck-arbiter` unit test:
+"ECLK slot rejects CPU req at hpos 224 only" — confirms hpos 224
+denies grants while adjacent hpos 223/225 stay free.
+
+Remaining Phase F parity-of-port work is logged here for future
+sessions when port-type plumbing becomes worthwhile.
 
 ## Risk
 

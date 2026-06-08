@@ -125,6 +125,17 @@ int main(int argc, char** argv) {
         check_eq(lbl, 1, (int)dut->winner_valid);
     }
 
+    // ---------------- Phase F (partial): ECLK slot --------------------
+    // hpos = 224 ($E0) is reserved unconditionally for E-clock CIA
+    // access.  Adjacent cycles (223, 225) must remain free.
+    printf("Phase F: ECLK slot rejects CPU req at hpos 224 only\n");
+    drive(dut, 224, /*dsk*/false, /*aud*/0, /*req*/0b0001, /*lock*/0);
+    check_eq("eclk hpos=224 valid", 0, (int)dut->winner_valid);
+    drive(dut, 223, /*dsk*/false, /*aud*/0, /*req*/0b0001, /*lock*/0);
+    check_eq("eclk_adj hpos=223 valid", 1, (int)dut->winner_valid);
+    drive(dut, 225, /*dsk*/false, /*aud*/0, /*req*/0b0001, /*lock*/0);
+    check_eq("eclk_adj hpos=225 valid", 1, (int)dut->winner_valid);
+
     // ---------------- Free cycle still grants ------------------------
     // hpos = 100 (mid-line, no reservation) — CPU req must be granted.
     printf("Sanity: hpos=100 free cycle grants CPU\n");
