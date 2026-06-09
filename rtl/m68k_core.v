@@ -3138,7 +3138,58 @@ module m68k_core #(
                     retired, ex_pc, dc_addr, dc_wdata, dc_be,
                     u_rf.regs[8], u_rf.regs[9], u_rf.regs[0]);
 `endif
+`ifdef FF4D0C_VALUE_WATCH
+            // Watch CPU writes that COULD be part of pushing $00FF4D0C
+            // onto the stack — the deferred-call address that BCPL DOS
+            // code stashes before calling an inner helper.  RTS at slow
+            // $C050E4 pops this value and lands at AutoRequest entry
+            // $FF4D0C.
+            //
+            // ONLY catches:
+            //   - Full .L writes (be=1111) of exact value $00FF4D0C
+            //   - 16-bit writes (be=0011) of the low half $4D0C (rare
+            //     pattern; usually paired with be=1100 high-half write)
+            // The high-half writes ($00FF) are too common to filter
+            // on alone — there are millions of them in exec routines.
+            if (dc_req_r && dc_we && dc_ack &&
+                ((dc_be == 4'b1111 && dc_wdata == 32'h00FF_4D0C) ||
+                 (dc_be == 4'b0011 && dc_wdata[15:0] == 16'h4D0C)))
+                $display("[FF4D0C-WR] r=%0d pc=%h addr=%h wdata=%h be=%b A0=%h A1=%h A5=%h A6=%h A7=%h",
+                    retired, ex_pc, dc_addr, dc_wdata, dc_be,
+                    u_rf.regs[8], u_rf.regs[9],
+                    u_rf.regs[13], u_rf.regs[14], u_rf.regs[15]);
+`endif
 `ifdef FF4D1C_RINGBUF
+            // Dump ring buffer + log SP/mem[SP] for $FF4D00 entry too
+            // — that's the routine's ACTUAL caller, since $FF4D02 is the
+            // first instruction.  Distinct from $FF4D1C trigger which
+            // captures the chain inside the routine.
+            if (is_settled && ex_pc == 32'h00ff_4d02) begin
+                $display("[FF4D02-ENTRY] r=%0d FF4D00 routine entered — SP=%h A0=%h A1=%h D0=%h",
+                    retired, u_rf.regs[15],
+                    u_rf.regs[8], u_rf.regs[9], u_rf.regs[0]);
+                $display("  ring (last 16 PCs leading to entry):");
+                $display("    [-15]=%h [-14]=%h [-13]=%h [-12]=%h",
+                         pc_ring[ring_head + 4'd1],
+                         pc_ring[ring_head + 4'd2],
+                         pc_ring[ring_head + 4'd3],
+                         pc_ring[ring_head + 4'd4]);
+                $display("    [-11]=%h [-10]=%h [-9]=%h [-8]=%h",
+                         pc_ring[ring_head + 4'd5],
+                         pc_ring[ring_head + 4'd6],
+                         pc_ring[ring_head + 4'd7],
+                         pc_ring[ring_head + 4'd8]);
+                $display("    [-7]=%h  [-6]=%h  [-5]=%h [-4]=%h",
+                         pc_ring[ring_head + 4'd9],
+                         pc_ring[ring_head + 4'd10],
+                         pc_ring[ring_head + 4'd11],
+                         pc_ring[ring_head + 4'd12]);
+                $display("    [-3]=%h  [-2]=%h  [-1]=%h [-0]=%h",
+                         pc_ring[ring_head + 4'd13],
+                         pc_ring[ring_head + 4'd14],
+                         pc_ring[ring_head + 4'd15],
+                         pc_ring[ring_head]);
+            end
             // PC ring buffer: capture the last 16 PCs, dump them when PC
             // reaches $FF4D1C (boing-disk AUTO-REQ entry).  Used to find
             // the BCPL/DOS caller chain that decides "show error dialog".
