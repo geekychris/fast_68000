@@ -1045,6 +1045,20 @@ module m68k_top #(
     end
 `endif
 
+`ifdef C00ED0_SNOOP
+    // Bus-level write watch on slow $C00ECC..$C00F0B — the real source
+    // of A3=$FFC5AE/$FFC5A0 (per the corrected MOVEM source analysis).
+    // Our sim has \$FFC5AE here; FS-UAE has \$00C00B3C (slow RAM BCPL
+    // handler).  Find what populates this dispatch table.
+    always @(posedge clk) if (rst_n) begin
+        if (snoop_valid &&
+            snoop_addr >= 32'h00C0_0ECC && snoop_addr <= 32'h00C0_0F0B) begin
+            $display("[C00ED0-SNOOP] r=%0d src=%0d cpu_pc=%h snoop_addr=%h",
+                retired_flat[31:0], snoop_src_id,
+                core_pc_flat[31:0], snoop_addr);
+        end
+    end
+`endif
 `ifdef C00EBC_SNOOP
     // Bus-level write watch on slow $C00EBC — the struct slot whose
     // value (\$FFC5A0) is loaded into A3 by MOVEM at \$FF4128 and

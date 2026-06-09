@@ -3179,6 +3179,19 @@ module m68k_core #(
                     u_rf.regs[0], u_rf.regs[1],
                     u_rf.regs[8], u_rf.regs[9]);
 `endif
+`ifdef C00ED0_WR_TRACE
+            // Wider version of C00EBC_WR_TRACE covering the real A3
+            // source at $C00ED0 plus surrounding dispatch-table slots
+            // $C00ECC..$C00F08.  Per the corrected MOVEM-source analysis
+            // (project_boing_filesystem_error_handler.md final update),
+            // A3 = mem[$C00ED0] at the divergent dispatch.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h00C00ECC && dc_addr < 32'h00C00F0C)
+                $display("[C00ED0-WR] r=%0d pc=%h addr=%h wdata=%h be=%b D0=%h D1=%h D2=%h A0=%h A1=%h",
+                    retired, ex_pc, dc_addr, dc_wdata, dc_be,
+                    u_rf.regs[0], u_rf.regs[1], u_rf.regs[2],
+                    u_rf.regs[8], u_rf.regs[9]);
+`endif
 `ifdef A3_CHANGE_TO_FFC5A0
             // Catch the exact instruction that sets A3 = $FFC5A0.  Track
             // A3 from the previous cycle; when A3 transitions from
