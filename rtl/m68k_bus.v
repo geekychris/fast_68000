@@ -448,9 +448,10 @@ module m68k_bus #(
     // transfer in real hw).  We accept the first write as a "start" too.
     // Source is disk[] starting at offset (blk_src << 9), i.e. we re-use
     // the block-device BLKSRC register at $00FE_8000 to set the disk
-    // position.  On completion we set INTREQ DSKBLK (bit 1) via an
-    // internal pulse fed into Paula's irq input wires (TODO; today we
-    // only set the busy flag and the boot ROM polls).
+    // position.  On completion we pulse `dskblk_pulse_o` (defined below
+    // as `blk_busy_last && !blk_busy`); m68k_top.v wires it to Paula's
+    // `dskblk_int_i`, which sets INTREQ bit 1.  DSKSYNC (bit 12) fires
+    // separately via `dsksyn_pulse_o` when the MFM sync word matches.
     localparam [31:0] DSKPTH_ADDR  = 32'h00DF_F020;   // high half of DSKPT
     localparam [31:0] DSKPTL_ADDR  = 32'h00DF_F022;   // low half
     localparam [31:0] DSKLEN_ADDR  = 32'h00DF_F024;   // length + DMAEN bit15
