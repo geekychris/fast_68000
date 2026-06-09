@@ -3207,6 +3207,30 @@ module m68k_core #(
                 $display("[BLT-BOING-SIZE] r=%0d pc=%h BLTSIZE=%h be=%b",
                     retired, ex_pc, dc_wdata, dc_be);
 `endif
+`ifdef CALLER_OF_D2EQ0
+            // Capture caller of the BCPL dispatcher at $FF4134 when
+            // the dispatch will store 0 at $C00EC8 (mem[A1+$4] at the
+            // failing predicate $FFC57A).
+            //
+            // The dispatcher's MOVEM at $FF413E writes D1,D2,D3,D4 to
+            // (A1) where A1 = caller_A1 + D0.  When the resulting A1
+            // = $C00EC4 (so that A1+4 = $C00EC8) AND D2 = 0, we've
+            // identified THE failing dispatch.
+            //
+            // Capture all caller-side regs + the BCPL return PC stored
+            // at A3 (which $FF4134's MOVEA.L (A7)+,A3 just popped).
+            // A3 IS the BCPL return PC (the instruction after the
+            // caller's `JSR (A5)`).
+            if (is_settled && ex_pc == 32'h00FF_413E &&
+                u_rf.regs[9] == 32'h00C0_0EC4 && u_rf.regs[2] == 32'h0000_0000)
+                $display("[D2EQ0-CALLER] r=%0d ret_PC=A3=%h  D0=%h D1=%h D2=%h D3=%h D4=%h  A0=%h A2=%h A4=%h A6=%h A7=%h",
+                    retired,
+                    u_rf.regs[11],  // A3 = popped return PC
+                    u_rf.regs[0], u_rf.regs[1], u_rf.regs[2],
+                    u_rf.regs[3], u_rf.regs[4],
+                    u_rf.regs[8], u_rf.regs[10], u_rf.regs[12],
+                    u_rf.regs[14], u_rf.regs[15]);
+`endif
 `ifdef FFC57E_PROBE
             // [DOS-ERR-PREDICATE] at $FFC57E:
             //   $FFC578: MOVEQ #29, D2
