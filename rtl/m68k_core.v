@@ -3366,6 +3366,15 @@ module m68k_core #(
                     retired, ex_pc, dc_addr, dc_wdata, dc_be,
                     u_rf.regs[0], u_rf.regs[1],
                     u_rf.regs[8], u_rf.regs[9], u_rf.regs[14]);
+            // Also watch slow $C00EC4..$C00ECF — the predicate input
+            // (mem[A1+$4] at $FFC57A where A1=$C00EC4).  This is what
+            // gets compared to 29; if !=29 → DOS error 296 dialog.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h00C0_0EC4 && dc_addr < 32'h00C0_0ED0)
+                $display("[C00EC4-WR] r=%0d pc=%h addr=%h wdata=%h be=%b D0=%h D1=%h A0=%h A1=%h A6=%h",
+                    retired, ex_pc, dc_addr, dc_wdata, dc_be,
+                    u_rf.regs[0], u_rf.regs[1],
+                    u_rf.regs[8], u_rf.regs[9], u_rf.regs[14]);
 `endif
 `ifdef FF5364_PROBE
             // Capture A2 at $FF5364: MOVEA.L $FF7C(A2), A4.  The struct
