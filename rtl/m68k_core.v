@@ -3179,6 +3179,34 @@ module m68k_core #(
                     u_rf.regs[0], u_rf.regs[1],
                     u_rf.regs[8], u_rf.regs[9]);
 `endif
+`ifdef BLT_BOING_TRACE
+            // When CPU writes the upper word of BLTDPT (\$DFF054) with
+            // a value that puts destination inside boing's buffer
+            // (\$11C38..\$1E0E0), log the write so we can see the blit's
+            // destination address.  Then we can also log BLTAPT etc.
+            // via the existing chipset writes that fire just before
+            // each blit trigger.
+            //
+            // We track only the .L writes to \$DFF054 (BLTDPT high half)
+            // since the high half determines the chip-RAM bank.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr == 32'h00DF_F054 && dc_be == 4'b1111 &&
+                dc_wdata >= 32'h0001_1C38 && dc_wdata <= 32'h0001_E0E0)
+                $display("[BLT-BOING-DPT] r=%0d pc=%h BLTDPT=%h",
+                    retired, ex_pc, dc_wdata);
+            // Also catch all writes to BLTAPT (\$DFF050) so we can
+            // correlate the source pointer with subsequent BLTDPT.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr == 32'h00DF_F050 && dc_be == 4'b1111)
+                $display("[BLT-BOING-APT] r=%0d pc=%h BLTAPT=%h",
+                    retired, ex_pc, dc_wdata);
+            // Catch BLTSIZE writes (\$DFF058 — triggers the blit) to
+            // see when each blit fires.  Log size + the regs at the moment.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr == 32'h00DF_F058)
+                $display("[BLT-BOING-SIZE] r=%0d pc=%h BLTSIZE=%h be=%b",
+                    retired, ex_pc, dc_wdata, dc_be);
+`endif
 `ifdef BOING_BUFFER_WR_TRACE
             // Watch CPU writes to the boing.samples destination buffer
             // area at chip $10000-$1F000.  Per the 16th-session boing
