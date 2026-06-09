@@ -713,6 +713,15 @@ module m68k_core #(
     reg         ex_valid;
     reg  [31:0] ex_pc;
     reg  [31:0] ex_pc_next;
+
+`ifdef FF4D1C_RINGBUF
+    // PC ring buffer: captures the last 16 retired PCs.  Used by the
+    // probe that fires at $FF4D1C entry (boing-disk AUTO-REQ path) to
+    // dump the caller chain that decided "show File System error dialog".
+    // See project_boing_filesystem_error_handler.md.
+    reg [3:0]   ring_head;
+    reg [31:0]  pc_ring [0:15];
+`endif
     reg  [5:0]  ex_kind;
     reg  [4:0]  ex_alu_op;
     reg  [1:0]  ex_size;
@@ -3128,6 +3137,44 @@ module m68k_core #(
                 $display("[BPLPTR-WR] r=%0d pc=%h addr=%h wdata=%h be=%b A0=%h A1=%h D0=%h",
                     retired, ex_pc, dc_addr, dc_wdata, dc_be,
                     u_rf.regs[8], u_rf.regs[9], u_rf.regs[0]);
+`endif
+`ifdef FF4D1C_RINGBUF
+            // PC ring buffer: capture the last 16 PCs, dump them when PC
+            // reaches $FF4D1C (boing-disk AUTO-REQ entry).  Used to find
+            // the BCPL/DOS caller chain that decides "show error dialog".
+            // See project_boing_filesystem_error_handler.md for the
+            // forensics context — $FF4D0C/$FF4D1C has zero static callers
+            // in K1.3 ROM, so the entry must come via runtime call.
+            if (is_settled && ex_pc == 32'h00ff_4d1c) begin
+                $display("[FF4D1C-RING] r=%0d hit AUTO-REQ entry — last 16 PCs:",
+                         retired);
+                $display("  [-15]=%h [-14]=%h [-13]=%h [-12]=%h",
+                         pc_ring[ring_head + 4'd1],
+                         pc_ring[ring_head + 4'd2],
+                         pc_ring[ring_head + 4'd3],
+                         pc_ring[ring_head + 4'd4]);
+                $display("  [-11]=%h [-10]=%h [-9]=%h [-8]=%h",
+                         pc_ring[ring_head + 4'd5],
+                         pc_ring[ring_head + 4'd6],
+                         pc_ring[ring_head + 4'd7],
+                         pc_ring[ring_head + 4'd8]);
+                $display("  [-7]=%h  [-6]=%h  [-5]=%h [-4]=%h",
+                         pc_ring[ring_head + 4'd9],
+                         pc_ring[ring_head + 4'd10],
+                         pc_ring[ring_head + 4'd11],
+                         pc_ring[ring_head + 4'd12]);
+                $display("  [-3]=%h  [-2]=%h  [-1]=%h [-0]=%h",
+                         pc_ring[ring_head + 4'd13],
+                         pc_ring[ring_head + 4'd14],
+                         pc_ring[ring_head + 4'd15],
+                         pc_ring[ring_head]);
+                $display("  SP=%h", u_rf.regs[15]);
+            end
+            // Update the ring on every settled instruction retire.
+            if (is_settled) begin
+                ring_head <= ring_head + 4'd1;
+                pc_ring[ring_head + 4'd1] <= ex_pc;
+            end
 `endif
 `ifdef SLOW_C07138_WR_TRACE
             // Trace every write to slow RAM $C07138 — the struct field
