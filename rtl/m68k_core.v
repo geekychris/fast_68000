@@ -3179,6 +3179,27 @@ module m68k_core #(
                     u_rf.regs[0], u_rf.regs[1],
                     u_rf.regs[8], u_rf.regs[9]);
 `endif
+`ifdef BOING_BUFFER_WR_TRACE
+            // Watch CPU writes to the boing.samples destination buffer
+            // area at chip $10000-$1F000.  Per the 16th-session boing
+            // investigation, boing's task allocates 49896 bytes at
+            // chip $11C38, intended to hold the audio sample data.
+            // At AUTO-REQ time the buffer is all zeros.
+            //
+            // If DOS Read() actually copies sector data into the buffer,
+            // we should see hundreds of CPU writes here during the
+            // r=9M..11M window.  If we see ZERO writes, the copy never
+            // happened — failure is before the FFS-to-buffer step.
+            //
+            // Filtered to events at r > 8.5M (post-boing-alloc moment)
+            // to skip pre-alloc noise.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h0001_0000 && dc_addr < 32'h0001_F000 &&
+                retired >= 32'd8500000) begin
+                $display("[BOING-BUF-WR] r=%0d pc=%h addr=%h wdata=%h be=%b",
+                    retired, ex_pc, dc_addr, dc_wdata, dc_be);
+            end
+`endif
 `ifdef C00ED0_WR_TRACE
             // Wider version of C00EBC_WR_TRACE covering the real A3
             // source at $C00ED0 plus surrounding dispatch-table slots
