@@ -53,6 +53,20 @@ dual-playfield / indexed display modes — see [DENISE.md](DENISE.md);
 demo via `make demo-den`. For Paula — 4-voice 8-bit PCM audio routed
 through SDL_audio — see [PAULA.md](PAULA.md); demo via `make demo-pau`.
 
+## Workbench 1.3 booting on the Verilog Amiga
+
+Run `make wb-desktop` to boot the real K1.3 ROM and Workbench 1.3 ADF
+through to the Workbench desktop:
+
+![Workbench 1.3 desktop running on the Verilog Amiga](screenshots/20260609_workbench_desktop.png)
+
+— RAM DISK auto-mount, Workbench1.3 disk icon, "Workbench release.
+888272 free memory" title, drive + battery indicators in the upper
+right.  Rendered from chip RAM at retired = 208M instructions
+(post-CLI desktop init).  No `MEM_POKE`, no hacks — the unmodified
+ROM + ADF reaches this state via the real trackdisk MFM-decode +
+Intuition + Workbench paths.
+
 ## Headline numbers
 
 ```
