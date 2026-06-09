@@ -1045,6 +1045,24 @@ module m68k_top #(
     end
 `endif
 
+`ifdef BOING_BUF_SNOOP
+    // Bus-level write watch on boing's allocated buffer at chip
+    // \$11C38..\$1E0E0 (49,896 bytes).  Catches CPU + blitter +
+    // Paula DMA + Agnus bitplane DMA — any source.
+    // Per BOING_BUFFER_WR_TRACE (CPU-only), 0 audio data writes land
+    // here.  This probe definitively tests: does ANY bus master
+    // ever write into boing's buffer?  If still zero, the ACTION_READ
+    // packet handler doesn't even attempt the buffer copy — the
+    // failure is upstream of the copy step.
+    always @(posedge clk) if (rst_n) begin
+        if (snoop_valid &&
+            snoop_addr >= 32'h0001_1C38 && snoop_addr <= 32'h0001_E0E0) begin
+            $display("[BOING-BUF-SNOOP] r=%0d src=%0d cpu_pc=%h addr=%h",
+                retired_flat[31:0], snoop_src_id,
+                core_pc_flat[31:0], snoop_addr);
+        end
+    end
+`endif
 `ifdef C00ED0_SNOOP
     // Bus-level write watch on slow $C00ECC..$C00F0B — the real source
     // of A3=$FFC5AE/$FFC5A0 (per the corrected MOVEM source analysis).
