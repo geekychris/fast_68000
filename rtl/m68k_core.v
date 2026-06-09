@@ -3159,6 +3159,50 @@ module m68k_core #(
                     u_rf.regs[8], u_rf.regs[9],
                     u_rf.regs[13], u_rf.regs[14], u_rf.regs[15]);
 `endif
+`ifdef FF4134_D1EQ3_TRACE
+            // Catch the $FF4134 dispatcher entry where D1 == 3.  That's
+            // the call that ends up writing $00000003 to $C00ED8 via the
+            // MOVEM at $FF413E.  Dispatcher fires ~1693+ times in
+            // ordinary operation, so filter to the specific bad case.
+            //
+            // At $FF4134, top of stack is the JSR-pushed return PC =
+            // caller's "next instruction" PC.  $FF4134 itself begins
+            // with MOVEA.L (SP)+, A3 which pops that return PC into A3,
+            // but the POP hasn't happened yet when ex_pc == $FF4134.
+            if (is_settled && ex_pc == 32'h00ff_4134 &&
+                u_rf.regs[1] == 32'h00000003) begin
+                $display("[FF4134-D1EQ3] r=%0d D1=3 — caller frame:",
+                         retired);
+                $display("  D0=%h D1=%h D2=%h D3=%h D4=%h",
+                         u_rf.regs[0], u_rf.regs[1], u_rf.regs[2],
+                         u_rf.regs[3], u_rf.regs[4]);
+                $display("  A0=%h A1=%h A2=%h A3=%h A4=%h A5=%h A6=%h A7=%h",
+                         u_rf.regs[8], u_rf.regs[9], u_rf.regs[10],
+                         u_rf.regs[11], u_rf.regs[12], u_rf.regs[13],
+                         u_rf.regs[14], u_rf.regs[15]);
+                $display("  ring (last 16 PCs leading to dispatcher entry):");
+                $display("    %h %h %h %h",
+                         pc_ring[ring_head + 4'd1],
+                         pc_ring[ring_head + 4'd2],
+                         pc_ring[ring_head + 4'd3],
+                         pc_ring[ring_head + 4'd4]);
+                $display("    %h %h %h %h",
+                         pc_ring[ring_head + 4'd5],
+                         pc_ring[ring_head + 4'd6],
+                         pc_ring[ring_head + 4'd7],
+                         pc_ring[ring_head + 4'd8]);
+                $display("    %h %h %h %h",
+                         pc_ring[ring_head + 4'd9],
+                         pc_ring[ring_head + 4'd10],
+                         pc_ring[ring_head + 4'd11],
+                         pc_ring[ring_head + 4'd12]);
+                $display("    %h %h %h %h",
+                         pc_ring[ring_head + 4'd13],
+                         pc_ring[ring_head + 4'd14],
+                         pc_ring[ring_head + 4'd15],
+                         pc_ring[ring_head]);
+            end
+`endif
 `ifdef C00ED8_WR_TRACE
             // Watch every CPU write to slow $C00ED8 (the DOS-packet
             // struct field0 whose value triggers the divergent boing-
