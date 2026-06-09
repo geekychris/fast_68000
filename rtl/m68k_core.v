@@ -722,6 +722,12 @@ module m68k_core #(
     reg [3:0]   ring_head;
     reg [31:0]  pc_ring [0:15];
 `endif
+`ifdef A3_CHANGE_TO_FFC5A0
+    // Tracks the prior A3 value so we can detect transitions to
+    // $00FFC5A0.  Used by the probe that captures the exact instruction
+    // that sets A3 to the boing-disk divergent dispatch target.
+    reg [31:0]  a3_prev;
+`endif
     reg  [5:0]  ex_kind;
     reg  [4:0]  ex_alu_op;
     reg  [1:0]  ex_size;
@@ -3158,6 +3164,44 @@ module m68k_core #(
                     retired, ex_pc, dc_addr, dc_wdata, dc_be,
                     u_rf.regs[8], u_rf.regs[9],
                     u_rf.regs[13], u_rf.regs[14], u_rf.regs[15]);
+`endif
+`ifdef C00EBC_WR_TRACE
+            // Watch writes to slow $C00EBC — the struct slot that
+            // MOVEM at $FF4128 loads into A3.  Per the boing-disk
+            // investigation, at r=11133232 this slot held $FFC5A0
+            // (the AutoRequest dispatch target).  At AUTO-REQ time
+            // it holds $FFC434 in our sim vs $FFC412 in FS-UAE.
+            // Find who writes $FFC5A0 to this slot.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h00C00EB8 && dc_addr < 32'h00C00EC4)
+                $display("[C00EBC-WR] r=%0d pc=%h addr=%h wdata=%h be=%b D0=%h D1=%h A0=%h A1=%h",
+                    retired, ex_pc, dc_addr, dc_wdata, dc_be,
+                    u_rf.regs[0], u_rf.regs[1],
+                    u_rf.regs[8], u_rf.regs[9]);
+`endif
+`ifdef A3_CHANGE_TO_FFC5A0
+            // Catch the exact instruction that sets A3 = $FFC5A0.  Track
+            // A3 from the previous cycle; when A3 transitions from
+            // anything to $00FFC5A0, log the PC + all regs.
+            //
+            // Per `project_boing_findtask_returns_rom.md`, the deduction
+            // "A3 = FindTask + $5C" was falsified.  $FFC5A0 doesn't
+            // appear as a stored longword anywhere.  So A3 must be
+            // computed via LEA d(An), A3 or similar.  This probe finds
+            // the PC where the computation happens.
+            if (is_settled && u_rf.regs[11] == 32'h00FFC5A0 &&
+                a3_prev != 32'h00FFC5A0) begin
+                $display("[A3-EQ-FFC5A0] r=%0d pc=%h prev_A3=%h",
+                    retired, ex_pc, a3_prev);
+                $display("  D0=%h D1=%h D2=%h D3=%h D4=%h D5=%h",
+                    u_rf.regs[0], u_rf.regs[1], u_rf.regs[2],
+                    u_rf.regs[3], u_rf.regs[4], u_rf.regs[5]);
+                $display("  A0=%h A1=%h A2=%h A4=%h A5=%h A6=%h A7=%h",
+                    u_rf.regs[8], u_rf.regs[9], u_rf.regs[10],
+                    u_rf.regs[12], u_rf.regs[13], u_rf.regs[14],
+                    u_rf.regs[15]);
+            end
+            if (is_settled) a3_prev <= u_rf.regs[11];
 `endif
 `ifdef FF474A_FINDTASK_TRACE
             // Capture A6 (= ExecBase) and the FindTask return path
