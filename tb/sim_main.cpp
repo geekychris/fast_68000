@@ -696,6 +696,10 @@ static int run_regression(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
     int      mouse_target_y  = 0;
     uint64_t mouse_click_cyc = ~0ULL;
     bool     mouse_click_enabled = false;
+    // MOUSE_AUTO_DOUBLE_CLICK=1 turns the single click into a double-
+    // click: two LMB-down pulses separated by a brief gap so Workbench's
+    // double-click detector triggers an icon-open.
+    bool     mouse_double_click = (std::getenv("MOUSE_AUTO_DOUBLE_CLICK") != nullptr);
     if (const char* s = std::getenv("MOUSE_AUTO_CLICK")) {
         char* end = nullptr;
         long x = std::strtol(s, &end, 0);
@@ -778,9 +782,24 @@ static int run_regression(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
             // LMB down for 500K cycles around click_cycle (covers several
             // VBL polls so Workbench's PRA-read latch catches it).
             const uint64_t CLICK_DURATION = 500000ULL;
-            top->mouse_btn_l = (cycle >= mouse_click_cyc &&
-                                cycle <  mouse_click_cyc + CLICK_DURATION)
-                               ? 1 : 0;
+            if (mouse_double_click) {
+                // Double-click: two 200K-cycle LMB pulses separated by
+                // a 300K-cycle release.  Amiga DoubleClick detection
+                // uses CIA timer ticks; this spacing falls within the
+                // default threshold (~500ms = ~10 VBL).
+                const uint64_t PULSE_LEN = 200000ULL;
+                const uint64_t GAP_LEN   = 300000ULL;
+                uint64_t t = cycle - mouse_click_cyc;
+                bool first_pulse  = (cycle >= mouse_click_cyc &&
+                                     t < PULSE_LEN);
+                bool second_pulse = (cycle >= mouse_click_cyc + PULSE_LEN + GAP_LEN &&
+                                     t < PULSE_LEN + GAP_LEN + PULSE_LEN);
+                top->mouse_btn_l = (first_pulse || second_pulse) ? 1 : 0;
+            } else {
+                top->mouse_btn_l = (cycle >= mouse_click_cyc &&
+                                    cycle <  mouse_click_cyc + CLICK_DURATION)
+                                   ? 1 : 0;
+            }
         }
         if (!pokes.empty() && cycle >= poke_next_cycle) {
             top->mem_poke_addr   = pokes[poke_idx].first;
