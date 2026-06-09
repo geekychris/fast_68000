@@ -3159,6 +3159,28 @@ module m68k_core #(
                     u_rf.regs[8], u_rf.regs[9],
                     u_rf.regs[13], u_rf.regs[14], u_rf.regs[15]);
 `endif
+`ifdef FF474A_FINDTASK_TRACE
+            // Capture A6 (= ExecBase) and the FindTask return path
+            // right at the JSR FindTask call at $FF474A.  Per the
+            // 10-hop boing investigation (project_boing_findtask_
+            // returns_rom.md), deduced ThisTask = $FFC50C at this
+            // moment, which feeds into the divergent dispatch chain.
+            //
+            // At PC=$FF474A, A6=ExecBase has just been loaded.  We
+            // log A6 + A1 + D0 (FindTask args).  The actual ThisTask
+            // value (= mem[A6+$114]) needs a separate readback after
+            // the JSR — captured at $FF474E (post-JSR PC, where D0 =
+            // FindTask return value).
+            if (is_settled && ex_pc == 32'h00ff_474a) begin
+                $display("[FF474A-PRE] r=%0d A6=%h (= ExecBase) A1=%h D0=%h SP=%h",
+                    retired, u_rf.regs[14], u_rf.regs[9],
+                    u_rf.regs[0], u_rf.regs[15]);
+            end
+            if (is_settled && ex_pc == 32'h00ff_474e) begin
+                $display("[FF474A-POST] r=%0d D0=%h (= FindTask result = ThisTask)",
+                    retired, u_rf.regs[0]);
+            end
+`endif
 `ifdef FF4134_D1EQ3_TRACE
             // Catch the $FF4134 dispatcher entry where D1 == 3.  That's
             // the call that ends up writing $00000003 to $C00ED8 via the
