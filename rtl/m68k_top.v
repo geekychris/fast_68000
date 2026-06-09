@@ -1044,6 +1044,25 @@ module m68k_top #(
         end
     end
 `endif
+
+`ifdef C00EBC_SNOOP
+    // Bus-level write watch on slow $C00EBC — the struct slot whose
+    // value (\$FFC5A0) is loaded into A3 by MOVEM at \$FF4128 and
+    // selects the divergent dispatch in boing-disk boot.  CPU writes
+    // produce \$FFC434 there; a non-CPU writer must produce \$FFC5A0.
+    // Catches ALL bus writers (CPU IC/DC, blitter, copper, Paula DMA,
+    // Agnus bitplane DMA) via the snoop port.  src_id key:
+    //   0,1 = CPU IC/DC   2 = BLT (blitter)   3 = COP (copper)
+    //   4 = Paula DMA   5 = Agnus bitplane DMA
+    always @(posedge clk) if (rst_n) begin
+        if (snoop_valid &&
+            snoop_addr >= 32'h00C0_0EB8 && snoop_addr <= 32'h00C0_0EC3) begin
+            $display("[C00EBC-SNOOP] r=%0d src=%0d cpu_pc=%h snoop_addr=%h",
+                retired_flat[31:0], snoop_src_id,
+                core_pc_flat[31:0], snoop_addr);
+        end
+    end
+`endif
     // ----------------------------------------------------------------
     // Snapshot-at-PC breakpoint.
     //
