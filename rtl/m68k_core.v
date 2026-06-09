@@ -3159,6 +3159,18 @@ module m68k_core #(
                     u_rf.regs[8], u_rf.regs[9],
                     u_rf.regs[13], u_rf.regs[14], u_rf.regs[15]);
 `endif
+`ifdef C00ED8_WR_TRACE
+            // Watch every CPU write to slow $C00ED8 (the DOS-packet
+            // struct field0 whose value triggers the divergent boing-
+            // disk AutoRequest path).  Our sim writes $00000003 here;
+            // FS-UAE has $0030031D.  Find the responsible instruction.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h00C0_0ED8 && dc_addr < 32'h00C0_0EE0)
+                $display("[C00ED8-WR] r=%0d pc=%h addr=%h wdata=%h be=%b D0=%h D1=%h A0=%h A1=%h A6=%h",
+                    retired, ex_pc, dc_addr, dc_wdata, dc_be,
+                    u_rf.regs[0], u_rf.regs[1],
+                    u_rf.regs[8], u_rf.regs[9], u_rf.regs[14]);
+`endif
 `ifdef FF5364_PROBE
             // Capture A2 at $FF5364: MOVEA.L $FF7C(A2), A4.  The struct
             // field at offset -$84 from A2 holds the function pointer
