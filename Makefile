@@ -110,7 +110,7 @@ test:
 # The crosscheck-minimig-{blt,cop} targets exit non-zero on any divergence
 # from minimig's reference modules, so they act as regression guards on
 # any chipset-RTL change.
-test-all: test test-ovl test-dma-snoop crosscheck-minimig-blt crosscheck-minimig-cop
+test-all: test test-ovl test-dma-snoop crosscheck-minimig-blt crosscheck-minimig-cop crosscheck-arbiter
 
 # ---------------------------------------------------------------------------
 # External Musashi 68000 core (https://github.com/kstenerud/Musashi).  Fetched
