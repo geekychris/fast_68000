@@ -3207,6 +3207,30 @@ module m68k_core #(
                 $display("[BLT-BOING-SIZE] r=%0d pc=%h BLTSIZE=%h be=%b",
                     retired, ex_pc, dc_wdata, dc_be);
 `endif
+`ifdef FFC57E_PROBE
+            // [DOS-ERR-PREDICATE] at $FFC57E:
+            //   $FFC578: MOVEQ #29, D2
+            //   $FFC57A: CMP.L $4(A1), D2
+            //   $FFC57E: BNE $FFC58C  ; if mem[A1+$4] != 29 → load $128 (err 296)
+            // Capture A1 and the value of mem[A1+$4] (which is what the
+            // packet handler returned in the Res1 slot) plus all regs to
+            // identify the predicate input that decides "read/write error".
+            // Probe at $FFC57A (CMP) so D2 is set and we see A1.
+            if (is_settled && ex_pc == 32'h00FF_C57A)
+                $display("[FFC57A-CMP] r=%0d A1=%h D2=%h sp=%h A0=%h A2=%h A4=%h A6=%h D0=%h D1=%h",
+                    retired,
+                    u_rf.regs[9], u_rf.regs[2], u_rf.regs[15],
+                    u_rf.regs[8], u_rf.regs[10], u_rf.regs[12], u_rf.regs[14],
+                    u_rf.regs[0], u_rf.regs[1]);
+            // Also probe at the BRANCH point: $FFC57E reached, then either
+            // $FFC582 (D1=$120 path) or $FFC58C (D1=$128 err 296 path).
+            if (is_settled && ex_pc == 32'h00FF_C58C)
+                $display("[FFC58C-ERR296] r=%0d A1=%h (mem[A1+\$4]!=29 → DOS err 296)",
+                    retired, u_rf.regs[9]);
+            if (is_settled && ex_pc == 32'h00FF_C582)
+                $display("[FFC582-ERR288] r=%0d A1=%h (mem[A1+\$4]==29 → DOS err 288)",
+                    retired, u_rf.regs[9]);
+`endif
 `ifdef BOING_BUFFER_WR_TRACE
             // Watch CPU writes to the boing.samples destination buffer
             // area at chip $10000-$1F000.  Per the 16th-session boing
