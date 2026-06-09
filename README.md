@@ -112,9 +112,12 @@ ISA.md               instruction-encoding reference
 
 ```sh
 make test                 # default 2 cores, build + run every regression test
+make test-all             # test + test-ovl + DMA snoop + minimig + arbiter xchecks
 make bench                # build two 1-core sims (cache on/off), print table
 make N_CORES=4 build      # rebuild the multi-core sim for 4 cores
 make clean                # remove build/ and per-test logs
+make crosscheck-arbiter   # exercise agnus_arbiter slot reservations (Phases B/C/D/E/F)
+EXTRA_VERI_DEFS=+define+SLOT_ACCURATE_AGNUS make test    # CPU under slot-accurate Agnus timing
 ```
 
 Prerequisites: **Verilator 5.x**, **Python 3** (assembler + bench runner),
