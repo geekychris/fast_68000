@@ -3159,6 +3159,28 @@ module m68k_core #(
                     u_rf.regs[8], u_rf.regs[9],
                     u_rf.regs[13], u_rf.regs[14], u_rf.regs[15]);
 `endif
+`ifdef FF5364_PROBE
+            // Capture A2 at $FF5364: MOVEA.L $FF7C(A2), A4.  The struct
+            // field at offset -$84 from A2 holds the function pointer
+            // that gets dispatched (eventually leading to AutoRequest).
+            // Compare A2 + the loaded value to FS-UAE-no-UAEFS at the
+            // same boot moment to find the upstream divergence.
+            if (is_settled && ex_pc == 32'h00ff_5364) begin
+                $display("[FF5364] r=%0d A2=%h  D0=%h D1=%h D2=%h A0=%h A1=%h A5=%h A6=%h A7=%h",
+                    retired,
+                    u_rf.regs[10],  // A2
+                    u_rf.regs[0], u_rf.regs[1], u_rf.regs[2],
+                    u_rf.regs[8], u_rf.regs[9],
+                    u_rf.regs[13], u_rf.regs[14], u_rf.regs[15]);
+            end
+            // Same instruction, but capture A4 just AFTER it loaded —
+            // we'll see what value was at mem[A2 + $FF7C].  $FF5368 is
+            // the next PC ($FF5364 is 4 bytes), so probe there.
+            if (is_settled && ex_pc == 32'h00ff_5368) begin
+                $display("[FF5368] r=%0d A4=%h (loaded from A2+\$FF7C)",
+                    retired, u_rf.regs[12]);
+            end
+`endif
 `ifdef FF4D1C_RINGBUF
             // Dump ring buffer + log SP/mem[SP] for $FF4D00 entry too
             // — that's the routine's ACTUAL caller, since $FF4D02 is the
