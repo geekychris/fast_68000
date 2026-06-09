@@ -777,6 +777,14 @@ module m68k_bus #(
     // requires sprite vstart/vstop state to avoid 10× over-reservation.
     wire        dmaen_q  = dmacon[9];
     wire [3:0]  audn_en_w = {4{dmaen_q}} & dmacon[3:0];
+    // Phase E (coarse) inputs: bitplane DMA reservation during the
+    // visible display window.  bpl_active matches the existing
+    // m68k_bus.v predicate; DDFSTRT/DDFSTOP from chip_regs shadow;
+    // HIRES from BPLCON0 bit 15.
+    wire        bpl_active_w = bpl_active_now;
+    wire [7:0]  ddfstrt_w    = chip_regs[9'h092][7:0];
+    wire [7:0]  ddfstop_w    = chip_regs[9'h094][7:0];
+    wire        hires_w      = bplcon0_shadow[15];
 
     agnus_arbiter #(
         .N_PORTS     (N_PORTS),
@@ -790,6 +798,12 @@ module m68k_bus #(
         .hpos         (agnus_h),
         .dsk_active   (blk_busy),       // disk DMA running
         .audn_en      (audn_en_w),      // Phase D audio per-channel
+        .bpl_active   (bpl_active_w),   // Phase E bitplane DMA on
+        .vpos         (agnus_v),        // Phase E vertical beam
+        .bpu          (bpu),            // Phase E plane count
+        .hires        (hires_w),        // Phase E hires flag
+        .ddfstrt      (ddfstrt_w),      // Phase E DDF start
+        .ddfstop      (ddfstop_w),      // Phase E DDF stop
         .winner       (winner),
         .winner_valid (winner_valid),
         .grant        (arb_grant)

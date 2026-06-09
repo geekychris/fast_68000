@@ -51,6 +51,19 @@ module agnus_arbiter #(
     // approximate via "visible lines" still over-reserved by ~10× for
     // typical OS use (1-sprite mouse pointer).
     input  wire [3:0]                 audn_en,
+    // Phase E (coarse approximation): bitplane DMA reservation.
+    // `bpl_active` is BPLEN & DMAEN & BPU>0 (caller responsibility);
+    // `vpos`, `bpu`, and DDFSTRT/DDFSTOP shadows let the arbiter deny
+    // CPU on visible lines during the bitplane fetch window.  Coarse
+    // because we don't model the exact slot-within-8-cycle-group
+    // pattern, just "every Nth cycle" where N is derived from BPU
+    // and HIRES.  Phase E proper would model the precise pattern.
+    input  wire                       bpl_active,
+    input  wire [9:0]                 vpos,
+    input  wire [2:0]                 bpu,
+    input  wire                       hires,
+    input  wire [7:0]                 ddfstrt,
+    input  wire [7:0]                 ddfstop,
     output reg  [PID_BITS-1:0]        winner,
     output reg                        winner_valid,
     output reg  [N_PORTS-1:0]         grant
@@ -84,11 +97,44 @@ module agnus_arbiter #(
     // Independent of any DMACON bit — reservation is always-on under
     // SLOT_ACCURATE_AGNUS.
     wire is_eclk_slot = (hpos[9:0] == 10'd224);
+
+    // Phase E (coarse): bitplane DMA reservation during visible-line
+    // active fetch window.  Real Agnus reserves N slots in each
+    // 8-cycle group within DDFSTRT..DDFSTOP, where N depends on BPU
+    // and HIRES.  We approximate:
+    //   - visible line if 26 <= vpos <= 308 (PAL)
+    //   - active fetch window if (ddfstrt*2) <= hpos <= (ddfstop*2)+8
+    //   - reservation pattern by BPU/HIRES based on hpos[2:0]
+    // This is coarser than HRM appendix C but gives the dominant
+    // CPU-stall effect (~40% loss during display) that determines
+    // K1.3 boot pacing.
+    wire is_visible_line = (vpos >= 10'd26) && (vpos < 10'd309);
+    wire [9:0] ddfstrt_h = {2'd0, ddfstrt[7:0]} << 1;  // DDFSTRT in raw hpos
+    wire [9:0] ddfstop_h = {2'd0, ddfstop[7:0]} << 1;
+    wire in_fetch_window = (hpos >= ddfstrt_h) && (hpos <= ddfstop_h + 10'd8);
+    // Per-cycle reservation pattern in lowres (8-cycle group):
+    //   BPU=1: hpos[2:0] == 4 reserved
+    //   BPU=2: hpos[2:0] in {2,6} reserved
+    //   BPU=3: hpos[2:0] in {2,4,6} reserved
+    //   BPU=4: hpos[2:0] in {0,2,4,6} reserved (every even cycle)
+    //   BPU=5+: same as BPU=4 (lowres caps at 4 planes in HRM)
+    // Hires (which we don't reach in K1.3) would use a tighter 4-cycle
+    // group pattern — same coarse model, halved interval.
+    wire [2:0] hs = hires ? {1'b0, hpos[1:0]} : hpos[2:0];
+    wire bpl_pattern = !hs[0] &&  // always on an even cycle
+                       ( (bpu >= 3'd4) ? 1'b1 :
+                         (bpu == 3'd3) ? (hs[2:1] != 2'b00) :
+                         (bpu == 3'd2) ? (hs[2:1] == 2'b01 || hs[2:1] == 2'b11) :
+                         (bpu == 3'd1) ? (hs[2:1] == 2'b10) :
+                                         1'b0 );
+    wire is_bitplane_slot = bpl_active && is_visible_line &&
+                            in_fetch_window && bpl_pattern;
 `else
-    wire is_refresh_slot = 1'b0;
-    wire is_disk_slot    = 1'b0;
-    wire is_audio_slot   = 1'b0;
-    wire is_eclk_slot    = 1'b0;
+    wire is_refresh_slot   = 1'b0;
+    wire is_disk_slot      = 1'b0;
+    wire is_audio_slot     = 1'b0;
+    wire is_eclk_slot      = 1'b0;
+    wire is_bitplane_slot  = 1'b0;
 `endif
 
     // ---------------- Internal state ----------------
@@ -136,6 +182,14 @@ module agnus_arbiter #(
             // happens every line.  Denies all requesters; the slot
             // gives the CIAs an exclusive bus moment matching real
             // 6800-compatible cycle behavior.
+            winner = {PID_BITS{1'b0}};
+            winner_valid = 1'b0;
+        end else if (is_bitplane_slot) begin
+            // Phase E (coarse): bitplane DMA reservation.  When BPLEN
+            // is on and we're inside the visible display window, the
+            // bitplane fetcher owns a fraction of cycles (varies with
+            // BPU / HIRES).  Approximated by hpos[2:0]-pattern match
+            // against BPU.  See is_bitplane_slot definition above.
             winner = {PID_BITS{1'b0}};
             winner_valid = 1'b0;
         end else if (lock_pending) begin

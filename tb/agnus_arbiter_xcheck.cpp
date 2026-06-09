@@ -26,6 +26,8 @@ static void tick(Vagnus_arbiter_xcheck_top* dut) {
 }
 
 // Drive inputs, settle combinational `winner_valid`, then snapshot.
+// Phase E inputs default to "no bitplane DMA" so legacy tests keep
+// working unmodified.
 static void drive(Vagnus_arbiter_xcheck_top* dut,
                   uint16_t hpos, bool dsk_active, uint8_t audn_en,
                   uint8_t req, uint8_t lock) {
@@ -34,6 +36,32 @@ static void drive(Vagnus_arbiter_xcheck_top* dut,
     dut->audn_en    = audn_en & 0xF;
     dut->req        = req & 0xF;
     dut->lock       = lock & 0xF;
+    dut->bpl_active = 0;
+    dut->vpos       = 0;
+    dut->bpu        = 0;
+    dut->hires      = 0;
+    dut->ddfstrt    = 0;
+    dut->ddfstop    = 0;
+    dut->eval();
+}
+
+// Drive with bitplane DMA active.
+static void drive_bpl(Vagnus_arbiter_xcheck_top* dut,
+                      uint16_t hpos, uint16_t vpos,
+                      uint8_t bpu, bool hires,
+                      uint8_t ddfstrt, uint8_t ddfstop,
+                      uint8_t req) {
+    dut->hpos       = hpos;
+    dut->dsk_active = 0;
+    dut->audn_en    = 0;
+    dut->req        = req & 0xF;
+    dut->lock       = 0;
+    dut->bpl_active = 1;
+    dut->vpos       = vpos;
+    dut->bpu        = bpu;
+    dut->hires      = hires ? 1 : 0;
+    dut->ddfstrt    = ddfstrt;
+    dut->ddfstop    = ddfstop;
     dut->eval();
 }
 
@@ -142,6 +170,54 @@ int main(int argc, char** argv) {
     drive(dut, 100, /*dsk*/false, /*aud*/0xF, /*req*/0b0001, /*lock*/0);
     check_eq("free hpos=100 valid", 1, (int)dut->winner_valid);
     check_eq("free hpos=100 winner", 0, (int)dut->winner);
+
+    // ---------------- Phase E (coarse): bitplane slot reservation -----
+    // With bpl_active=1, bpu=1, ddfstrt=$38, ddfstop=$D0 (lowres
+    // typical), vpos=100 (visible line), hpos in the fetch window:
+    //   - Reserved cycles: hpos[2:0] == 4 (BPU=1 pattern)
+    //   - Other even cycles: free
+    //   - Odd cycles: free
+    // Outside the fetch window (e.g. hpos=300), free regardless.
+    printf("Phase E: BPU=1 lowres reserves hpos[2:0]==4 in fetch window\n");
+    {
+        const uint8_t ddfstrt = 0x38;
+        const uint8_t ddfstop = 0xD0;
+        // ddfstrt_h = $38<<1 = $70 = 112; ddfstop_h = $D0<<1 = $1A0 = 416.
+        // Pick hpos=120 (in window).  Test hpos[2:0] = 0..7.
+        for (int p = 0; p < 8; p++) {
+            uint16_t h = 112 + p;
+            drive_bpl(dut, h, /*vpos*/100, /*bpu*/1, /*hires*/false,
+                      ddfstrt, ddfstop, /*req*/0b0001);
+            bool reserved = (p == 4);
+            int expected = reserved ? 0 : 1;
+            char lbl[64];
+            snprintf(lbl, sizeof(lbl), "bpu1 fetch hpos=%u (p=%d) valid",
+                     h, p);
+            check_eq(lbl, expected, (int)dut->winner_valid);
+        }
+        // Outside fetch window: always free.
+        drive_bpl(dut, 60, 100, 1, false, ddfstrt, ddfstop, 0b0001);
+        check_eq("bpu1 pre-fetch hpos=60 valid", 1,
+                 (int)dut->winner_valid);
+        // Non-visible line: always free.
+        drive_bpl(dut, 116, 0, 1, false, ddfstrt, ddfstop, 0b0001);
+        check_eq("bpu1 vblank vpos=0 valid", 1,
+                 (int)dut->winner_valid);
+    }
+
+    // Phase E: BPU=2 reserves hpos[2:0] in {2, 6}; BPU=4 reserves all
+    // even cycles (0, 2, 4, 6).
+    printf("Phase E: BPU=4 lowres reserves all even cycles in window\n");
+    for (int p = 0; p < 8; p++) {
+        uint16_t h = 112 + p;
+        drive_bpl(dut, h, 100, 4, false, 0x38, 0xD0, 0b0001);
+        bool reserved = ((p & 1) == 0);  // even
+        int expected = reserved ? 0 : 1;
+        char lbl[64];
+        snprintf(lbl, sizeof(lbl), "bpu4 fetch hpos=%u (p=%d) valid",
+                 h, p);
+        check_eq(lbl, expected, (int)dut->winner_valid);
+    }
 
     // ---------------- Round-robin still works across free cycles ----
     // Drive two ports at hpos=100 — round-robin fairness implies the

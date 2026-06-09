@@ -21,6 +21,14 @@ module agnus_arbiter_xcheck_top #(
     input  wire [9:0]                 hpos,
     input  wire                       dsk_active,
     input  wire [3:0]                 audn_en,
+    // Phase E coarse-bitplane inputs (set bpl_active=0 to disable for
+    // Phases B/C/D/F-ECLK isolation tests).
+    input  wire                       bpl_active,
+    input  wire [9:0]                 vpos,
+    input  wire [2:0]                 bpu,
+    input  wire                       hires,
+    input  wire [7:0]                 ddfstrt,
+    input  wire [7:0]                 ddfstop,
     output wire [PID_BITS-1:0]        winner,
     output wire                       winner_valid,
     output wire [N_PORTS-1:0]         grant
@@ -37,6 +45,12 @@ module agnus_arbiter_xcheck_top #(
         .hpos         (hpos),
         .dsk_active   (dsk_active),
         .audn_en      (audn_en),
+        .bpl_active   (bpl_active),
+        .vpos         (vpos),
+        .bpu          (bpu),
+        .hires        (hires),
+        .ddfstrt      (ddfstrt),
+        .ddfstop      (ddfstop),
         .winner       (winner),
         .winner_valid (winner_valid),
         .grant        (grant)

@@ -142,12 +142,35 @@ Also fidelity-fixed during this phase: refresh slot reservation was
 Per HRM appendix C, refresh occupies cycles 0, 2, 4, 6 only (4 cycles
 per line).  Corrected to `!hpos[0] && hpos[9:1] < 4`.
 
-### Phase E — Bitplane slots (2-3 sessions)
+### Phase E — Bitplane slots [PARTIAL: coarse approximation landed]
 
 - BPLEN + DDFSTRT/DDFSTOP gate bitplane fetch slots, varies by
-  BPU/hires.  Existing approximation in `m68k_bus.v` becomes the
-  reference; replace with slot-by-slot.
-- Verify: WB1.3 render byte-identical to current at idle.
+  BPU/hires.  Coarse approximation implemented:
+  - Reservation only when `bpl_active` AND visible line
+    (vpos in [26, 308] PAL) AND in DDF fetch window
+    `[ddfstrt*2, ddfstop*2 + 8]`
+  - Per-cycle pattern by BPU in lowres:
+    - BPU=1: hpos[2:0] == 4 reserved (1 slot per 8)
+    - BPU=2: hpos[2:0] in {2, 6} reserved (2 slots per 8)
+    - BPU=3: hpos[2:0] in {2, 4, 6} reserved
+    - BPU=4+: all even hpos[2:0] reserved (4 slots per 8)
+  - Hires uses tighter 4-cycle group (hpos[1:0] instead of [2:0])
+- Sprite slot reservation remains deferred — needs per-sprite
+  vstart/vstop state, not just SPREN/visible-line gating.
+- m68k_bus.v threads `bpl_active_now`, `agnus_v`, `bpu`,
+  `bplcon0_shadow[15]` (hires), `chip_regs[$092]` (DDFSTRT),
+  `chip_regs[$094]` (DDFSTOP) to the arbiter.
+
+Unit test coverage in `crosscheck-arbiter`:
+- BPU=1 fetch window: hpos[2:0]==4 denies, others grant
+- BPU=4 fetch window: all even hpos[2:0] deny, odd grant
+- Outside fetch window: always free
+- Non-visible line (vpos=0): always free
+
+Tradeoff: this is coarser than HRM appendix C's exact slot allocation
+but captures the dominant CPU-stall effect (~40% loss at BPU=4 lowres
+during display).  Precise slot-by-slot fidelity would model each
+BPLxPT increment cycle separately and is out of scope for this phase.
 
 ### Phase F — Even/odd slot enforcement for blitter/copper/CPU
        (1-2 sessions, PARTIAL)
