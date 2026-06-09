@@ -187,6 +187,10 @@ BPLxPT increment cycle separately and is out of scope for this phase.
   `SLOT_ACCURATE_AGNUS`.  Matches real Agnus's 6800-bus-compatible
   peripheral slot, giving CIAs an exclusive bus moment.
 - Verify: cpu_fuzz.py still clean (no instruction-timing bugs).
+  **LANDED.**  Verified 200/200 mem-src-dst + 50/50 mem-dst cases
+  pass under `+define+SLOT_ACCURATE_AGNUS` — CPU instruction
+  semantics unaffected by slot reservation (slots only add memory
+  latency, never change CPU result).
 
 ECLK reservation is verified by the `crosscheck-arbiter` unit test:
 "ECLK slot rejects CPU req at hpos 224 only" — confirms hpos 224
