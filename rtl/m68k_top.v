@@ -291,6 +291,7 @@ module m68k_top #(
         .mouse_y_in     (mouse_y_count),
         .mouse_btn_r_in (mouse_btn_r),
         .vblank_pulse_o (vblank_pulse),
+        .agnus_h_o      (agnus_h_top),
         .dskblk_pulse_o (dskblk_pulse),
         .dsksyn_pulse_o (dsksyn_pulse),
         .ovl_clear_pulse_o (ovl_clear_pulse),
@@ -562,6 +563,7 @@ module m68k_top #(
         .mst_rdata  (cop_mst_rdata),
         .blt_busy_i (blt_busy),
         .vbeam_i    (vbeam),
+        .hbeam_i    (agnus_h_top[7:0]),
         .auto_kick_i   (vblank_pulse),
         .auto_active_i (bus_cop_auto_active),
         .cdang_i       (bus_cop_cdang)
@@ -634,6 +636,7 @@ module m68k_top #(
 
     wire [2:0] paula_irq_level;
     wire       vblank_pulse;
+    wire [9:0] agnus_h_top;
     wire       dskblk_pulse;
     wire       dsksyn_pulse;
     wire       ovl_clear_pulse;

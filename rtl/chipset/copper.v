@@ -35,13 +35,15 @@
 //     (raster already past the target position), skip the next 4
 //     bytes (advance PC by 4 instead of just continuing).
 //
-// vbeam_i carries the Denise raster row (V) only -- there is no Agnus
-// H-position signal in this codebase yet.  The H comparison in WAIT/
-// SKIP is therefore treated as ALWAYS SATISFIED for now: the V
-// comparison alone decides.  This is sufficient for every line-grain
-// raster trick a Copper list does, and matches the simplification
-// already used by `tools/render_k13_screen.py`.  TODO: wire a real H
-// counter (e.g. from Agnus when it lands) and tighten the compare.
+// vbeam_i carries the Denise raster row (V).  hbeam_i carries the
+// Agnus horizontal beam position (H, 8 bits, agnus_h[7:0]).  The
+// WAIT/SKIP comparator follows HRM semantics:
+//   match when (V > VP) OR (V == VP AND H >= HP)
+// Each side of the compare is masked with vp_mask / hp_mask as the
+// Copper instruction specifies.  Legacy harnesses that don't have an
+// H signal can tie hbeam_i to 0 — WAIT lists that don't use HP (hp
+// fields zero) still match correctly because hp_mask=0 forces
+// h_match=1 trivially.
 //
 // Slave port (legacy harness compat, kept verbatim) at
 // $00FE_0040..$00FE_007F:
@@ -80,10 +82,13 @@ module copper (
     // kept on the port for legacy harness compat).
     input  wire        blt_busy_i,
 
-    // Current Denise raster row.  Carries V only; H is unavailable in
-    // this codebase, so WAIT/SKIP treat the H comparator as always
-    // satisfied (see header comment).
+    // Current Denise raster row (vertical position, V).
     input  wire [15:0] vbeam_i,
+    // Current Agnus horizontal beam position (H).  Drives WAIT/SKIP
+    // tighter than the original V-only compare.  Caller can tie to 0
+    // for legacy harness compat — H matches default to satisfied when
+    // hp_mask is also 0 (vanilla WAIT 0,0 semantics).
+    input  wire [7:0]  hbeam_i,
     input  wire        auto_kick_i,
     input  wire        auto_active_i,
     // COPCON.CDANG: 0 = Copper restricted to chip regs $80+ (default OCS);
@@ -127,22 +132,24 @@ module copper (
     wire [5:0] hp_mask   = ir2_q[6:1];    // [6:1]  = 6 bits
     wire       skip_bit  = ir2_q[0];      // 1 = SKIP, 0 = WAIT
 
-    // V-only compare: ((vbeam_v & vp_mask) >= vp_target).  Take vbeam_i's
+    // V compare: ((vbeam_v & vp_mask) >= vp_target).  Take vbeam_i's
     // low 8 bits as the current V (Denise row counter); mask with the
     // 7-bit vp_mask zero-extended to 8 bits (HRM uses VP=8 bits; high
-    // bit is always enabled in real Agnus comparator, which matches
-    // masking with 0xFF in our simplified model when vp_mask has the
-    // high bit implicitly enabled.  We follow CopperSim and ignore the
-    // mask's high-bit subtlety; using only the 7 low mask bits is fine
-    // for end-of-list ($FF,$FE) and for any V threshold under 128).
+    // bit is always enabled in real Agnus comparator).
     wire [7:0] vbeam_v = vbeam_i[7:0];
-    wire [7:0] vp_mask_ext = {1'b1, vp_mask};   // top bit always enabled
-    wire       v_match    = ((vbeam_v & vp_mask_ext) >= vp_target);
-    // H comparator stubbed as always satisfied (see header comment).
-    wire       h_match    = 1'b1;
-    // Suppress Verilator unused-bit warning on hp_target / hp_mask:
-    wire _unused_hp = |{hp_target, hp_mask};
-    wire       raster_match = v_match && h_match;
+    wire [7:0] vp_mask_ext = {1'b1, vp_mask};
+    wire       v_strict_match = ((vbeam_v & vp_mask_ext) > vp_target);
+    wire       v_eq_match     = ((vbeam_v & vp_mask_ext) == vp_target);
+    // H compare: ((hbeam_h & hp_mask) >= hp_target), but only used as a
+    // tie-breaker when v_eq_match is true.  Per HRM, the comparator
+    // matches when (V > VP) OR (V == VP AND H >= HP).  hp_target is
+    // 7-bit (bits [7:1] of HP word); we compare against hbeam_i[7:1]
+    // similarly.  When hp_mask is 0, h_match is always true and the
+    // WAIT degenerates to V-only — matches the previous behavior for
+    // legacy lists that don't care about H precision.
+    wire [6:0] hbeam_h  = hbeam_i[7:1];
+    wire       h_match  = ((hbeam_h & hp_mask) >= hp_target);
+    wire       raster_match = v_strict_match || (v_eq_match && h_match);
 
     // ---------------- IR1 decode --------------------------------------
     wire       is_move = !ir1_q[0];

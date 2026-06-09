@@ -171,6 +171,9 @@ module m68k_bus #(
     // Wire into Paula's vblank_int_i so the system-tick interrupt (VERTB,
     // INTREQ bit 5, IPL 3) fires once per frame.
     output wire                           vblank_pulse_o,
+    // Live Agnus horizontal beam position.  Fed to Copper as hbeam_i
+    // for tight WAIT/SKIP raster compare.
+    output wire [9:0]                     agnus_h_o,
     output wire                           dskblk_pulse_o,
     // Bitplane DMA shadow outputs for Denise auto-rasterisation.
     // BPLnPT pointers come from the chipset shadow chip_regs[$E0..$F6],
@@ -405,6 +408,7 @@ module m68k_bus #(
     // "next advance would wrap the line AND we're on the last line".
     wire beam_line_wraps_next = (agnus_h + beam_stride > AGNUS_H_LAST);
     assign vblank_pulse_o = beam_line_wraps_next && (agnus_v == AGNUS_V_LAST);
+    assign agnus_h_o      = agnus_h;
     // Beam tick.  Increment H every clock; on wrap, increment V; on V wrap,
     // back to 0.  In a real Amiga the H tick is one bus cycle (8 master
     // clocks); here we tick once per system clock so the counter advances

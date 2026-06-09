@@ -224,6 +224,7 @@ module minimig_cop_xcheck_top (
         .mst_rdata     (our_mst_rdata),
         .blt_busy_i    (1'b0),
         .vbeam_i       ({8'd0, vpos_in}),
+        .hbeam_i       (8'd0),
         .auto_kick_i   (sof_in),
         .auto_active_i (1'b1),
         .cdang_i       (1'b1)
