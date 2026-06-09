@@ -3207,6 +3207,38 @@ module m68k_core #(
                 $display("[BLT-BOING-SIZE] r=%0d pc=%h BLTSIZE=%h be=%b",
                     retired, ex_pc, dc_wdata, dc_be);
 `endif
+`ifdef DOIO_PROBE
+            // [DoIO] at PC=\$FFD3FC: just before the BCPL wrapper for
+            // exec.library:DoIO (LVO -456 = \$FFFFFE38).
+            // Through \$FF46E8 wrapper:
+            //   A1 = IORequest <-- mem[(BCPL_A1)+\$10]
+            // So we want to capture A1 AT \$FF46F8 (which loads A1 = mem[BCPL_A1+\$10]).
+            // But simpler to probe AT the DoIO JSR site \$FF4700 with A1 fully loaded.
+            if (is_settled && ex_pc == 32'h00FF_4700)
+                $display("[DoIO-CALL] r=%0d A1=%h (IORequest) A0=%h A2=%h D0=%h D1=%h",
+                    retired,
+                    u_rf.regs[9], u_rf.regs[8], u_rf.regs[10],
+                    u_rf.regs[0], u_rf.regs[1]);
+`endif
+`ifdef OPENDEVICE_PROBE
+            // [OD] at PC=\$FFD42A: just before the BCPL wrapper for
+            // exec.library:OpenDevice (LVO -456 = \$FFFFFE38).
+            // Through \$FF46E8 wrapper, the args become:
+            //   A0 = device name ptr   <-- BCPL D4 (= u_rf.regs[4])
+            //   D0 = unit number       <-- BCPL D2 (= u_rf.regs[2])
+            //   D1 = flags             <-- BCPL D3 (= u_rf.regs[3])
+            //   A1 = IORequest         <-- mem[A1+\$10]
+            // Capturing these tells us WHICH device is being opened.
+            if (is_settled && ex_pc == 32'h00FF_D42A)
+                $display("[OPENDEV] r=%0d A1=%h name_ptr=D4=%h unit=D2=%h flags=D3=%h",
+                    retired, u_rf.regs[9],
+                    u_rf.regs[4], u_rf.regs[2], u_rf.regs[3]);
+            // Also probe just AFTER the OpenDevice JSR returns
+            // (\$FFD432) to capture the result code in D0.
+            if (is_settled && ex_pc == 32'h00FF_D432)
+                $display("[OPENDEV-RET] r=%0d D0=%h D1=%h (OpenDevice ret: 0=success, nonzero=error)",
+                    retired, u_rf.regs[0], u_rf.regs[1]);
+`endif
 `ifdef CALLER_OF_D2EQ0
             // Capture caller of the BCPL dispatcher at $FF4134 when
             // the dispatch will store 0 at $C00EC8 (mem[A1+$4] at the
