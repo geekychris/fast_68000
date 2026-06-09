@@ -3180,6 +3180,36 @@ module m68k_core #(
                 $display("[FF5368] r=%0d A4=%h (loaded from A2+\$FF7C)",
                     retired, u_rf.regs[12]);
             end
+            // Capture caller of the $FF5354 routine entry: dump ring +
+            // registers + 4 words of stack so we identify the upstream
+            // dispatcher selection that landed us here.
+            if (is_settled && ex_pc == 32'h00ff_5354) begin
+                $display("[FF5354-ENTRY] r=%0d A1=%h A2=%h A5=%h A6=%h A7=%h",
+                    retired,
+                    u_rf.regs[9], u_rf.regs[10], u_rf.regs[13],
+                    u_rf.regs[14], u_rf.regs[15]);
+                $display("  ring (last 16 retired PCs leading to entry):");
+                $display("    [-15..-12]=%h %h %h %h",
+                         pc_ring[ring_head + 4'd1],
+                         pc_ring[ring_head + 4'd2],
+                         pc_ring[ring_head + 4'd3],
+                         pc_ring[ring_head + 4'd4]);
+                $display("    [-11..-8] =%h %h %h %h",
+                         pc_ring[ring_head + 4'd5],
+                         pc_ring[ring_head + 4'd6],
+                         pc_ring[ring_head + 4'd7],
+                         pc_ring[ring_head + 4'd8]);
+                $display("    [-7..-4]  =%h %h %h %h",
+                         pc_ring[ring_head + 4'd9],
+                         pc_ring[ring_head + 4'd10],
+                         pc_ring[ring_head + 4'd11],
+                         pc_ring[ring_head + 4'd12]);
+                $display("    [-3..-0]  =%h %h %h %h",
+                         pc_ring[ring_head + 4'd13],
+                         pc_ring[ring_head + 4'd14],
+                         pc_ring[ring_head + 4'd15],
+                         pc_ring[ring_head]);
+            end
 `endif
 `ifdef FF4D1C_RINGBUF
             // Dump ring buffer + log SP/mem[SP] for $FF4D00 entry too
