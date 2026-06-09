@@ -927,6 +927,35 @@ wb-screenshot-final:
 	@$(MAKE) --no-print-directory wb-screenshot STOP=0
 
 # ---------------------------------------------------------------------------
+# wb-desktop: boot WB1.3 through to the Workbench DESKTOP state (not
+# just the CLI banner that `wb-screenshot` shows).  Runs ~210M retired
+# instructions, then renders the chipram + slowram via render_k13_screen.
+# Captures icons (RAM DISK, Workbench1.3), title bar with free-memory
+# count, desktop background — the real "Amiga is running" view.
+# ---------------------------------------------------------------------------
+wb-desktop:
+	@echo "Booting K1.3 + WB1.3 to Workbench desktop (1.7B cycles)..."
+	@rm -rf build_kick_boot
+	@BOOT_TRACE=0 \
+	    KBD_AUTO_INJECT='dir\n' \
+	    KBD_AUTO_INJECT_START=1400000000 \
+	    KBD_AUTO_INJECT_PERIOD=5000000 \
+	    CHIPRAM_DUMP=/tmp/wb_chipram_desktop.bin \
+	    SLOWRAM_DUMP=/tmp/wb_slowram_desktop.bin \
+	    ADFFILE=kickstart/wb13.adf \
+	    ROMFILE=kickstart/kick_13.bin \
+	    ROMCYCLES=1700000000 \
+	    $(MAKE) --no-print-directory test-kickstart-boot 2>&1 | tail -3 || true
+	@echo "Rendering Workbench desktop..."
+	@$(PYTHON) tools/render_k13_screen.py \
+	    --chipram /tmp/wb_chipram_desktop.bin \
+	    --slowram /tmp/wb_slowram_desktop.bin \
+	    --width 640 --height 200 \
+	    --out /tmp/wb_desktop.png
+	@echo "Saved /tmp/wb_desktop.png"
+	@if command -v open >/dev/null 2>&1; then open /tmp/wb_desktop.png; fi
+
+# ---------------------------------------------------------------------------
 # wb-trace-blits: boot WB1.3 with +define+BLT_BORDER_TRACE and save the
 # full blit trace.  Use with tools/blt_trace.py to analyse:
 #

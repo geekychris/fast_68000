@@ -117,6 +117,8 @@ make bench                # build two 1-core sims (cache on/off), print table
 make N_CORES=4 build      # rebuild the multi-core sim for 4 cores
 make clean                # remove build/ and per-test logs
 make crosscheck-arbiter   # exercise agnus_arbiter slot reservations (Phases B/C/D/E/F)
+make wb-screenshot        # boot K1.3+WB1.3 to CLI banner; render PNG
+make wb-desktop           # boot K1.3+WB1.3 deep into Workbench desktop (icons, RAM disk)
 EXTRA_VERI_DEFS=+define+SLOT_ACCURATE_AGNUS make test    # CPU under slot-accurate Agnus timing
 ```
 
