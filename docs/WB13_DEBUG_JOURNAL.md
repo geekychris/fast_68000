@@ -5292,3 +5292,41 @@ corrected hypothesis and the FS-UAE comparison data.
    CPU PC through K1.3 init when the FS-UAE window was backgrounded.
    For comparison runs, use saved `.uss` state files pre-positioned
    at WB1.3 idle and skip the boot.
+
+
+### §60l. The real root cause: BCPL DOS buffer-allocation is LOW vs HIGH
+
+Cross-referencing chip-RAM POINTERS in slow RAM (FS-UAE vs ours):
+
+```
+slow $C04788 :  FS-UAE = $00010C0C    OUR SIM = $00001774
+slow $C00C9C :  FS-UAE = $00010A0C    OUR SIM = $00001574
+slow $C04786 :  (only in ours) = $1774
+slow $C012D0 :  (only in ours) = $12F0
+```
+
+Real K1.3 places BCPL DOS file-header buffers in chip RAM **$10000+
+range** (above the WB1.3 bitplane at $60C8).  Our sim places the same
+buffers in chip RAM **$1500-$1800 range**.
+
+So when K1.3 graphics line-draws happen to land in the $1500-$1800 area
+(which they do in both sims), real K1.3's BCPL buffers are
+unaffected — they're at $10A0C, $10C0C, etc.  In OUR sim, they're at
+$1574, $1774, etc. — directly in the line-draw target area.
+
+This is **the root cause** of the boing failure.  It's NOT a blitter
+bug, NOT a graphics bug, NOT a CPU bug.  It's a chip-RAM allocation
+divergence at the BCPL-DOS init phase.
+
+WHY ours allocates LOW while real K1.3 allocates HIGH: the chip-RAM
+free-list state at the moment K1.3 BCPL inits is different between
+our sim and FS-UAE.  Earlier (in WB1.3 init) we have some chip-RAM
+behavior that doesn't match.  Per
+`project_boing_chip_freelist.md`, our chip MH_FIRST chain has been
+known-divergent for many sessions: 448KB orphaned at $10170, free
+list truncates after one 64-byte chunk.
+
+So the actionable path is to fix the EARLIER chip-RAM-allocation
+divergence, not to fix the boing-specific symptoms.  Once the
+allocator returns the same chunks as real K1.3, BCPL will place its
+buffers at $10A0C and the line-draw conflict disappears.
