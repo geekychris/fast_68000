@@ -3087,6 +3087,38 @@ module m68k_core #(
                 $display("[PC-SAMPLE] r=%0d pc=%h sp=%h A6=%h",
                     retired, ex_pc, u_rf.regs[15], u_rf.regs[14]);
 `endif
+`ifdef ADDTASK_TRACE
+            // Catch every call to exec.library AddTask ($FC1C84 in K1.3
+            // ROM).  A1 points to the new Task struct; A1+10 is
+            // tc_Node.ln_Name (pointer to ASCII name).  Tracking these
+            // identifies whether boing! ever got CreateProc'd.  If
+            // boing.samples decode succeeded but boing! task never
+            // appears, AddTask was not called → CreateProc upstream
+            // failed.
+            if (is_settled && ex_pc == 32'h00fc_1c84)
+                $display("[ADDTASK] r=%0d task=%h name_ptr=mem[A1+10] A0=%h A1=%h",
+                    retired, u_rf.regs[9], u_rf.regs[8], u_rf.regs[9]);
+`endif
+`ifdef BOING_FLAG_WR
+            // Catch any write to chip \$10256 — boing!'s main-loop wait
+            // flag.  If the flag never gets set, boing! main loop spins
+            // forever at \$C09762.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h00010254 && dc_addr <= 32'h00010259)
+                $display("[BOING_FLAG] r=%0d pc=%h addr=%h wdata=%h",
+                    retired, ex_pc, dc_addr, dc_wdata);
+`endif
+`ifdef BOING_SLOW_PC_CATCH
+            // boing!'s code lives at slow \$C07984+ (per cli_Module BPTR
+            // \$301E61) and dos.library code clusters at \$C09D44+/\$C0A130+.
+            // Catch any PC in \$C04000..\$C0AFFF range (BCPL CLI + loaded
+            // user code) every 4K retired.
+            if (is_settled && retired >= 32'd5_000_000 &&
+                ex_pc >= 32'h00c0_4000 && ex_pc <= 32'h00c0_afff &&
+                retired[11:0] == 12'd0)
+                $display("[SLOW-USER-PC] r=%0d pc=%h sp=%h A6=%h A4=%h",
+                    retired, ex_pc, u_rf.regs[15], u_rf.regs[14], u_rf.regs[12]);
+`endif
 `ifdef BOING_CHIP_PC_CATCH
             // Catch any execution in chip RAM range that's NOT in the
             // K1.3 BCPL low-area ($0..$3FF vector table) or the CLI's
