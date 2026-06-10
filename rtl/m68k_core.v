@@ -3327,6 +3327,25 @@ module m68k_core #(
                     u_rf.regs[0], u_rf.regs[1],
                     u_rf.regs[8], u_rf.regs[9]);
 `endif
+`ifdef C04A88_WR_TRACE
+            // Probe writes to slow $C04A88..$C04A97 — K1.3 trackdisk
+            // IORequest struct at A1=$C04A82.  In our sim these slots
+            // are populated with BCPL DOS struct pointers
+            // ($C0040C, $C00A80, $C00CA8, $C04730) — FS-UAE has all
+            // zeros.  The destination buffer pointer fed to the
+            // MFM-decode blit at $FEA992 is read from mem[A1+12]
+            // = $C04A8E and resolves to chip $1574 in our sim.
+            //
+            // Identify the K1.3 ROM PC that writes those non-zero
+            // pointers — that is the upstream divergence causing
+            // the MFM-decode to land in the wrong chip-RAM region.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h00C0_4A88 && dc_addr <= 32'h00C0_4A97)
+                $display("[C04A88-WR] r=%0d pc=%h addr=%h wdata=%h be=%b D0=%h D1=%h A0=%h A1=%h",
+                    retired, ex_pc, dc_addr, dc_wdata, dc_be,
+                    u_rf.regs[0], u_rf.regs[1],
+                    u_rf.regs[8], u_rf.regs[9]);
+`endif
 `ifdef CALLER_OF_D2EQ0
             // Capture caller of the BCPL dispatcher at $FF4134 when
             // the dispatch will store 0 at $C00EC8 (mem[A1+$4] at the
@@ -4007,6 +4026,26 @@ module m68k_core #(
                 retired >= 32'd4_180_000 && retired <= 32'd4_200_000)
                 $display("[BLTMOD-WR] r=%d pc=%h addr=%h be=%b wdata=%h",
                     retired, ex_pc, dc_addr, dc_be, dc_wdata);
+`ifdef BLTAMOD_FF2E_TRACE
+            // [BLTAMOD-FF2E]: catch the CPU write that puts $FF2E or
+            // sign-extended $FFFFFF2E into BLTAMOD ($DFF064).
+            // Boing-disk: blit #15 to chip $1574 has amod=$FFFFFF2E
+            // while blits 1-14 had amod=0 — find who set it.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h00DF_F060 && dc_addr <= 32'h00DF_F067 &&
+                (dc_wdata[15:0] == 16'hFF2E ||
+                 dc_wdata[31:16] == 16'hFF2E))
+                $display("[BLTAMOD-FF2E] r=%d pc=%h addr=%h be=%b wdata=%h A0=%h A1=%h",
+                    retired, ex_pc, dc_addr, dc_be, dc_wdata,
+                    u_rf.regs[8], u_rf.regs[9]);
+            // Also catch all BLTAMOD/BLTDMOD writes in the window of
+            // r=10_500_000..10_520_000 (15-blit failing window).
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h00DF_F060 && dc_addr <= 32'h00DF_F067 &&
+                retired >= 32'd10_500_000 && retired <= 32'd10_520_000)
+                $display("[BLTMOD-WIN] r=%d pc=%h addr=%h be=%b wdata=%h",
+                    retired, ex_pc, dc_addr, dc_be, dc_wdata);
+`endif
             // [BLT-DST-SRC]: probe registers right after the MOVEM.L $8(A1)
             // at $FEA97A that loads D0/D1/A5 from the struct.  This is the
             // graphics primitive that computes BLTDPT = D1 + $200 - 1.

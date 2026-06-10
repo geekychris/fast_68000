@@ -1134,9 +1134,21 @@ module m68k_bus #(
                                  : {{16{amiga_wdata_half[15]}}, amiga_wdata_half};
             end
             5'd17: begin                      // BLTBMOD ($DFF062)
+                // .L writes also commit BLTAMOD ($DFF064), same pattern as
+                // BLTCMOD/BLTBMOD (slot 5'd16) and BLTAMOD/BLTDMOD (slot 5'd18).
+                // K1.3 trackdisk at $FEAF5C does `MOVE.L D0,(A1)+` with
+                // A1=$DFF062, clearing BOTH BLTBMOD and BLTAMOD before each
+                // MFM-decode setup.  Without this split, BLTAMOD retains its
+                // stale value from the last graphics line-draw (e.g. $FFFFFF2E
+                // from PC=$FC56F0 Bresenham setup), and the resulting MFM
+                // decode walks A pointer wrong → garbage OFS block at the
+                // BCPL DOS buffer chip $1574 → boing-disk AUTO-REQ.
+                // See project_boing_blitter_mfm_decode_bug.md.
                 blt_xlat_valid = 1'b1;
                 blt_xlat_addr  = 6'h20;
-                blt_xlat_wdata = {{16{amiga_wdata_half[15]}}, amiga_wdata_half};
+                blt_xlat_wdata = (is_long[winner] && be[winner] == 4'b1111)
+                                 ? wdata[winner]
+                                 : {{16{amiga_wdata_half[15]}}, amiga_wdata_half};
             end
             5'd18: begin                      // BLTAMOD ($DFF064)
                 // .L writes also commit BLTDMOD ($DFF066), same pattern

@@ -475,11 +475,32 @@ module blitter (
                         if (slv_is_long) begin
                             bltamod <= {{16{slv_wdata[31]}}, slv_wdata[31:16]};
                             bltdmod <= {{16{slv_wdata[15]}}, slv_wdata[15:0]};
+`ifdef BLTAMOD_WR_TRACE
+                            $display("[BLTAMOD-WR] cycle=%0t LONG amod<=%h dmod<=%h",
+                                $time, {{16{slv_wdata[31]}}, slv_wdata[31:16]},
+                                {{16{slv_wdata[15]}}, slv_wdata[15:0]});
+`endif
                         end else begin
                             bltamod <= slv_wdata;
+`ifdef BLTAMOD_WR_TRACE
+                            $display("[BLTAMOD-WR] cycle=%0t WORD amod<=%h",
+                                $time, slv_wdata);
+`endif
                         end
                     end
-                    4'h8: bltbmod      <= slv_wdata;
+                    // BLTBMOD .L from CPU (MOVE.L to $DFF062) commits both
+                    // BLTBMOD (high 16, sign-ext) AND BLTAMOD (low 16,
+                    // sign-ext).  Mirrors slot 4'h7 (BLTAMOD/BLTDMOD) and
+                    // 4'h9 (BLTCMOD/BLTBMOD).  K1.3 trackdisk pre-MFM-decode
+                    // resets both via `MOVE.L D0,(A1)+` at $FEAF5C.
+                    4'h8: begin
+                        if (slv_is_long) begin
+                            bltbmod <= {{16{slv_wdata[31]}}, slv_wdata[31:16]};
+                            bltamod <= {{16{slv_wdata[15]}}, slv_wdata[15:0]};
+                        end else begin
+                            bltbmod <= slv_wdata;
+                        end
+                    end
                     // BLTCMOD .L from CPU (MOVE.L to $DFF060) commits both
                     // BLTCMOD (high 16, sign-ext) AND BLTBMOD (low 16,
                     // sign-ext).
