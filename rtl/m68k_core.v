@@ -3099,6 +3099,16 @@ module m68k_core #(
                 $display("[ADDTASK] r=%0d task=%h name_ptr=mem[A1+10] A0=%h A1=%h",
                     retired, u_rf.regs[9], u_rf.regs[8], u_rf.regs[9]);
 `endif
+`ifdef PUTMSG_TRACE
+            // Catch every PutMsg call (\$FC1B70 in K1.3 ROM).
+            // ABI: A0 = MsgPort, A1 = Message.
+            // Filter: only fire when A0 = boing's UserPort (\$C0C6C8)
+            // OR when retired is in the boing-input window.
+            if (is_settled && ex_pc == 32'h00fc_1b70 &&
+                retired >= 32'd8_000_000)
+                $display("[PUTMSG] r=%0d A0=%h A1=%h",
+                    retired, u_rf.regs[8], u_rf.regs[9]);
+`endif
 `ifdef BOING_WIN_PTR_TRACE
             // Catch ALL writes to chip \$102A8/\$102AC (boing's stored
             // Window/Screen ptr globals).  We see them end up non-zero
