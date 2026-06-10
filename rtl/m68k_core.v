@@ -3284,6 +3284,19 @@ module m68k_core #(
                 $display("[OPENDEV-RET] r=%0d D0=%h D1=%h (OpenDevice ret: 0=success, nonzero=error)",
                     retired, u_rf.regs[0], u_rf.regs[1]);
 `endif
+`ifdef C00EAC_WR_TRACE
+            // Probe writes to slow $C00EAC — at $FFC3A2, K1.3 reads
+            // mem[$C00EAC] as a BPTR index, shifts <<2, then uses it
+            // to index a chip-RAM struct.  The result becomes $55D
+            // (= chip $1574) for the failing checksum case.
+            // Find what writes the failing-case index value.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr == 32'h00C0_0EAC)
+                $display("[C00EAC-WR] r=%0d pc=%h wdata=%h be=%b D0=%h D1=%h A0=%h A1=%h",
+                    retired, ex_pc, dc_wdata, dc_be,
+                    u_rf.regs[0], u_rf.regs[1],
+                    u_rf.regs[8], u_rf.regs[9]);
+`endif
 `ifdef C00EB0_WR_TRACE
             // Probe writes to slow $C00EB0 — the BPTR slot that ends up
             // fed to checksum routine $FFED98 as input D1.  At $FFC416,
