@@ -590,6 +590,13 @@ module blitter (
                                     bltafwm[15:0], bltalwm[15:0],
                                     bltamod, bltbmod, bltcmod, bltdmod,
                                     bltadat_pre[15:0], bltbdat_pre[15:0], bltcdat_pre[15:0]);
+                            // Extra-narrow: only the DIFFERENTIAL blit in bisect-4
+                            // (cmod=\$2A and amod=\$FFFFFF2E).  Fire \$display with
+                            // distinctive tag so the parent log can search for it.
+                            if (bltdpt[31:0] >= 32'h0000_1574 && bltdpt[31:0] <= 32'h0000_1773
+                                && bltcmod == 32'h0000_002A)
+                                $display("[BLT_DIFFERENTIAL] bltcpt=%h bltdpt=%h bltamod=%h bltcmod=%h ← THE EXTRA BLIT",
+                                    bltcpt, bltdpt, bltamod, bltcmod);
 `endif
 `ifdef KICKSTART_BOOT_TRACE
                             $display("[BLT_START] bltcon=%h bltapt=%h bltbpt=%h bltcpt=%h bltdpt=%h bltsize=%h bltamod=%h bltbmod=%h bltcmod=%h bltdmod=%h",
