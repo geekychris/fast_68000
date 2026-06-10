@@ -3099,6 +3099,20 @@ module m68k_core #(
                 $display("[ADDTASK] r=%0d task=%h name_ptr=mem[A1+10] A0=%h A1=%h",
                     retired, u_rf.regs[9], u_rf.regs[8], u_rf.regs[9]);
 `endif
+`ifdef IRQ_INSTALL_TRACE
+            // Catch AddIntServer (\$FC1210) and SetIntVector (\$FC11CA)
+            // calls.  Boing-style demos install a VBL handler via one of
+            // these to set a frame-ready flag — that flag is what the
+            // main loop polls (chip \$10256 in our case).
+            // ABI: D0 = irq number (5=VERTB), A1 = Interrupt struct ptr
+            // (which has is_Code at offset 18, is_Data at offset 14).
+            if (is_settled && ex_pc == 32'h00fc_1210)
+                $display("[ADDINTSERVER] r=%0d D0=%h A1=%h",
+                    retired, u_rf.regs[0], u_rf.regs[9]);
+            if (is_settled && ex_pc == 32'h00fc_11ca)
+                $display("[SETINTVECTOR] r=%0d D0=%h A1=%h",
+                    retired, u_rf.regs[0], u_rf.regs[9]);
+`endif
 `ifdef BOING_FLAG_WR
             // Catch any write to chip \$10256 — boing!'s main-loop wait
             // flag.  If the flag never gets set, boing! main loop spins
