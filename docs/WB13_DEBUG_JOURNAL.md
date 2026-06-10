@@ -5330,3 +5330,57 @@ So the actionable path is to fix the EARLIER chip-RAM-allocation
 divergence, not to fix the boing-specific symptoms.  Once the
 allocator returns the same chunks as real K1.3, BCPL will place its
 buffers at $10A0C and the line-draw conflict disappears.
+
+
+### §60m. The smoking gun: chip MH_FIRST chain compared directly
+
+`/tmp/wb13_idle_chip_ours.bin` (our sim, bisect-3 at idle) vs
+`test_data/fsuae_wb13_idle_chip.bin` (FS-UAE WB1.3 idle):
+
+```
+=== OUR SIM chip MEMHEADER @ $400 ===
+  attrs=$0003 lower=$420 upper=$80000 free=$7A000 (499712 bytes)
+  MH_FIRST chain:
+    #0 @ $001998  size=$0048 (72)        next=$006048
+    #1 @ $006048  size=$79FB8 (499640)   next=$0
+  Total: 499712 bytes
+
+=== FS-UAE WB1.3 idle chip MEMHEADER @ $400 ===
+  attrs=$0003 lower=$420 upper=$80000 free=$6E5D8 (452056 bytes)
+  MH_FIRST chain:
+    #0 @ $001998  size=$0048 (72)        next=$011A70
+    #1 @ $011A70  size=$6E590 (451984)   next=$0
+  Total: 452056 bytes
+```
+
+**The difference is 47,656 bytes** — exactly the size of two 640×256
+bitplanes (40,960) plus ~6KB of other allocations.
+
+FS-UAE has the main pool starting at **$11A70** (above bitplanes at
+$60C8..$B0C7 and $B0C8..$100C7).
+Our sim has the main pool starting at **$6048** (below bitplanes —
+the chunk *contains* the bitplane area).
+
+So our sim's allocator considers chip $60C8..$100C7 as **free** even
+though K1.3 graphics WRITES there (slow-RAM BitMap.Planes[0]=$60C8 in
+both sims).  Any subsequent AllocMem will hand out memory that
+overlaps the active bitplanes → BCPL DOS file buffers get scribbled
+by graphics line-draws.
+
+So the **upstream bug** is one of:
+1. K1.3 in our sim doesn't actually call AllocMem for bitplanes
+2. K1.3 does call AllocMem but our allocator doesn't update MH_FIRST
+3. Something else allocates the bitplane area without going through
+   AllocMem (e.g., direct OS_Cache_*-style hack)
+
+This explains EVERY downstream symptom this investigation has chased:
+boing.samples buffer at $11C38 empty, file headers at $1574 scribbled,
+free-list orphans 448KB at $10170 in boing-disk run, etc.  All are
+consequences of the bitplane area not being properly removed from
+MH_FIRST during WB1.3 init.
+
+Next session: add ALLOC_TRACE filter for chip-RAM allocations of
+bitplane size (20480, 40960) at r ≈ 2-3M during WB1.3 init.  If those
+calls return successfully but don't shrink the MH_FIRST chunk, fix
+the chunk-splitting code in our K1.3 boot setup (or wherever the
+divergence is).
