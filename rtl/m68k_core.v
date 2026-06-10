@@ -3078,6 +3078,26 @@ module m68k_core #(
                     retired, ex_pc, dc_wdata, dc_be);
             end
 `endif
+`ifdef BOING_PC_SAMPLE
+            // Sample the PC every ~512K retired in the boing-disk
+            // post-AUTO-REQ window to identify what code the CPU is
+            // executing — was hoping boing! task does Intuition
+            // OpenScreen but maybe is stuck in SERDATR poll or other.
+            if (is_settled && retired[18:0] == 19'd0 && retired >= 32'd30_000_000)
+                $display("[PC-SAMPLE] r=%0d pc=%h sp=%h A6=%h",
+                    retired, ex_pc, u_rf.regs[15], u_rf.regs[14]);
+`endif
+`ifdef BOING_CHIP_PC_CATCH
+            // Catch any execution in chip RAM range that's NOT in the
+            // K1.3 BCPL low-area ($0..$3FF vector table) or the CLI's
+            // BCPL operand fetches in slow RAM.  Boing! runs from
+            // somewhere in chip $1000..$5FFFF after LoadSeg.
+            if (is_settled && retired >= 32'd5_000_000 &&
+                ex_pc >= 32'h00000400 && ex_pc < 32'h00060000 &&
+                retired[12:0] == 13'd0)  // sample 1 in every 8K
+                $display("[CHIP-PC] r=%0d pc=%h sp=%h A6=%h",
+                    retired, ex_pc, u_rf.regs[15], u_rf.regs[14]);
+`endif
 `ifdef BANNER_CLEAR_PC_STACK_TRACE
             // Targeted: when the per-plane banner clear loop trigger fires
             // (PC=\$FE301E per WB13_DEBUG_JOURNAL §42), dump all 16
