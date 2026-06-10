@@ -3099,6 +3099,27 @@ module m68k_core #(
                 $display("[ADDTASK] r=%0d task=%h name_ptr=mem[A1+10] A0=%h A1=%h",
                     retired, u_rf.regs[9], u_rf.regs[8], u_rf.regs[9]);
 `endif
+`ifdef INTUITION_OPEN_TRACE
+            // Catch entry to intuition.library OpenScreen (\$FDFCE8)
+            // and OpenWindow (\$FDFCF4).  ABI: A0 = NewScreen/NewWindow
+            // struct pointer.  Then catch RTS-back via PC at known
+            // intuition-internal RTS points (we identify them
+            // post-hoc).
+            if (is_settled && ex_pc == 32'h00fd_fce8)
+                $display("[OPENSCREEN] r=%0d A0=%h",
+                    retired, u_rf.regs[8]);
+            if (is_settled && ex_pc == 32'h00fd_fcf4)
+                $display("[OPENWINDOW] r=%0d A0=%h",
+                    retired, u_rf.regs[8]);
+            // Capture the result of OpenScreen/OpenWindow by trapping
+            // ex_pc just AFTER the JSR call site in boing! code.
+            // boing! at \$C0A2F4 does JSR \$FE8C(A6) — but that's exec
+            // FindPort.  Find the real intuition-callsite in boing!
+            // via another approach: trap MOVE.L D0, \$00C0BXXX writes
+            // (boing! likely saves OpenWindow result to slow RAM).
+            // Just track D0 at entry and exit of intuition entries
+            // by also catching the chained RTS at exec dispatcher.
+`endif
 `ifdef IRQ_INSTALL_TRACE
             // Catch AddIntServer (\$FC1210) and SetIntVector (\$FC11CA)
             // calls.  Boing-style demos install a VBL handler via one of
