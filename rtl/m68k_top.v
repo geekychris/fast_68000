@@ -1045,6 +1045,24 @@ module m68k_top #(
     end
 `endif
 
+`ifdef OFS_BLK_1574_SNOOP
+    // Bus-level write watch on chip \$1574..\$1773 (512-byte buffer
+    // where K1.3 OFS validates a disk block via checksum routine
+    // \$FFED98).  This block is valid (sum=0) at r=8.2M but corrupted
+    // (sum=\$51792D22) at r=10.5M when boing.samples is on disk.
+    // Find the corrupting bus master (CPU/blitter/Paula DMA/Agnus DMA).
+    // src_id: 0,1=CPU IC/DC  2=BLT  3=COP  4=Paula DMA  5=Agnus DMA
+    always @(posedge clk) if (rst_n) begin
+        if (snoop_valid &&
+            snoop_addr >= 32'h0000_1574 && snoop_addr <= 32'h0000_1773 &&
+            retired_flat[31:0] >= 32'd8000000 &&
+            retired_flat[31:0] <= 32'd10524000) begin
+            $display("[OFS1574-SNOOP] r=%0d src=%0d cpu_pc=%h addr=%h",
+                retired_flat[31:0], snoop_src_id,
+                core_pc_flat[31:0], snoop_addr);
+        end
+    end
+`endif
 `ifdef BOING_BUF_SNOOP
     // Bus-level write watch on boing's allocated buffer at chip
     // \$11C38..\$1E0E0 (49,896 bytes).  Catches CPU + blitter +
