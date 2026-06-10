@@ -3207,6 +3207,51 @@ module m68k_core #(
                 $display("[BLT-BOING-SIZE] r=%0d pc=%h BLTSIZE=%h be=%b",
                     retired, ex_pc, dc_wdata, dc_be);
 `endif
+`ifdef FFC422_PROBE
+            // Probe at \$FFC422 TST.L D1 — captures D1 just after the
+            // 2nd dispatch returns.  If D1==0, BEQ \$FFC43A takes and
+            // skips the failing 3rd dispatch.  If D1!=0, the 3rd
+            // dispatch runs and causes AUTO-REQ.
+            //
+            // The handler called was at A4=mem[A2+\$2B0]=\$FFED98 +
+            // any LEA advance from the 1st dispatch.  We expect D1=0
+            // on real K1.3 / bisect-3, but get D1!=0 on bisect-4.
+            if (is_settled && ex_pc == 32'h00FF_C422)
+                $display("[FFC422-TST] r=%0d D1=%h A1=%h A2=%h A4=%h (D1==0 → skip fail path)",
+                    retired, u_rf.regs[1], u_rf.regs[9],
+                    u_rf.regs[10], u_rf.regs[12]);
+            // Also probe BEFORE the 2nd dispatch at \$FFC41A so we see
+            // D1's INPUT to the handler — vs \$FFC422 which captures
+            // the handler's RETURN.  If both inputs are identical
+            // across passing/failing runs but the output differs, the
+            // handler chain executed something different.
+            if (is_settled && ex_pc == 32'h00FF_C41A)
+                $display("[FFC41A-PRE] r=%0d A1=%h A2=%h D1=%h D2=%h (in: BCPL packet pre-dispatch)",
+                    retired, u_rf.regs[9], u_rf.regs[10],
+                    u_rf.regs[1], u_rf.regs[2]);
+`endif
+`ifdef MOVEM_AUDIT
+            // Audit \$FF413E MOVEM.L D1,D2,D3,D4, (A1) — check that ALL
+            // 4 longs (16 bytes) get written.  If our MOVEM is buggy
+            // and writes only 3 longs at certain addressing modes, we'd
+            // see only 3 writes here per MOVEM execution.
+            if (dc_req_r && dc_we && dc_ack && ex_pc == 32'h00FF_413E)
+                $display("[MOVEM-WR] r=%0d addr=%h wdata=%h be=%b D1=%h D2=%h D3=%h D4=%h",
+                    retired, dc_addr, dc_wdata, dc_be,
+                    u_rf.regs[1], u_rf.regs[2], u_rf.regs[3], u_rf.regs[4]);
+            // Audit $FF4136 MOVEM.L A1,A3,A4, $F4(A1,D0.L) — save step.
+            // $F4 = -12 signed.  Save addr = A1_in + (-12) + D0.
+            // For inner dispatch (A1=$C00EC4, D0=$14): save addr =
+            // $C00ED0.  This conflicts with the subsequent input MOVEM
+            // at $FF413E which writes D1..D4 to $C00ED8..$C00EE7 — but
+            // the save and input regions overlap at $C00ED0..$C00EDB.
+            // If our MOVEM addressing is wrong, the save could go to
+            // an unrelated address.
+            if (dc_req_r && dc_we && dc_ack && ex_pc == 32'h00FF_4136)
+                $display("[SAVE-MOVEM-WR] r=%0d addr=%h wdata=%h be=%b D0=%h A1=%h A3=%h A4=%h",
+                    retired, dc_addr, dc_wdata, dc_be,
+                    u_rf.regs[0], u_rf.regs[9], u_rf.regs[11], u_rf.regs[12]);
+`endif
 `ifdef DOIO_PROBE
             // [DoIO] at PC=\$FFD3FC: just before the BCPL wrapper for
             // exec.library:DoIO (LVO -456 = \$FFFFFE38).
