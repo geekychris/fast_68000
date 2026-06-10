@@ -5059,3 +5059,236 @@ This isolates the remaining visible-state gap to:
 Both are upstream of the blitter; the §54 + §55c RTL fixes still
 stand as real RTL improvements.
 
+
+
+## §60. Boing-disk investigation — full forensic chain (2026-06-09 / 2026-06-10)
+
+After WB1.3 desktop boot was unblocked, the focus shifted to running the
+real Boing! demo (`boing! + boing.samples` from Workbench 1.3 disk).  This
+section captures the multi-session debug arc that traced the failure from
+"boing doesn't run" through 12+ probes to a precise FS-UAE-confirmed
+chip-RAM scribble bug — but did NOT yet land a fix.
+
+### §60a. 4-step ADF bisect → reduces to "boing.samples + invoke"
+
+The failure was originally framed as "boing.! doesn't display anything".
+Four progressive disk-image variants narrowed it dramatically:
+
+  bisect-1: WB1.3 + just `cd c:; echo; endcli`        → PASS
+  bisect-2: + boing! binary on disk (not invoked)     → PASS
+  bisect-3: + invoke boing, no boing.samples on disk  → PASS
+  bisect-4: + boing.samples (full real-boing disk)    → FAIL AUTO-REQ
+
+Extra confirmations:
+  bisect-5: 256-byte truncated boing.samples → still FAIL → **size doesn't matter**
+  bisect-6: boing! binary itself renamed to boing.samples → still FAIL
+            → **content doesn't matter, only presence does**
+
+So the trigger is precisely: "boing.samples exists on disk AND boing is
+invoked".  All bisect ADFs are saved under `/tmp/bisect{1..6}.adf`;
+reproducer commands in `project_boing_minimal_repro_bisect.md`.
+
+### §60b. The dialog string decodes "Volume X has a read/write error"
+
+The K1.3 ROM dispatcher at `$FF4DAA` (AutoRequest entry) receives two
+BPTR-typed pointers `D1=$003FD4E3` and `D3=$003FD509`.  Multiplied by
+4 these are BCPL byte addresses pointing into K1.3 ROM:
+
+  $FF538C : BCPL string "Volume"
+  $FF5424 : BCPL string "has a read/write error"
+
+So the displayed dialog is exactly "Volume <name> has a read/write error".
+DOS error code 296 ($128) per Amiga DOS conventions.
+
+### §60c. Pinpoint the predicate at $FFC57A
+
+K1.3 ROM disasm:
+
+  $FFC578: MOVEQ #29, D2
+  $FFC57A: CMP.L  $4(A1), D2
+  $FFC57E: BNE    $FFC58C        ← if mem[A1+$4] != 29 → DOS err 296
+
+`+define+FFC57E_PROBE` captures this comparison.  bisect-3 (passing)
+NEVER reaches $FFC57A.  bisect-4 (failing) reaches it once at
+r=10524495 with A1=$C00EC4 — meaning mem[$C00EC8] is the checked value.
+
+A `CHIPRAM_SNAP_PCS=FFC57A:predicate` snapshot revealed
+mem[$C00EC8] = 0 in the failing case — clearly != 29.  So the
+predicate would always-fail in this code path.
+
+### §60d. $FFED98 is the OFS checksum routine
+
+The dispatch upstream of $FFC57A goes through `$FFC420 JSR (A5)`
+calling handler A4=$FFED98+offset.  Disasm:
+
+  $FFED98: MOVEA.L D1, A3
+  $FFED9A: ADDA.L  A3, A3       (A3 *= 4 = BPTR<<2)
+  $FFED9C: ADDA.L  A3, A3
+  $FFED9E: CLR.L   D1
+  $FFEDA0: ADD.L   (A3)+, D1
+  $FFEDA2: DBRA    D2, $FFEDA0
+  $FFEDA6: JMP     (A6)
+
+This is the **standard OFS block checksum**: sum (D2+1) longs at
+`mem[D1*4]`.  Returns 0 for valid OFS block, non-zero for invalid.
+
+`+define+FFC422_PROBE` captures the D1 returned across 5 calls in the
+failing boot:
+
+  r=7973964   D1=0          (block OK)
+  r=7980319   D1=0          (block OK)
+  r=8191298   D1=0          (block OK)
+  r=8202725   D1=0          (block OK)
+  r=10523777  D1=$51792D22  ← CORRUPTED!  triggers AUTO-REQ
+
+Same inputs (D1=$55D, D2=$7F → sum 128 longs at chip $1574) all 5
+times.  The 5th time returns garbage because chip $1574..$1773 was
+overwritten between r=8.2M and r=10.5M.
+
+### §60e. MFM-decode of track 125 is actually correct
+
+Initial hypothesis: blitter MFM-decode for boing.samples track 125 is
+buggy.  Verified via:
+
+  `make demo-real-boing` + python decode of chip $20A0/$22A0 raw MFM
+  → produces:
+       type=2 own_key=1375 highSeq=51 chksum=$BD541223
+       name="boing.samples"  sum-of-128-longs = 0 (VALID)
+
+So MFM data at chip $2064 is the correct boing.samples block.  Header
+info bytes at chip $2068 decode to lead=$FF, track=125, sector=0,
+sectorsToGap=11 — exactly what the disk has.
+
+So MFM source data is correct.  This hypothesis was wrong.
+
+### §60f. The "corrupting blits" are LINE-mode, not MFM-decode
+
+`+define+OFS_BLK_1574_SNOOP` (bus-level write watch on chip $1574..$1773
+in window r=[8M,10.5M]) shows 768 writes, ALL from src=2 (blitter), 0
+from CPU/Copper/DMA.
+
+`+define+BLT_OFS_1574_TRACE` (blitter-level trace filtered to dest
+$1574..$1773) captures the 15 BLT_STARTs: ALL have
+
+  bltcon = $D810810D
+       = BLTCON0 $D810: USE_A=1, USE_B=0, USE_C=0, USE_D=0, LF=$10
+       = BLTCON1 $810D: LINE=1, FCI=1, IFE=1, BSH=8
+
+So these are **graphics line-drawing** blits, NOT trackdisk MFM-decode
+(which uses USE-A+B+C+D, LF=$CA, LINE=0).
+
+The CPU PCs at the time are $FE5854..$FE5934 — K1.3 graphics.library
+line-draw routines.
+
+### §60g. K1.3 graphics scribbles $1574 in BOTH passing and failing runs
+
+Critical: `OFS_BLK_1574_SNOOP` rerun on bisect-3 (passing) shows it
+ALSO has 512 blitter writes to $1574..$1773 in the same window.
+
+So graphics-into-$1574 is NOT specific to the failing case.  The bug
+is purely that:
+- bisect-3 (passing) never reaches the validator that checksums $1574
+- bisect-4 (failing) does reach it because boing.samples Read triggers
+  the OFS file-header validation chain
+
+### §60h. FS-UAE comparison confirms our sim has a graphics-scribble bug
+
+Existing `test_data/fsuae_wb13_idle_chip.bin` (FS-UAE WB1.3 at idle)
+shows what real K1.3 has at the SAME chip-RAM buffer addresses:
+
+```
+addr   | FS-UAE                       | OUR SIM
+$1574  | VALID "Protect" file header  | CORRUPTED sum=$51792D22
+$1794  | VALID "c" dir header         | VALID "c"  ← same
+$5A04  | VALID "Ed"                   | VALID "libs" (different file, both valid)
+$5C24  | VALID "Expansion"            | VALID "mathtrans.library"
+$5E44  | VALID "Workbench1.3" root    | VALID "boing"
+```
+
+**Conclusion**: The chip-RAM buffer SLOTS are the same in both
+emulators.  K1.3 BCPL DOS uses chip $1574, $1794, etc. as OFS
+file-header cache slots in both.
+
+The difference: real K1.3 (FS-UAE) keeps the slot $1574 intact (a
+file header).  Our sim has graphics line-pixels overwriting it.
+
+So the actual bug is **K1.3 graphics line-draws targeting chip $1574
+in our sim, but NOT in real K1.3**.  Something in our chipset/CPU
+state misdirects line draws to a buffer K1.3 expects to be inviolate.
+
+### §60i. Probe inventory landed this round
+
+All under `+define+` gates so they're zero-cost when off:
+
+  rtl/m68k_core.v:
+    FFC57E_PROBE      — DOS-err-296 predicate $FFC57A capture
+    FFC422_PROBE      — checksum-routine D1 return value
+    CALLER_OF_D2EQ0   — dispatcher caller's ret-PC + regs
+    DOIO_PROBE        — exec.library:DoIO call interception
+    C00ED8_WR_TRACE   — extended to $C00EC4..$C00EDF range
+    C00EAC_WR_TRACE   — BPTR-index writes
+    C00EB0_WR_TRACE   — BPTR-value writes
+    C00C9C_WR_TRACE   — current-buffer-ptr writes
+    BLT_BOING_TRACE   — blits hitting boing's allocated buffer
+    OPENDEVICE_PROBE  — captured args at $FFD42A
+    MOVEM_AUDIT       — verifies $FF413E MOVEM writes all 4 longs
+
+  rtl/m68k_top.v:
+    OFS_BLK_1574_SNOOP — bus-level snoop of $1574..$1773 writes
+
+  rtl/chipset/blitter.v:
+    BLT_OFS_1574_TRACE — BLT_START filtered to dest $1574..$1773
+
+Reusable tooling:
+
+  tools/disasm68k.py        — already had it
+  bisect-{3,4,5,6}.adf      — saved at /tmp/, reproducer commands
+                              in project_boing_minimal_repro_bisect.md
+  fsuae bisect4 config      — saved as
+                              ~/Documents/FS-UAE/Configurations/
+                              Bisect4-Boing-Disk.fs-uae
+
+### §60j. Where this leaves the boing investigation
+
+Status: **deep diagnosed, undixed**.  11 commits this round, all probe
+additions (zero functional changes).
+
+Concrete next-step target: identify what struct in our sim has
+`Plane[N]` pointing such that K1.3 graphics line-draws land at
+chip $1574.  Likely a corrupted Layer/RastPort whose BitMap.Planes[0]
+got an incorrect chip-RAM allocation.
+
+Whatever wrote the bad pointer is upstream of all the probes added
+this round.  Tracing it requires either:
+
+  (a) WB1.3 init bisect: snap chip RAM at successive boot moments to
+      see when the BitMap pointer goes bad
+  (b) FS-UAE GDB step inside Intuition NewLayer/InitBitMap
+  (c) Cosim window covering Intuition init at r ≈ 4M to find the
+      first chip-RAM write divergence
+
+Memory file `project_boing_blitter_mfm_decode_bug.md` carries the
+corrected hypothesis and the FS-UAE comparison data.
+
+### §60k. Misc lessons learned
+
+1. **The FS-UAE snapshot in test_data/ was decisive**.  4+ sessions of
+   chasing increasingly-specific probes converged to confirmation in
+   30 seconds of Python decode.  Going forward, "diff against FS-UAE
+   chip RAM" should be the FIRST sanity check, not the last.
+
+2. **Probes branch — they don't progress alone**.  Each new probe added
+   this round confirmed the previous probe but never identified a
+   fixable Verilog line.  The bug is several layers up; probes scoped
+   to the current symptom don't help.  The FS-UAE diff was a phase
+   change.
+
+3. **Bisect on real-world reproducers is faster than synthetic ones**.
+   The 4-step ADF bisect (§60a) gave more progress than 4 sessions of
+   adding probes had given before it.  Should have done it sooner.
+
+4. **Apple Silicon FS-UAE is too slow for headless boot loops**.  Live
+   booting `Bisect4-Boing-Disk.fs-uae` took 3+ minutes to advance the
+   CPU PC through K1.3 init when the FS-UAE window was backgrounded.
+   For comparison runs, use saved `.uss` state files pre-positioned
+   at WB1.3 idle and skip the boot.
