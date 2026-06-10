@@ -5384,3 +5384,90 @@ bitplane size (20480, 40960) at r ≈ 2-3M during WB1.3 init.  If those
 calls return successfully but don't shrink the MH_FIRST chunk, fix
 the chunk-splitting code in our K1.3 boot setup (or wherever the
 divergence is).
+
+
+### §60n. CORRECTION: §60m's "MH_FIRST smoking gun" was a snap-timing artifact
+
+The §60m chunk comparison snapped our sim at "WB1.3 idle" via
+STOP_AT_RETIRED=4000000 — but at r=4M the chip-RAM allocator hadn't yet
+allocated the bitplanes.  Re-snapping at multiple checkpoints reveals:
+
+```
+r=1M  chain: $420/523232                       (whole chip free)
+r=2M  chain: $1558/518824                      (small consumption)
+r=3M  chain: $1998/72   →  $6048/499640        (first split)
+r=4M  chain: $1998/72   →  $6048/499640        (still pre-bitplane)
+r=5M  chain: $1998/72   →  $10170/458384       ← BITPLANE ALLOCATED!
+r=6M  chain: $19a0/64   →  $11c38/451528
+r=8M  chain: $19a0/64   →  $11c38/451528       (~matches FS-UAE)
+```
+
+Between r=4M and r=5M the second chunk start jumped from $6048 to
+$10170 — a $A128 (41,256 byte) delta exactly matching a 640×256
+double-bitplane allocation (40,960 + ~300 bytes of overhead).
+
+So our chip-RAM allocator IS working correctly.  By r=8M our chain is
+`$19a0/64 → $11c38/451528` — only 456 bytes off FS-UAE WB1.3 idle's
+`$1998/72 → $11A70/451984`.
+
+### §60o. The correct framing: ONE extra blit during boing.samples Read
+
+OFS_BLK_1574_SNOOP totals:
+
+```
+bisect-3 (passing):  512 blitter writes to chip $1574..$1773
+bisect-4 (failing):  768 writes (= 512 + 256 extra)
+```
+
+256 extra writes = exactly 1 blit (BLTSIZE $0808 = 32 lines × 8 words
+= 256 words).  So bisect-4 issues ONE extra LINE-mode blit during
+boing.samples Read, which overwrites an OFS file-header buffer K1.3
+needs to validate.
+
+Snapshot of OUR chip $1574 at r=8M (bisect-3 mid-boot):
+
+```
++00: 00 00 00 08 00 00 04 f1 00 00 00 07 ...
+checksum sum: $00000000 → VALID OFS block (type=8 own_key=1265, data)
+```
+
+So at the r=8M moment, chip $1574 holds a valid OFS data block in OUR
+sim — graphics writes from earlier WERE there but K1.3 OVERWROTE them
+with a freshly-loaded OFS block.  This is normal K1.3 BCPL DOS
+behavior: chip $1574 is a CACHE BUFFER that gets reused for different
+OFS blocks over time.
+
+So the real failure mode in bisect-4:
+1. Earlier WB1.3 boot: graphics writes scribble $1574 (normal)
+2. K1.3 BCPL DOS loads OFS block (boing-related file header) → chip $1574 = valid OFS
+3. **One more graphics line-draw fires after** → chip $1574 corrupted again
+4. K1.3 BCPL DOS validator reads $1574 → checksum != 0 → DOS err 296
+
+So the smoking gun is the **one specific extra blit** between
+boing AllocMem (r=8.2M) and the validator (r=10.5M).  Bisect-3
+doesn't have this blit; bisect-4 does.  Identifying that one blit
+is the path to the fix.
+
+### §60p. BitMap struct search rules out the obvious causes
+
+Scanning slow RAM for BitMap structs in both sims:
+
+```
+FS-UAE: 3 BitMaps, all with Plane[0]=$60C8 (WB Screen + Layer copies)
+OUR:    1 valid (slow $C01410, Plane[0]=$60C8) + 1 malformed (depth=6,
+        Plane[0]=$428800C0 — likely heuristic false positive)
+```
+
+So the WB Screen BitMap is correctly at Plane[0]=$60C8 in OUR sim
+too — matches FS-UAE.  The line blits hitting $1574 are NOT from
+drawing into the WB Screen.
+
+They must be from drawing into a different BitMap (sprite/cursor/font
+glyph TmpRas) OR a direct programmatic line draw at a computed-wrong
+endpoint.
+
+Honest investigation state: the boing-disk failure has been traced
+through many layers but the precise instigator of the failing extra
+blit hasn't been identified.  Likely candidates: a boing-specific
+graphics call during audio init, or a K1.3 ROM helper that runs only
+when boing.samples Read enters a specific state.
