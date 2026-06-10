@@ -3284,6 +3284,19 @@ module m68k_core #(
                 $display("[OPENDEV-RET] r=%0d D0=%h D1=%h (OpenDevice ret: 0=success, nonzero=error)",
                     retired, u_rf.regs[0], u_rf.regs[1]);
 `endif
+`ifdef C00C9C_WR_TRACE
+            // Probe writes to slow \$C00C9C — chip-RAM buffer pointer
+            // for K1.3 BCPL DOS file headers.  FS-UAE WB1.3 has
+            // \$00010A0C here.  Our sim has \$00001574 (low chip RAM)
+            // which is the root divergence causing graphics line-draws
+            // to scribble OFS file-header memory.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr == 32'h00C0_0C9C)
+                $display("[C00C9C-WR] r=%0d pc=%h wdata=%h be=%b D0=%h D1=%h A0=%h A1=%h",
+                    retired, ex_pc, dc_wdata, dc_be,
+                    u_rf.regs[0], u_rf.regs[1],
+                    u_rf.regs[8], u_rf.regs[9]);
+`endif
 `ifdef C00EAC_WR_TRACE
             // Probe writes to slow $C00EAC — at $FFC3A2, K1.3 reads
             // mem[$C00EAC] as a BPTR index, shifts <<2, then uses it
