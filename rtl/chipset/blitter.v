@@ -579,6 +579,18 @@ module blitter (
                                     bltadat_pre[15:0], bltbdat_pre[15:0], bltcdat_pre[15:0],
                                     bltafwm[15:0], bltalwm[15:0]);
 `endif
+`ifdef BLT_OFS_1574_TRACE
+                            // Filtered: only blits with destination in
+                            // chip \$1574..\$1773 (the failing boing.samples
+                            // OFS validation buffer).  Captures the exact
+                            // BLTCON/AP/BP/DP/SIZE for the decode blit.
+                            if (bltdpt[31:0] >= 32'h0000_1574 && bltdpt[31:0] <= 32'h0000_1773)
+                                $display("[BLT_OFS1574] bltcon=%h bltapt=%h bltbpt=%h bltcpt=%h bltdpt=%h bltsize=%h afwm=%h alwm=%h amod=%h bmod=%h cmod=%h dmod=%h adat=%h bdat=%h cdat=%h",
+                                    bltcon, bltapt, bltbpt, bltcpt, bltdpt, slv_wdata[15:0],
+                                    bltafwm[15:0], bltalwm[15:0],
+                                    bltamod, bltbmod, bltcmod, bltdmod,
+                                    bltadat_pre[15:0], bltbdat_pre[15:0], bltcdat_pre[15:0]);
+`endif
 `ifdef KICKSTART_BOOT_TRACE
                             $display("[BLT_START] bltcon=%h bltapt=%h bltbpt=%h bltcpt=%h bltdpt=%h bltsize=%h bltamod=%h bltbmod=%h bltcmod=%h bltdmod=%h",
                                 bltcon, bltapt, bltbpt, bltcpt, bltdpt, slv_wdata[15:0],
