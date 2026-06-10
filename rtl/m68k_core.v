@@ -3099,6 +3099,27 @@ module m68k_core #(
                 $display("[ADDTASK] r=%0d task=%h name_ptr=mem[A1+10] A0=%h A1=%h",
                     retired, u_rf.regs[9], u_rf.regs[8], u_rf.regs[9]);
 `endif
+`ifdef BOING_WIN_PTR_TRACE
+            // Catch ALL writes to chip \$102A8/\$102AC (boing's stored
+            // Window/Screen ptr globals).  We see them end up non-zero
+            // at r=150M but with only one OpenWindow call captured.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h00010_2a8 && dc_addr <= 32'h00010_2b3)
+                $display("[WINPTR-WR] r=%0d pc=%h addr=%h wdata=%h",
+                    retired, ex_pc, dc_addr, dc_wdata);
+`endif
+`ifdef ALLOCMEM_WINDOW_TRACE
+            // Catch all AllocMem entries during the OpenWindow window
+            // (r=8269014..8350000).  AllocMem in K1.3 has a SetFunction
+            // patch trampoline at \$C05088, which BRAs to \$C050D0
+            // common stub, which JMPs to real AllocMem at \$FE491E.
+            // Probe both entries to be safe.  Args: D0=size, D1=flags.
+            // After RTS: D0=ptr (0=NULL).
+            if (is_settled && (ex_pc == 32'h00fe_491e || ex_pc == 32'h00c0_5088) &&
+                retired >= 32'd8_269_000 && retired <= 32'd8_400_000)
+                $display("[ALLOCMEM] r=%0d pc=%h size=%h flags=%h A1=%h",
+                    retired, ex_pc, u_rf.regs[0], u_rf.regs[1], u_rf.regs[9]);
+`endif
 `ifdef INTUITION_OPEN_TRACE
             // Catch entry to intuition.library OpenScreen (\$FDFCE8)
             // and OpenWindow (\$FDFCF4).  ABI: A0 = NewScreen/NewWindow
