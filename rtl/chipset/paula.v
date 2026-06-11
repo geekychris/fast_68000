@@ -119,17 +119,15 @@ module paula (
     end
 `endif
 
-    // TEST FIX: gate DSKSYN setting on INTENA[12] being enabled.
-    // Real Paula raises INTREQ[12] unconditionally on sync match, but
-    // K1.3 1.3 with INTENA[12]=0 never clears the latched bit, leaving
-    // it pending forever in our sim.  FS-UAE shows INTREQ[12]=0 at
-    // steady state — either via different K1.3 path or auto-clear.
-    // This narrows it: only latch DSKSYN if it would actually fire an
-    // interrupt.  See task #164.
-    wire dsksyn_edge_gated = dsksyn_edge & intena[12];
+    // Real Paula sets INTREQ[12] on sync match regardless of INTENA[12].
+    // The CPU must explicitly write to INTREQ to clear it.  minimig's
+    // paula_floppy.v line 663-665 confirms: `syncint = sync_match | ...`
+    // — no INTENA gating.  The prior "gate on intena[12]" workaround
+    // (task #164) was wrong-by-spec; the symptom it masked is K1.3
+    // taking a different control-flow path than real K1.3 + minimig do.
     wire [13:0] intreq_hw_set = {
         cia_b_edge,           // 13 EXTER
-        dsksyn_edge_gated,    // 12 DSKSYN (gated, see above)
+        dsksyn_edge,          // 12 DSKSYN (set unconditionally on edge)
         1'b0,                 // 11 RBF
         1'b0,                 // 10 AUD3
         1'b0,                 // 9 AUD2
