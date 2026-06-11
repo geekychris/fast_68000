@@ -134,6 +134,16 @@ module paula (
     // line 261-262, 292-293 assert AUDxIR similarly in its state machine.
     // Single-cycle pulses generated below in the channel-wrap block.
     reg [3:0] aud_int_pulse;
+    // Per-channel internal pending flag — mirrors minimig's `intreq2`
+    // (paula_audio_channel.v STATE_3 line 368: `intreq2_set = lenfin &
+    // AUDxON & AUDxDAT`).  Set when DMA fetches the LAST word of a buffer,
+    // cleared when audio output emits the low byte of that word — i.e.
+    // when the last sample of the buffer is fully consumed.  The actual
+    // INTREQ pulse (aud_int_pulse[ch]) fires at the consume moment, not
+    // at the fetch moment, so the interrupt-handler arrival time matches
+    // real Paula's "second sample period elapsed after last DMA fetch"
+    // (~2 × AUDxPER host cycles later than our previous behaviour).
+    reg [3:0] aud_int2_pending;
     wire [13:0] intreq_hw_set = {
         cia_b_edge,           // 13 EXTER
         dsksyn_edge,          // 12 DSKSYN (set unconditionally on edge)
@@ -315,6 +325,7 @@ module paula (
         if (!rst_n) begin
             audena <= 4'd0;
             aud_int_pulse <= 4'd0;
+            aud_int2_pending <= 4'd0;
             for (i = 0; i < 4; i = i + 1) begin
                 aud_lc[i]  <= 32'd0;
                 aud_len[i] <= 16'd0;
@@ -465,10 +476,20 @@ module paula (
                 // Advance address; reload at end of buffer unless this
                 // channel is in one-shot mode.
                 if (ch_words_left[fetch_ch] == 16'd1) begin
-                    // End-of-buffer: real Paula asserts AUDx INTREQ on
-                    // each buffer wrap (both one-shot and loop modes).
-                    // Per minimig paula_audio_channel.v state machine.
-                    aud_int_pulse[fetch_ch] <= 1'b1;
+                    // End-of-buffer: real Paula's AUDxIR pulse fires when
+                    // the LAST SAMPLE of the buffer is fully output (i.e.
+                    // when the audio playback consumes the last word's
+                    // low byte), not when the last DMA fetch arrives.
+                    // Per minimig paula_audio_channel.v: STATE_3 sets
+                    // `intreq2_set = lenfin & AUDxON & AUDxDAT` (our
+                    // moment-of-fetch); STATE_4 → STATE_3 then asserts
+                    // `AUDxIR = (intreq2 & AUDxON) | ~AUDxON` after the
+                    // second sample's period elapses (~2 × AUDxPER cycles
+                    // later).  We mirror this by latching the pending
+                    // flag here and pulsing aud_int_pulse below in the
+                    // per-channel sample-emission block when the low
+                    // byte is emitted.
+                    aud_int2_pending[fetch_ch] <= 1'b1;
                     if (aud_oneshot[fetch_ch]) begin
                         // One-shot: disable this channel cleanly.
                         audena[fetch_ch] <= 1'b0;
@@ -500,6 +521,14 @@ module paula (
                                 ch_sample[i] <= ch_word_q[i][7:0];
                                 ch_byte_idx[i] <= 1'b0;
                                 ch_word_valid[i] <= 1'b0;  // need next word
+                                // If this was the LAST word of the buffer
+                                // (latched by aud_int2_pending at DMA-fetch
+                                // time), pulse INTREQ now to match minimig
+                                // AUDxIR timing.
+                                if (aud_int2_pending[i]) begin
+                                    aud_int_pulse[i]    <= 1'b1;
+                                    aud_int2_pending[i] <= 1'b0;
+                                end
                             end
                             ch_per_cnt[i] <= aud_per[i];
                         end
