@@ -3166,11 +3166,13 @@ module m68k_core #(
                     retired, u_rf.regs[0], u_rf.regs[9]);
 `endif
 `ifdef BOING_FLAG_WR
-            // Catch any write to chip \$10256 — boing!'s main-loop wait
-            // flag.  If the flag never gets set, boing! main loop spins
-            // forever at \$C09762.
+            // Catch any write to boing!'s wait-flag area at chip \$10250-\$1026F.
+            // Covers $10252 (drawing-suppress flag), $10256 (the dead unused
+            // flag), $1025A (mouse click counter), and $1026E (title-update
+            // flag).  Earlier range only covered $10254-$10259, missing
+            // writes to $10252 itself.
             if (dc_req_r && dc_we && dc_ack &&
-                dc_addr >= 32'h00010254 && dc_addr <= 32'h00010259)
+                dc_addr >= 32'h00010250 && dc_addr <= 32'h0001026F)
                 $display("[BOING_FLAG] r=%0d pc=%h addr=%h wdata=%h",
                     retired, ex_pc, dc_addr, dc_wdata);
 `endif
