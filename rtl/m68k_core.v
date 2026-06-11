@@ -3197,6 +3197,35 @@ module m68k_core #(
             if (is_settled && ex_pc == 32'h00fd_fcf4)
                 $display("[OPENWIN] r=%0d pc=%h A0=%h A1=%h SP=%h",
                     retired, ex_pc, u_rf.regs[8], u_rf.regs[9], u_rf.regs[15]);
+            // Catch entry into each boing intuition wrapper at slow \$C0A5xx.
+            // First time each one fires, log it.  Tells us how far boing's
+            // init chain progresses before stalling.
+            if (is_settled && (
+                ex_pc == 32'h00c0_a592 || ex_pc == 32'h00c0_a5a6 ||
+                ex_pc == 32'h00c0_a5ba || ex_pc == 32'h00c0_a5ce ||
+                ex_pc == 32'h00c0_a5e2 || ex_pc == 32'h00c0_a5f6 ||
+                ex_pc == 32'h00c0_a60c || ex_pc == 32'h00c0_a62a ||
+                ex_pc == 32'h00c0_a642 || ex_pc == 32'h00c0_a656))
+                $display("[BOING_LIBCALL] r=%0d pc=%h A6=%h SP=%h",
+                    retired, ex_pc, u_rf.regs[14], u_rf.regs[15]);
+            // boing's own entry point + msg loop + key control-flow points.
+            // Fires every time PC visits these — shows whether boing reaches
+            // them at all and how often.
+            if (is_settled && (
+                ex_pc == 32'h00c0_7984 ||   // boing entry
+                ex_pc == 32'h00c0_8868 ||   // boing main init
+                ex_pc == 32'h00c0_88b0 ||   // tick entry (post-epilogue)
+                ex_pc == 32'h00c0_8a00 ||   // somewhere in init
+                ex_pc == 32'h00c0_96aa ||   // msg loop start
+                ex_pc == 32'h00c0_9762))    // wait-loop check
+                $display("[BOING_FLOW] r=%0d pc=%h A6=%h SP=%h D0=%h",
+                    retired, ex_pc, u_rf.regs[14], u_rf.regs[15], u_rf.regs[0]);
+            // GROUND TRUTH: print every PC in slow $C00000-$C80000 range.
+            // Removed retired-bit gate (that condition seems to never hit).
+            if (is_settled && ex_pc >= 32'h00c0_0000 && ex_pc <= 32'h00c0_a800 &&
+                retired[15:0] == 16'd0)  // throttle to ~1 per 64K instr
+                $display("[ANY-PC] r=%0d pc=%h sp=%h",
+                    retired, ex_pc, u_rf.regs[15]);
 `endif
 `ifdef BOING_SLOW_PC_CATCH
             // boing!'s code lives at slow \$C07984+ (per cli_Module BPTR
