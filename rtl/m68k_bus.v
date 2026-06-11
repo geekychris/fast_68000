@@ -306,9 +306,15 @@ module m68k_bus #(
             : mem[fb_peek_addr[AIDX_BITS+1:2]];
 
     // Memory-poke port (diagnostic — see comment near port declaration).
+    // Extended to also write slow RAM at \$C00000+ (used for boing
+    // animation hack — patches slow-RAM boing! main-loop wait branch).
     always @(posedge clk) begin
-        if (mem_poke_strobe)
-            mem[mem_poke_addr[AIDX_BITS+1:2]] <= mem_poke_data;
+        if (mem_poke_strobe) begin
+            if (mem_poke_addr[31:20] == 12'h00C)
+                slowmem[(mem_poke_addr - 32'h00C0_0000) >> 2] <= mem_poke_data;
+            else
+                mem[mem_poke_addr[AIDX_BITS+1:2]] <= mem_poke_data;
+        end
     end
     integer mi;
     initial begin

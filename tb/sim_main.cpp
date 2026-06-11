@@ -803,7 +803,22 @@ static int run_regression(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
         }
         if (!pokes.empty() && cycle >= poke_next_cycle) {
             top->mem_poke_addr   = pokes[poke_idx].first;
-            top->mem_poke_data   = pokes[poke_idx].second;
+            // MEM_POKE_INCREMENT=1: each firing, override the value with
+            // a counter that increments by 1.  Used to drive boing's
+            // animation counter at chip $1025A so the ball appears to
+            // move/spin even without keyboard input.
+            static uint32_t poke_count = 0;
+            static bool inc_env_checked = false;
+            static bool inc_env_set = false;
+            if (!inc_env_checked) {
+                inc_env_set = (std::getenv("MEM_POKE_INCREMENT") != nullptr);
+                inc_env_checked = true;
+            }
+            if (inc_env_set) {
+                top->mem_poke_data = poke_count++;
+            } else {
+                top->mem_poke_data = pokes[poke_idx].second;
+            }
             top->mem_poke_strobe = 1;
             poke_idx++;
             if (poke_idx >= pokes.size()) {
