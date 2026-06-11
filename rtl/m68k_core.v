@@ -3174,6 +3174,30 @@ module m68k_core #(
                 $display("[BOING_FLAG] r=%0d pc=%h addr=%h wdata=%h",
                     retired, ex_pc, dc_addr, dc_wdata);
 `endif
+`ifdef BOING_WIN_WR
+            // Catch every write to boing!'s Window struct at chip \$494A0
+            // and its UserPort area.  We need to find which intuition.library
+            // path writes (or fails to write) the Window so the IDCMP port
+            // ends up malformed.  Format prints PC + A0/A1/A6 + wdata.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h0004_94a0 && dc_addr <= 32'h0004_9520)
+                $display("[BOING_WIN] r=%0d pc=%h addr=%h wdata=%h A0=%h A1=%h A6=%h",
+                    retired, ex_pc, dc_addr, dc_wdata,
+                    u_rf.regs[8], u_rf.regs[9], u_rf.regs[14]);
+            // Catch writes to chip \$102AC (boing's Window pointer slot).
+            // If this is never written, \$102AC=\$494A0 was baked into
+            // boing's .data section at LoadSeg time — meaning OpenWindow
+            // was never called or never returned.
+            if (dc_req_r && dc_we && dc_ack &&
+                dc_addr >= 32'h0001_02ac && dc_addr <= 32'h0001_02af)
+                $display("[BOING_WPTR] r=%0d pc=%h addr=%h wdata=%h D0=%h A0=%h",
+                    retired, ex_pc, dc_addr, dc_wdata,
+                    u_rf.regs[0], u_rf.regs[8]);
+            // Catch entry into intuition OpenWindow body at \$FDFCF4.
+            if (is_settled && ex_pc == 32'h00fd_fcf4)
+                $display("[OPENWIN] r=%0d pc=%h A0=%h A1=%h SP=%h",
+                    retired, ex_pc, u_rf.regs[8], u_rf.regs[9], u_rf.regs[15]);
+`endif
 `ifdef BOING_SLOW_PC_CATCH
             // boing!'s code lives at slow \$C07984+ (per cli_Module BPTR
             // \$301E61) and dos.library code clusters at \$C09D44+/\$C0A130+.
