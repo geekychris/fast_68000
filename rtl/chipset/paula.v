@@ -125,14 +125,23 @@ module paula (
     // — no INTENA gating.  The prior "gate on intena[12]" workaround
     // (task #164) was wrong-by-spec; the symptom it masked is K1.3
     // taking a different control-flow path than real K1.3 + minimig do.
+    // AUD0..AUD3 interrupts.  Real Paula asserts AUDx INTREQ on each
+    // buffer wrap (audio channel just consumed its AUDxLEN words and is
+    // about to reload from AUDxLC).  boing needs this — without AUDx
+    // INTREQ, boing's audio playback loop never advances past one buffer
+    // pass, and its main animation loop (which depends on audio
+    // progression for timing) stalls.  Minimig's paula_audio_channel.v
+    // line 261-262, 292-293 assert AUDxIR similarly in its state machine.
+    // Single-cycle pulses generated below in the channel-wrap block.
+    reg [3:0] aud_int_pulse;
     wire [13:0] intreq_hw_set = {
         cia_b_edge,           // 13 EXTER
         dsksyn_edge,          // 12 DSKSYN (set unconditionally on edge)
         1'b0,                 // 11 RBF
-        1'b0,                 // 10 AUD3
-        1'b0,                 // 9 AUD2
-        1'b0,                 // 8 AUD1
-        1'b0,                 // 7 AUD0
+        aud_int_pulse[3],     // 10 AUD3
+        aud_int_pulse[2],     // 9 AUD2
+        aud_int_pulse[1],     // 8 AUD1
+        aud_int_pulse[0],     // 7 AUD0
         blt_edge,             // 6 BLIT
         vblank_edge,          // 5 VERTB
         cop_edge,             // 4 COPER
@@ -305,6 +314,7 @@ module paula (
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             audena <= 4'd0;
+            aud_int_pulse <= 4'd0;
             for (i = 0; i < 4; i = i + 1) begin
                 aud_lc[i]  <= 32'd0;
                 aud_len[i] <= 16'd0;
@@ -442,6 +452,9 @@ module paula (
                     fetch_ch <= (fetch_ch + 2'd3) & 2'b11;
                 end
             end
+            // Default AUDx interrupt pulses to 0 each cycle; the wrap
+            // block below pulses the relevant channel for one cycle.
+            aud_int_pulse <= 4'd0;
             if (mst_req_r && mst_ack) begin
                 mst_req_r <= 1'b0;
                 // Pick the half-word for this fetch address.
@@ -452,6 +465,10 @@ module paula (
                 // Advance address; reload at end of buffer unless this
                 // channel is in one-shot mode.
                 if (ch_words_left[fetch_ch] == 16'd1) begin
+                    // End-of-buffer: real Paula asserts AUDx INTREQ on
+                    // each buffer wrap (both one-shot and loop modes).
+                    // Per minimig paula_audio_channel.v state machine.
+                    aud_int_pulse[fetch_ch] <= 1'b1;
                     if (aud_oneshot[fetch_ch]) begin
                         // One-shot: disable this channel cleanly.
                         audena[fetch_ch] <= 1'b0;
