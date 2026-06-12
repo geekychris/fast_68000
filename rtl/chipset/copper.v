@@ -101,10 +101,19 @@ module copper (
     reg [31:0] cop2lc;
     reg        cop_busy;
 
-    // Silence Verilator unused-input warning on blt_busy_i.  Canonical
-    // Copper does not consult the blitter (WAIT-BLITTER no longer
-    // exists in this encoding); the port stays for harness symmetry.
-    wire _unused_blt_busy = blt_busy_i;
+    // Copper WAIT respects the Blitter Finished Disable (BFD) bit at
+    // IR2[15] per HRM (Amiga Hardware Reference Manual, "Copper" §3).
+    //   BFD=1: WAIT compares ONLY the raster position (the common case;
+    //          "WAIT vp,hp,0xFFFE" canonical terminator uses BFD=1).
+    //   BFD=0: WAIT compares the raster position AND requires the
+    //          blitter to be idle.  Used by graphics.library and other
+    //          OS code to synchronize Copper-driven palette/BPLPT swaps
+    //          with blitter-rendered display data.
+    // The previous impl ignored blt_busy_i entirely, treating every
+    // WAIT as if BFD=1.  That let our Copper proceed past a WAIT-with-BFD=0
+    // while the blitter was still finishing its blit — racing the
+    // chipset state and breaking blitter-paced display setup.
+    wire bfd = ir2_q[15];
 
     // ---------------- Internal state ---------------------------------
     localparam S_IDLE       = 3'd0;
@@ -150,6 +159,9 @@ module copper (
     wire [6:0] hbeam_h  = hbeam_i[7:1];
     wire       h_match  = ((hbeam_h & hp_mask) >= hp_target);
     wire       raster_match = v_strict_match || (v_eq_match && h_match);
+    // Full WAIT-complete condition: raster reached AND (BFD=1 OR blitter idle).
+    // When BFD=0 the WAIT must also stall until blt_busy_i drops.
+    wire       wait_complete = raster_match && (bfd || !blt_busy_i);
 
     // ---------------- IR1 decode --------------------------------------
     wire       is_move = !ir1_q[0];
@@ -310,9 +322,10 @@ module copper (
                             state <= S_WRITE;
                         end
                     end else if (skip_bit) begin
-                        // SKIP: if raster already past target, skip next
-                        // instruction (4 more bytes).
-                        if (raster_match) pc <= pc + 32'd4;
+                        // SKIP: skip next instruction (4 bytes) if raster has
+                        // reached target AND (BFD=1 OR blitter idle).  Like
+                        // WAIT, SKIP respects the BFD bit at IR2[15] per HRM.
+                        if (wait_complete) pc <= pc + 32'd4;
                         state <= S_FETCH;
                     end else if (ir1_q == 16'hFFFF && ir2_q == 16'hFFFE) begin
                         // Canonical end-of-list sentinel: WAIT vp=$FF.
@@ -356,7 +369,9 @@ module copper (
                 end
 
                 S_WAIT_RAS: begin
-                    if (raster_match) state <= S_FETCH;
+                    // Stall here until raster compare succeeds AND, if
+                    // BFD=0, blitter is idle.  See `wait_complete` defn.
+                    if (wait_complete) state <= S_FETCH;
                 end
 
                 S_HALT: begin
