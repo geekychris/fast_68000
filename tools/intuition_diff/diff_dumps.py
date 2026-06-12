@@ -24,12 +24,15 @@ STATUS_NAMES = {
     0: "in-progress (crashed mid-test)",
     1: "OpenLibrary failed",
     2: "OpenScreen failed",
-    3: "OpenScreen OK",
+    3: "OpenScreen OK (no follow-on, or follow-on not yet run)",
+    4: "OpenWindow failed",
+    5: "OpenWindow OK",
     255: "AllocMem hard-fail (no marker block)",
 }
 
-# Field layout — kept in sync with screen_open_test.s.
-FIELDS = [
+# Field layouts — kept in sync with the corresponding .s files.
+# Common screen fields (offsets 0..47) are shared by all stubs.
+FIELDS_COMMON = [
     ("magic",         0,  4, "L", "sentinel 'TEST'"),
     ("intuibase",     4,  4, "L", "IntuitionBase"),
     ("screen_ptr",    8,  4, "L", "Screen pointer"),
@@ -43,6 +46,25 @@ FIELDS = [
     ("bm_plane0",    40,  4, "L", "BitMap.Planes[0] (chip-RAM)"),
     ("bm_plane1",    44,  4, "L", "BitMap.Planes[1]"),
 ]
+
+# Extra fields used by open_window_test.s (offsets 48+).  Decoded only
+# when status >= 4 (i.e. OpenWindow was attempted), so a screen-only
+# dump doesn't claim zero-Window data is meaningful.
+FIELDS_WINDOW = [
+    ("win_ptr",      48,  4, "L", "Window pointer"),
+    ("win_lt",       52,  4, "L", "Window.LeftEdge.W|TopEdge.W"),
+    ("win_wh",       56,  4, "L", "Window.Width.W|Height.W"),
+    ("win_flags",    60,  4, "L", "Window.Flags"),
+    ("win_idcmp",    64,  4, "L", "Window.IDCMPFlags"),
+    ("win_rport",    68,  4, "L", "Window.RPort"),
+    ("win_userport", 72,  4, "L", "Window.UserPort"),
+    ("win_wscreen",  76,  4, "L", "Window.WScreen (should == screen_ptr)"),
+]
+
+# Default for marker_block: just the common screen fields.  After
+# decode we check `status` and append window fields if the stub got
+# that far.
+FIELDS = FIELDS_COMMON
 
 
 def read_marker(blob: bytes) -> dict | None:
@@ -65,9 +87,14 @@ def read_marker(blob: bytes) -> dict | None:
     sentinel = struct.unpack(">I", blob[ptr:ptr + 4])[0]
     if sentinel != MAGIC:
         return None
-    out = {"_addr": ptr, "_path": "marker_block"}
-    for name, off, sz, fmt, _desc in FIELDS:
+    out = {"_addr": ptr, "_path": "marker_block", "_fields": list(FIELDS_COMMON)}
+    for name, off, sz, fmt, _desc in FIELDS_COMMON:
         out[name] = struct.unpack(">" + fmt, blob[ptr + off:ptr + off + sz])[0]
+    # If status >= 4 the stub attempted OpenWindow; decode the extra fields.
+    if out.get("status", 0) >= 4 and ptr + 80 <= len(blob):
+        for name, off, sz, fmt, _desc in FIELDS_WINDOW:
+            out[name] = struct.unpack(">" + fmt, blob[ptr + off:ptr + off + sz])[0]
+        out["_fields"] = list(FIELDS_COMMON) + list(FIELDS_WINDOW)
     return out
 
 
@@ -97,7 +124,7 @@ def show_marker(label: str, m: dict | None) -> None:
         print("  no marker found — sentinel missing from chip RAM dump")
         return
     print(f"  located via {m['_path']} at chip ${m['_addr']:06X}")
-    for name, _o, _s, _f, desc in FIELDS:
+    for name, _o, _s, _f, desc in m.get("_fields", FIELDS_COMMON):
         if name not in m:
             continue
         print(f"  {name:<14} {fmt_field(name, m[name]):<40}  {desc}")
@@ -108,16 +135,29 @@ def show_diff(a: dict, b: dict, label_a: str, label_b: str) -> int:
     diffs = 0
     print(f"\n== diff: {label_a} vs {label_b} ==")
     width = max(len(label_a), len(label_b))
-    for name, _o, _s, _f, desc in FIELDS:
+    # Use the union of fields present in either marker so a screen-only
+    # dump can be diffed against an open-window dump (the extra Window
+    # fields show "missing" on the screen side).
+    union_field_names: list[str] = []
+    seen: set[str] = set()
+    for src in (a.get("_fields", FIELDS_COMMON), b.get("_fields", FIELDS_COMMON)):
+        for entry in src:
+            if entry[0] not in seen:
+                union_field_names.append(entry[0])
+                seen.add(entry[0])
+    field_index = {f[0]: f for f in FIELDS_COMMON + FIELDS_WINDOW}
+    for name in union_field_names:
+        _, _o, _s, _f, desc = field_index[name]
         va = a.get(name)
         vb = b.get(name)
         if va == vb:
-            print(f"  ok   {name:<14} {fmt_field(name, va):<40}  {desc}")
+            shown = fmt_field(name, va) if va is not None else "(missing)"
+            print(f"  ok   {name:<14} {shown:<40}  {desc}")
         else:
             diffs += 1
             print(f"  DIFF {name:<14} {desc}")
-            print(f"    {label_a:<{width}} = {fmt_field(name, va)}")
-            print(f"    {label_b:<{width}} = {fmt_field(name, vb)}")
+            print(f"    {label_a:<{width}} = {fmt_field(name, va) if va is not None else '(missing)'}")
+            print(f"    {label_b:<{width}} = {fmt_field(name, vb) if vb is not None else '(missing)'}")
     return diffs
 
 

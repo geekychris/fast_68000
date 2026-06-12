@@ -5609,3 +5609,82 @@ The pattern:
    (bug is upstream, narrow down by extending the stub).
 
 This sidesteps the "100M instructions of context" problem completely.
+
+## §62. open_window_test follows — OpenWindow also passes (2026-06-12)
+
+Following §61's pattern, added `open_window_test.s` to the harness.
+Same chain plus one more step:
+
+    AllocMem -> OpenLibrary -> OpenScreen -> OpenWindow -> snapshot
+
+NewWindow uses LeftEdge=10, TopEdge=10, Width=300, Height=180,
+Flags=ACTIVATE, IDCMPFlags=0, Type=CUSTOMSCREEN, Screen=<our Screen>.
+
+`make open-window-test` result on commit fc5ac88 + this change:
+
+```
+status         5 (OpenWindow OK)
+Screen ptr     $00C065E0
+Window ptr     $00C08C98
+Win.LeftEdge,Top  10, 10        (matches NewWindow)
+Win.Width,Height  300, 180      (matches NewWindow)
+Win.Flags         $00003000     (ACTIVATE + WINDOWACTIVE — Intuition set the active bit)
+Win.RPort         $00C08D88     (valid)
+Win.WScreen       $00C065E0     (== Screen ptr above — correct link-back)
+```
+
+So **OpenWindow works on our sim too**.  The Window struct is fully
+populated, RPort is allocated, WScreen back-pointer matches.  This
+narrows the boing failure significantly:
+
+- Not in OpenScreen.
+- Not in OpenWindow at the basic API level.
+- Must be either (a) boing-specific NewWindow / NewScreen parameters
+  trigger a different code path, (b) earlier OS state corruption
+  doesn't reproduce in our fresh-CLI test, or (c) a graphics.library
+  or Layers internal divergence that surfaces only with more drawing
+  activity (text print, sprites, etc).
+
+### §62a. One stack-marshalling bug to note
+
+The first attempt at `open_window_test` hung at status=3
+(OpenScreen ok, OpenWindow never returned).  Cause: NewWindow is 48
+bytes / 12 longs which doesn't fit in a single MOVEM register set.
+I split the push into two halves but pushed the low half (bytes
+0..31) FIRST, then the high half (bytes 32..47).  `movem.l reg,-(SP)`
+decrements SP before each store, so the second push lands at LOWER
+addresses than the first.  After both pushes the layout from SP was:
+
+    [SP+0..15]   nw_template[0..15]   (last push)
+    [SP+16..47]  ...
+
+— i.e. bytes 32..47 of the template ended up at offset 16..31 of the
+on-stack NewWindow, and bytes 0..31 of the template at offset 32..47.
+Total garbage.  Intuition saw Type=15 (CUSTOMSCREEN) at the LeftEdge
+position and presumably hung in a parameter-validation path.
+
+Fix: push the HIGH half first and the LOW half second.  Comment
+added in `open_window_test.s` explaining why.  Good harness lesson:
+"100-instruction stubs" still need careful stack hygiene.
+
+### §62b. Where to look next
+
+The most likely remaining hypothesis is **boing's specific NewScreen
+or NewWindow parameters**.  Boing's Screen is probably DUALPF or HAM
+or something exotic that our chipset doesn't handle quite right.
+Next stub to write:
+
+- `boing_replica_test.s` — mirror boing's *exact* NewScreen +
+  NewWindow byte-for-byte (extracted from the boing! binary in the
+  ADF), then snapshot the same way.  If THAT fingerprint differs
+  from our generic test, the bug is in whichever flag/mode boing
+  exercises that the generic test doesn't.
+
+Or, since this is a different research direction:
+
+- Strip boing of its boing.samples Read() dependency and just see if
+  it ever reaches OpenWindow at all.  If the bisect-3 evidence
+  (`project_boing_minimal_repro_bisect.md`) holds, boing without
+  samples loads + calls OpenWindow fine — the failure is only when
+  the samples load is involved.  Then the harness becomes
+  `loadseg_then_open_test.s`.

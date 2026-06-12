@@ -1437,6 +1437,12 @@ screen-open-test: kickstart/$(INTUITION_DIFF_STEM).adf
 	$(PYTHON) tools/intuition_diff/diff_dumps.py \
 	    /tmp/$(INTUITION_DIFF_STEM)_chip.bin
 
+# open-window-test: same harness, different stem.  Goes one library call
+# further (OpenScreen -> OpenWindow) and adds Window fingerprint fields
+# (offsets 48..79) to the marker block.
+open-window-test:
+	$(MAKE) screen-open-test INTUITION_DIFF_STEM=open_window_test
+
 # demo-real-boing: boot the boing-disk ADF, render the final frame.
 demo-real-boing: kickstart/boing_disk.adf
 	@rm -rf build_kick_boot
