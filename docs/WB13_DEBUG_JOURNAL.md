@@ -5688,3 +5688,81 @@ Or, since this is a different research direction:
   samples loads + calls OpenWindow fine — the failure is only when
   the samples load is involved.  Then the harness becomes
   `loadseg_then_open_test.s`.
+
+## §63. idcmp_window_test — UserPort + IDCMP_INTUITICKS dispatch also works (2026-06-12)
+
+Third stub.  Same as `open_window_test` but with NewWindow.IDCMPFlags
+= IDCMP_INTUITICKS ($00400000) | IDCMP_VANILLAKEY ($00200000), forcing
+Intuition to allocate a real UserPort + signal bit + input-handler
+hookup.  Boing waits forever on this UserPort for INTUITICKS, so its
+construction has to be correct.
+
+`make idcmp-window-test` result on commit c0452e2 + this change:
+
+```
+status         6 (UserPort allocated + snapshot taken)
+Window         $00C08CC8
+Window.Flags   $04003000   (WINDOWREFRESH + ACTIVATE + WINDOWACTIVE)
+Window.IDCMP   $00600000   (INTUITICKS | VANILLAKEY — matches NewWindow)
+Window.UserPort $00C08D78
+UserPort.mp_Flags = $00      (PA_SIGNAL)
+UserPort.mp_SigBit = $1F     (signal bit 31, legitimate alloc)
+UserPort.mp_SigTask = $C05128 (slow-RAM task ptr — valid)
+UserPort.mp_Tail = $0        (MinList convention)
+UserPort.mp_Head = UserPort.mp_TailPred = $C08E80
+                             (one message already enqueued)
+Window.MessageKey = $C08E80  (same address — that one message is the
+                              first INTUITICKS dispatched by Intuition's
+                              input handler)
+UserPort.ln_Name -> $FD5C14  (Intuition's "Window UserPort" string in ROM)
+```
+
+This is significant: **even the UserPort + IDCMP_INTUITICKS dispatch
+works correctly on our sim**.  Intuition is delivering INTUITICKS
+messages to the UserPort.  A program polling that UserPort (the boing
+main loop pattern) would see and consume them.
+
+Narrowing summary across three stubs:
+
+| Stub                | Passes on our sim | Notes |
+|---------------------|-------------------|-------|
+| screen_open_test    | YES (status 3)    | Screen + BitMap correct |
+| open_window_test    | YES (status 5)    | Window + RPort + WScreen correct |
+| idcmp_window_test   | YES (status 6)    | UserPort signal alloc + INTUITICKS dispatch correct |
+
+So the boing failure is **not** in any of:
+- OpenScreen
+- OpenWindow
+- UserPort allocation with IDCMP
+- Intuition's input-handler enqueuing INTUITICKS
+
+Remaining hypotheses for the boing wall:
+1. Another Intuition / graphics.library call that boing depends on
+   (SetMenuStrip, ScreenToBack, RectFill, Move, Draw, etc).
+2. boing's main loop has a specific timing or message-class
+   expectation that our Intuition dispatch matches only partially.
+3. The bug appears only with the cumulative state from boing's
+   first-100M-instruction OS interactions (LoadSeg + audio.device
+   + sample-data load), not from a single library call.
+
+Hypothesis 3 starts to dominate: every isolatable library call we
+test passes.  The bug only surfaces when boing's full lifecycle runs.
+
+### §63a. Path forward
+
+If a stub keeps passing while real boing fails, the harness has
+done its job and the next move is back to **option 3** (task #194):
+extend FS-UAE's claude_rpc patch to record every chipset register
+write (with PC + retired count) during boing-disk, run the same on
+our sim, diff the streams.  The first divergent write is the
+smoking gun — and unlike isolated library calls, this catches
+cumulative-state bugs.
+
+Alternatively, attack from the boing side: **trace boing's actual
+library-call sequence**.  Boing's binary has thin wrappers at the
+start of its .text segment (intuition LVO trampolines).  If we patch
+those trampolines (via MEM_POKE_AT_PC, or by injecting `move.l D0,$ABCD`
+breadcrumbs into the binary itself) to log "called OpenScreen with A0
+= ...", we get a high-signal trace of what boing actually does, vs.
+what we tested in isolation.  The first library call where its return
+value differs from FS-UAE is the bug.

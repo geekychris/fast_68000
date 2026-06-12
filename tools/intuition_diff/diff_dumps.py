@@ -27,6 +27,8 @@ STATUS_NAMES = {
     3: "OpenScreen OK (no follow-on, or follow-on not yet run)",
     4: "OpenWindow failed",
     5: "OpenWindow OK",
+    6: "OpenWindow + UserPort allocated; UserPort snapshot taken",
+    7: "OpenWindow OK but UserPort = NULL (silent fail)",
     255: "AllocMem hard-fail (no marker block)",
 }
 
@@ -59,6 +61,19 @@ FIELDS_WINDOW = [
     ("win_rport",    68,  4, "L", "Window.RPort"),
     ("win_userport", 72,  4, "L", "Window.UserPort"),
     ("win_wscreen",  76,  4, "L", "Window.WScreen (should == screen_ptr)"),
+]
+
+# Extra fields used by idcmp_window_test.s (offsets 80+).  Decoded only
+# when status >= 6 (UserPort snapshot was taken).
+FIELDS_USERPORT = [
+    ("mp_flags_sb",  80,  4, "L", "UserPort.mp_Flags.B|mp_SigBit.B|pad.W"),
+    ("mp_sigtask",   84,  4, "L", "UserPort.mp_SigTask"),
+    ("mp_head",      88,  4, "L", "UserPort.MsgList.mlh_Head"),
+    ("mp_tail",      92,  4, "L", "UserPort.MsgList.mlh_Tail (=0 for empty MinList)"),
+    ("mp_tailpred",  96,  4, "L", "UserPort.MsgList.mlh_TailPred"),
+    ("mp_lnname",   100,  4, "L", "UserPort.ln_Name pointer"),
+    ("win_idcmp2", 104,  4, "L", "Window.IDCMPFlags (readback)"),
+    ("win_msgkey", 108,  4, "L", "Window.MessageKey"),
 ]
 
 # Default for marker_block: just the common screen fields.  After
@@ -95,6 +110,11 @@ def read_marker(blob: bytes) -> dict | None:
         for name, off, sz, fmt, _desc in FIELDS_WINDOW:
             out[name] = struct.unpack(">" + fmt, blob[ptr + off:ptr + off + sz])[0]
         out["_fields"] = list(FIELDS_COMMON) + list(FIELDS_WINDOW)
+    # If status >= 6 the stub took a UserPort snapshot.
+    if out.get("status", 0) >= 6 and ptr + 112 <= len(blob):
+        for name, off, sz, fmt, _desc in FIELDS_USERPORT:
+            out[name] = struct.unpack(">" + fmt, blob[ptr + off:ptr + off + sz])[0]
+        out["_fields"] = list(FIELDS_COMMON) + list(FIELDS_WINDOW) + list(FIELDS_USERPORT)
     return out
 
 
@@ -145,7 +165,7 @@ def show_diff(a: dict, b: dict, label_a: str, label_b: str) -> int:
             if entry[0] not in seen:
                 union_field_names.append(entry[0])
                 seen.add(entry[0])
-    field_index = {f[0]: f for f in FIELDS_COMMON + FIELDS_WINDOW}
+    field_index = {f[0]: f for f in FIELDS_COMMON + FIELDS_WINDOW + FIELDS_USERPORT}
     for name in union_field_names:
         _, _o, _s, _f, desc = field_index[name]
         va = a.get(name)

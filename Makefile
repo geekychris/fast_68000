@@ -1443,6 +1443,13 @@ screen-open-test: kickstart/$(INTUITION_DIFF_STEM).adf
 open-window-test:
 	$(MAKE) screen-open-test INTUITION_DIFF_STEM=open_window_test
 
+# idcmp-window-test: OpenWindow with IDCMP_INTUITICKS|IDCMP_VANILLAKEY
+# so Intuition allocates a real UserPort + input-handler dispatch.
+# Snapshots UserPort MsgPort layout (offsets 80..111) — boing waits on
+# this UserPort for IDCMP_INTUITICKS, so its construction has to be valid.
+idcmp-window-test:
+	$(MAKE) screen-open-test INTUITION_DIFF_STEM=idcmp_window_test
+
 # demo-real-boing: boot the boing-disk ADF, render the final frame.
 demo-real-boing: kickstart/boing_disk.adf
 	@rm -rf build_kick_boot
