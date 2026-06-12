@@ -338,8 +338,45 @@ module minimig_phase1_top (
                 {cpu_address, 1'b0});
         end
     end
+    // Phase 1b deepest trace: hierarchical access into u_minimig internal
+    // signals.  Shows the bridge enable chain + downstream cpu_rd/bank,
+    // so we can identify which gate is wrong.  Note: u_minimig.CPU1 is
+    // the m68k_bridge instance (per minimig.v:770); BMAP1 is the
+    // bank mapper.
+    always @(posedge clk or negedge rst_n) begin
+        if (rst_n && sig_cnt < 10'd60) begin
+            $display("[deep %0d] cpuhlt=%b cpurst=%b dbr=%b dbs=%b nrdy=%b l_as=%b l_dtack=%b enable=%b _ta_n=%b cpu_rd=%b sel_kick=%b bank=%h",
+                sig_cnt,
+                u_minimig.cpuhlt,
+                u_minimig.cpurst,
+                u_minimig.dbr,
+                u_minimig.dbs,
+                u_minimig.gayle_nrdy,
+                u_minimig.CPU1.l_as,
+                u_minimig.CPU1.l_dtack,
+                u_minimig.CPU1.enable,
+                u_minimig.CPU1._ta_n,
+                u_minimig.cpu_rd,
+                u_minimig.sel_kick,
+                u_minimig.bank);
+        end
+    end
 `endif
 
     wire _unused = &{ic_we, ic_lock, ic_wdata, dc_lock, 1'b0};
+
+    // Phase 1b unblocker: minimig's user_io keeps cpuhlt=1 and
+    // cpurst=1 by default until the OSD/host SPI bus releases them.
+    // Our test harness has no SPI driver, so they stay asserted
+    // forever — preventing the m68k_bridge from ever latching the
+    // CPU's AS strobe and thus DTACK never asserts.
+    // Force them low to let the CPU run.  This is intrusive but
+    // semantically correct: real-hardware minimig releases cpuhlt
+    // shortly after FPGA configuration; we're simulating that
+    // already-released state from t=0.
+    initial begin
+        force u_minimig.cpuhlt = 1'b0;
+        force u_minimig.cpurst = 1'b0;
+    end
 
 endmodule
