@@ -311,6 +311,18 @@ module minimig_phase1_top (
                     {cpu_address, 1'b0}, cpu_data);
                 dtack_count <= dtack_count + 1;
             end
+            // Phase 1b: when CPU AS is low at $FC00D2 (or any addr in
+            // the ROM range $F8_0000..$FF_FFFF), capture what minimig
+            // outputs on its SRAM bridge.  This tells us the SRAM
+            // offset minimig actually generates so we know where to
+            // load ROM in our test SRAM.
+            if (!cpu_as_n && probe_count < 10 &&
+                {cpu_address, 1'b0} >= 24'hF8_0000) begin
+                $display("[probe-sram] cpu=%h -> ram_addr_word=%h (byte=%h) oe=%b we=%b bhe=%b ble=%b",
+                    {cpu_address, 1'b0}, ram_address,
+                    {ram_address, 1'b0},
+                    ~ram_oe_n, ~ram_we_n, ~ram_bhe_n, ~ram_ble_n);
+            end
         end
     end
 `endif
