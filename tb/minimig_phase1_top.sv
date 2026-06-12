@@ -325,6 +325,19 @@ module minimig_phase1_top (
             end
         end
     end
+    // Phase 1b deeper trace: dump the m68k_bridge enable-chain signals
+    // every cycle for the first 200 cycles after reset to see which
+    // gate is stuck.
+    reg [9:0] sig_cnt;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) sig_cnt <= 10'd0;
+        else if (sig_cnt < 10'd200) begin
+            sig_cnt <= sig_cnt + 10'd1;
+            $display("[sig %0d] _as=%b _dtack=%b cck=%b clk7_en=%b clk_7=%b c1=%b c3=%b cpu_addr=%h",
+                sig_cnt, cpu_as_n, cpu_dtack_n, cck, clk7_en, clk_7, c1, c3,
+                {cpu_address, 1'b0});
+        end
+    end
 `endif
 
     wire _unused = &{ic_we, ic_lock, ic_wdata, dc_lock, 1'b0};
