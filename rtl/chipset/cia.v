@@ -114,6 +114,30 @@ module cia (
     reg [23:0] tod;
     reg [9:0]  tod_prescale;
     reg        tod_tick_seen;
+    // 8520 CIA TOD semantics (per the chip's datasheet):
+    //   - Writing TODHI stops the TOD counter (real 8520 quirk; staging mode).
+    //   - Writing TODMID is buffered.
+    //   - Writing TODLO restarts the counter and atomically commits the
+    //     {TODHI, TODMID, TODLO} buffer to the live TOD register (or to
+    //     the ALARM register when CRB[7]=1).
+    //   - Reading TODHI latches all three TOD bytes into a side register;
+    //     subsequent reads of TODMID/TODLO return the latched values until
+    //     the matching TODLO read releases the latch.  This avoids the
+    //     read-tear hazard while TOD is incrementing.
+    //   - When live TOD matches the ALARM register, the CIA asserts
+    //     ICR bit 2 (ALARM source).
+    // Previously our impl ignored TOD writes (silently dropped), didn't
+    // latch on read, and didn't generate ALARM interrupts.  K1.3
+    // timer.device uses CIA-A TOD ALARM for EClock sub-second wakeups —
+    // missing alarms shift the interrupt pattern and downstream
+    // allocation order.
+    reg [23:0] tod_alarm;
+    reg [23:0] tod_writebuf;   // staged {TODHI, TODMID, TODLO}
+    reg        tod_writepend;  // 1 = TODHI/MID written; awaiting TODLO commit
+    reg        tod_stopped;    // TODHI write halts counter until TODLO commit
+    reg [23:0] tod_latch;
+    reg        tod_latched;
+    reg [23:0] tod_prev;       // for alarm-match edge detection
 
     // Derived control bits.
     wire ta_start    = cra[0];
@@ -167,9 +191,9 @@ module cia (
             4'h5: slv_rdata = ta_cnt[15:8];
             4'h6: slv_rdata = tb_cnt[7:0];
             4'h7: slv_rdata = tb_cnt[15:8];
-            4'h8: slv_rdata = tod[7:0];     // TOD low
-            4'h9: slv_rdata = tod[15:8];    // TOD mid
-            4'hA: slv_rdata = tod[23:16];   // TOD hi
+            4'h8: slv_rdata = tod_latched ? tod_latch[7:0]   : tod[7:0];   // TOD low (unlatches)
+            4'h9: slv_rdata = tod_latched ? tod_latch[15:8]  : tod[15:8];  // TOD mid
+            4'hA: slv_rdata = tod_latched ? tod_latch[23:16] : tod[23:16]; // TOD hi (latches on read)
             4'hB: slv_rdata = 8'd0;
             4'hC: slv_rdata = sdr;
             4'hD: slv_rdata = {int_o, 2'd0, icr_pending};
@@ -200,6 +224,13 @@ module cia (
             tod <= 24'd0;
             tod_prescale <= 10'd0;
             tod_tick_seen <= 1'b0;
+            tod_alarm     <= 24'd0;
+            tod_writebuf  <= 24'd0;
+            tod_writepend <= 1'b0;
+            tod_stopped   <= 1'b0;
+            tod_latch     <= 24'd0;
+            tod_latched   <= 1'b0;
+            tod_prev      <= 24'd0;
             sdr <= 8'd0;
         end else begin
             // Serial byte arrives from external (keyboard scancode).
@@ -217,22 +248,32 @@ module cia (
             // ~70 times per VBL and re-introduce the fast-TOD bug).
             // Until the first tick, the prescaler ticks TOD as a
             // fallback so harnesses that don't drive tod_tick_i still
-            // see TOD advance.
-            if (tod_tick_i) begin
-                // First external tick: reset TOD to discard the
-                // prescaler-fallback's pre-VBL ticks so wall-time
-                // measurement is clean.  Subsequent ticks increment.
-                tod                <= tod_tick_seen ? (tod + 24'd1) : 24'd1;
-                tod_prescale       <= 10'd0;
-                tod_tick_seen      <= 1'b1;
-            end else if (!tod_tick_seen) begin
-                if (tod_prescale == 10'd1023) begin
-                    tod_prescale <= 10'd0;
-                    tod          <= tod + 24'd1;
-                end else begin
-                    tod_prescale <= tod_prescale + 10'd1;
+            // see TOD advance.  Counter is gated on !tod_stopped so
+            // writes-in-progress (TODHI without matching TODLO commit)
+            // pause the counter exactly like the real 8520.
+            tod_prev <= tod;
+            if (!tod_stopped) begin
+                if (tod_tick_i) begin
+                    tod                <= tod_tick_seen ? (tod + 24'd1) : 24'd1;
+                    tod_prescale       <= 10'd0;
+                    tod_tick_seen      <= 1'b1;
+                end else if (!tod_tick_seen) begin
+                    if (tod_prescale == 10'd1023) begin
+                        tod_prescale <= 10'd0;
+                        tod          <= tod + 24'd1;
+                    end else begin
+                        tod_prescale <= tod_prescale + 10'd1;
+                    end
                 end
             end
+            // ALARM match: when TOD transitions INTO equality with alarm
+            // (edge), assert ICR bit 2 (the ALARM source).  Edge check
+            // avoids re-asserting every cycle the values stay equal.
+            // Alarm value 0 isn't special on real silicon, but it's the
+            // power-on default — we still need to fire if K1.3 set
+            // alarm=0 deliberately.
+            if (tod == tod_alarm && tod_prev != tod_alarm)
+                icr_pending[2] <= 1'b1;
             ta_just_underflowed <= 1'b0;
             tb_just_underflowed <= 1'b0;
             icr_read_clear <= 1'b0;
@@ -262,6 +303,29 @@ module cia (
                             crb[0] <= 1'b1;
                         end
                     end
+                    // TOD writes — real 8520 semantics:
+                    //   * Write TODHI ($A) stops the counter, stages the hi byte.
+                    //   * Write TODMID ($9) stages the mid byte.
+                    //   * Write TODLO ($8) atomically commits {hi:mid:lo}
+                    //     into either TOD (CRB[7]=0) or ALARM (CRB[7]=1),
+                    //     then restarts the counter.
+                    4'h8: begin
+                        if (crb[7]) begin
+                            tod_alarm <= {tod_writebuf[23:8], slv_wdata};
+                        end else begin
+                            tod <= {tod_writebuf[23:8], slv_wdata};
+                        end
+                        tod_writepend <= 1'b0;
+                        tod_stopped   <= 1'b0;
+                    end
+                    4'h9: tod_writebuf[15:8]  <= slv_wdata;
+                    4'hA: begin
+                        tod_writebuf[23:16] <= slv_wdata;
+                        // Only stop the live counter when targeting TOD
+                        // (CRB[7]=0); writing the ALARM should not pause TOD.
+                        if (!crb[7]) tod_stopped <= 1'b1;
+                        tod_writepend <= 1'b1;
+                    end
                     4'hD: begin
                         // ICR write: bit 7 = SET/CLR, bits 4:0 = which bits.
                         if (slv_wdata[7])
@@ -287,6 +351,17 @@ module cia (
             // ---- Slave reads: clear pending on ICR read ----
             if (slv_req && !slv_we && slv_addr == 4'hD)
                 icr_read_clear <= 1'b1;
+            // ---- TOD read-latch: $A latches, $8 unlatches ----
+            // Real 8520 latches all three TOD bytes when TODHI is read,
+            // and releases the latch when TODLO is read.  This gives the
+            // CPU a stable snapshot across the three byte reads, even if
+            // TOD increments in between.
+            if (slv_req && !slv_we && slv_addr == 4'hA) begin
+                tod_latch   <= tod;
+                tod_latched <= 1'b1;
+            end else if (slv_req && !slv_we && slv_addr == 4'h8) begin
+                tod_latched <= 1'b0;
+            end
 
             // ---- Timer A countdown ----
             if (ta_start && tick) begin
