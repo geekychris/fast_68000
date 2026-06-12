@@ -621,7 +621,7 @@ $(PHASE1_BUILD)/Vminimig_phase1_top: \
 	@if [ ! -f "$(ROMFILE)" ]; then \
 	    echo "ROMFILE=$(ROMFILE) does not exist."; exit 1; \
 	fi
-	$(PYTHON) tools/bin2rom.py --mem-words 65536 $(ROMFILE) $(PHASE1_BUILD)/rom.hex
+	$(PYTHON) tools/bin2rom16.py $(ROMFILE) $(PHASE1_BUILD)/rom.hex
 	$(VERILATOR) -Wno-fatal -Wno-WIDTH -Wno-UNOPTFLAT -Wno-CASEINCOMPLETE \
 	    -Wno-UNUSED -Wno-MULTIDRIVEN -Wno-INITIALDLY \
 	    --cc --exe --build --no-timing \
