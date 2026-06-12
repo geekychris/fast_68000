@@ -58,6 +58,15 @@ module m68k_to_amiga_bus (
     output reg         rw,        // 1 = read, 0 = write
     input  wire        dtack_n    // data acknowledge     (active low)
 );
+    // MIN_AS_CYCLES: minimum host cycles to hold AS asserted before
+    // releasing on DTACK.  Real 68000 holds AS for at least 4 clock
+    // periods (S0..S7); our default of 1 is much shorter — fine when
+    // talking to memory models that respond combinationally on AS
+    // (e.g. our m68k_bus.v).  When the target is minimig.v's
+    // clk7_en-gated m68k_bridge, we must hold AS for several host
+    // cycles so the bridge's l_dtack latch can capture _ta_n=0.
+    // Override at instantiation: `.MIN_AS_CYCLES(16)` for minimig.
+    parameter MIN_AS_CYCLES = 1;
 
     // ---------------- State machine ----------------
     localparam S_IDLE   = 3'd0;
@@ -75,6 +84,9 @@ module m68k_to_amiga_bus (
     reg [31:0] xact_wdata;
     reg [3:0]  xact_be;
     reg [15:0] hi_rdata;          // latched high half for .L reads
+    // Counter that runs while AS is asserted (S_HI_W, S_LO_W).  Bus
+    // cycle completes when DTACK is low AND counter >= MIN_AS_CYCLES.
+    reg [7:0]  as_hold_cnt;
 
     // ---------------- Arbitration: pick next requester ----------------
     wire pick_dc = dc_req;
@@ -132,12 +144,14 @@ module m68k_to_amiga_bus (
                     lds_n  <= ~xact_be[2];
                     data_o <= xact_wdata[31:16];
                     as_n   <= 1'b0;
+                    as_hold_cnt <= 8'd0;
                     state  <= S_HI_W;
                 end
 
                 // -------- HI_W: wait for DTACK on high half --------
                 S_HI_W: begin
-                    if (!dtack_n) begin
+                    if (as_hold_cnt < MIN_AS_CYCLES) as_hold_cnt <= as_hold_cnt + 8'd1;
+                    if (!dtack_n && as_hold_cnt >= MIN_AS_CYCLES) begin
                         if (!is_write) hi_rdata <= data_i;
                         // Drop strobes; move on.
                         as_n  <= 1'b1; uds_n <= 1'b1; lds_n <= 1'b1;
@@ -154,12 +168,14 @@ module m68k_to_amiga_bus (
                     lds_n  <= ~xact_be[0];
                     data_o <= xact_wdata[15:0];
                     as_n   <= 1'b0;
+                    as_hold_cnt <= 8'd0;
                     state  <= S_LO_W;
                 end
 
                 // -------- LO_W: wait for DTACK on low half --------
                 S_LO_W: begin
-                    if (!dtack_n) begin
+                    if (as_hold_cnt < MIN_AS_CYCLES) as_hold_cnt <= as_hold_cnt + 8'd1;
+                    if (!dtack_n && as_hold_cnt >= MIN_AS_CYCLES) begin
                         as_n <= 1'b1; uds_n <= 1'b1; lds_n <= 1'b1;
                         state <= S_ACK;
                         // For .L reads we combine hi_rdata + data_i here.

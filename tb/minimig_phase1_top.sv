@@ -84,7 +84,7 @@ module minimig_phase1_top (
     wire        cpu_rw;
     wire        cpu_dtack_n;
 
-    m68k_to_amiga_bus u_bus_adapter (
+    m68k_to_amiga_bus #(.MIN_AS_CYCLES(64)) u_bus_adapter (
         .clk        (clk),
         .rst_n      (rst_n),
         .ic_req     (ic_req),
@@ -170,7 +170,11 @@ module minimig_phase1_top (
     reg [15:0] sram [0:2097151];  // 2 MiB / 2 = 1Mi words
     initial begin
         if (MEM_HEXFILE_ROM != "")
-            $readmemh(MEM_HEXFILE_ROM, sram, 21'h180000);  // load ROM at $300000-$37FFFF (word addr)
+            // Empirically determined via probe: minimig bank mapper
+            // generates SRAM word $1E0069 for CPU read at $FC00D2.
+            // So the ROM region $FC0000..$FFFFFF maps to SRAM word
+            // $1E0000..$1FFFFF (256 KiB / 2 = 128K words).
+            $readmemh(MEM_HEXFILE_ROM, sram, 21'h1E0000);
     end
 
     // SRAM read/write logic.
@@ -376,8 +380,8 @@ module minimig_phase1_top (
     always @(posedge clk) begin
         dump_strobe_d <= dump_strobe;
         if (dump_strobe && !dump_strobe_d) begin
-            $writememh("phase1_sram.hex", sram, 21'h00000, 21'h17FFFF);
-            $display("[phase1] dumped sram to phase1_sram.hex (1.5 MiB / 768K words)");
+            $writememh("phase1_sram.hex", sram, 21'h00000, 21'h1FFFFF);
+            $display("[phase1] dumped sram to phase1_sram.hex (2 MiB / 1Mi words)");
         end
     end
 
