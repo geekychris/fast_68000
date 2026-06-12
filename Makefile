@@ -1450,6 +1450,37 @@ open-window-test:
 idcmp-window-test:
 	$(MAKE) screen-open-test INTUITION_DIFF_STEM=idcmp_window_test
 
+# ---------------------------------------------------------------------------
+# Option 3 — full chipset register-trace differential.
+#
+# `make boing-chipset-trace` runs boing-disk with +define+CHIPSET_TRACE_ALL
+# enabled and captures every $DFFxxx write to /tmp/boing_chipset.ours.log.
+# Pair with a same-ADF FS-UAE run (see tools/intuition_diff/chipset_trace_diff.py
+# header for FS-UAE patch notes) and compare via
+#   python3 tools/intuition_diff/chipset_trace_diff.py \
+#       /tmp/boing_chipset.ours.log /tmp/boing_chipset.fsuae.log
+# The first divergent write is the smoking gun for cumulative-state
+# divergence that no isolated library-call test can catch (see WB13
+# journal §63a).
+# ---------------------------------------------------------------------------
+boing-chipset-trace: kickstart/boing_disk.adf
+	@rm -rf build_kick_boot
+	BOOT_TRACE=0 ROMCYCLES=$${ROMCYCLES:-400000000} \
+	    EXTRA_VERI_DEFS="+define+CHIPSET_TRACE_ALL" \
+	    $(MAKE) --no-print-directory test-kickstart-boot \
+	    ADFFILE=kickstart/boing_disk.adf 2>&1 | tail -3 || true
+	@grep -E '^\[CHIPSET-WR\]' build_kick_boot/run.log \
+	    > /tmp/boing_chipset.ours.log || true
+	@echo "Captured /tmp/boing_chipset.ours.log ($$(wc -l < /tmp/boing_chipset.ours.log) entries)"
+	@echo "Quick preview:"
+	@$(PYTHON) tools/intuition_diff/chipset_trace_diff.py \
+	    /tmp/boing_chipset.ours.log --head 5 2>&1 | head -10
+	@echo "..."
+	@echo "For full comparison run:"
+	@echo "  python3 tools/intuition_diff/chipset_trace_diff.py \\"
+	@echo "      /tmp/boing_chipset.ours.log /tmp/boing_chipset.fsuae.log"
+	@echo "  or --by-addr for coarse address-count comparison"
+
 # demo-real-boing: boot the boing-disk ADF, render the final frame.
 demo-real-boing: kickstart/boing_disk.adf
 	@rm -rf build_kick_boot

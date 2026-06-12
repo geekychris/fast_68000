@@ -5766,3 +5766,101 @@ breadcrumbs into the binary itself) to log "called OpenScreen with A0
 = ...", we get a high-signal trace of what boing actually does, vs.
 what we tested in isolation.  The first library call where its return
 value differs from FS-UAE is the bug.
+
+## §64. Full chipset register-trace differential — option 3 landed (2026-06-12)
+
+Since all three minimal-program stubs (§61–63) pass on our sim, the
+boing failure must be in cumulative chipset state across millions of
+instructions, not in any single library call.  Landed the option 3
+infrastructure to find it: a positional diff of every chipset
+register write between our sim and an FS-UAE reference run.
+
+### §64a. Our side
+
+`rtl/m68k_bus.v` gains one `hw_watch` instance covering the whole
+$DFF000-$DFFFFF window, gated by `+define+CHIPSET_TRACE_ALL`:
+
+```verilog
+hw_watch #(
+    .LABEL ("CHIPSET-WR"),
+    .ADDR_LO (32'h00DF_F000), .ADDR_HI (32'h00DF_FFFF),
+    .MATCH_WE (1)) u_w_chipset ( ... .src_id(bus_src), ... );
+```
+
+`bus_src` is the arbiter's master id (CPU / Blitter / Disk / Copper /
+Agnus) which `chipset_trace_diff.py` decodes into a name.  Each write
+emits one line:
+
+    [CHIPSET-WR] r=N src=S pc=P we=1 addr=H wdata=H be=ZZZZ
+
+### §64b. Tooling
+
+`tools/intuition_diff/chipset_trace_diff.py`:
+
+- `--by-addr`: coarse per-address count diff (good for "we write
+  BPLCON0 1000 times, FS-UAE writes it 1004 times" findings even
+  if ordering isn't stable).
+- positional default: line N of ours vs. line N of other; first
+  divergence (addr, wdata, or be mismatch) is printed with context
+  ±5 entries.
+- known register table (decoded names: BPLCON0, BLT*, AUD*, COP*…),
+  raw $DFFxxx for everything else.
+
+`make boing-chipset-trace`: build with the trace define, boot boing-disk,
+grep `[CHIPSET-WR]` into `/tmp/boing_chipset.ours.log`, preview the
+first few lines, print the FS-UAE comparison command.
+
+### §64c. First-side stats
+
+400M-cycle boing-disk run with the trace on produced **4,242,504**
+chipset writes over 55M retired instructions.  Log is 326 MB — large
+but tractable; the Python tool handles it in seconds.
+
+Per-address counts (top by frequency) show what dominates:
+
+| address    | name     | count   |
+|------------|----------|---------|
+| $DFF034    | POTGO    | 65,235  |
+| $DFF084    | COP2LCH  | 65,238  |
+| $DFF090    | DIWSTOP  | 48,476  |
+| $DFF092    | DDFSTRT  | 48,472  |
+| $DFF040    | BLTCON0  | 6,978   |
+| $DFF058    | BLTSIZE  | 6,976   |
+| $DFF070    | BLTCDAT  |   199   |
+| $DFF024    | DSKLEN   |   201   |
+
+These match expectations — Copper is restarting once per frame so
+COP2LCH and the DIWSTRT/DIWSTOP/DDFSTRT/DDFSTOP set get written
+~50K times each over the 55M instructions = roughly the right scale
+for a continuous WB display.  Disk DMA fires ~200 times during the
+boot.
+
+Self-compare reports `streams are byte-identical`, so the parser +
+diff logic is sound.
+
+### §64d. FS-UAE side (deferred)
+
+The FS-UAE companion still needs to be written: extend the existing
+`claude_rpc` patch (project_fsuae_rpc.md) so a `/v1/chipset_trace`
+endpoint enables a `chipmem_*put` / `custom_cycle` hook that emits
+the same line format.  Once that exists, the loop is:
+
+    EXTRA_VERI_DEFS=+define+CHIPSET_TRACE_ALL make boing-chipset-trace
+    fsuae-cli /v1/chipset_trace on; boot boing-disk; export -> .fsuae.log
+    python3 tools/intuition_diff/chipset_trace_diff.py \
+        /tmp/boing_chipset.ours.log /tmp/boing_chipset.fsuae.log
+
+The first DIFF line is the cumulative-state smoking gun.
+
+### §64e. Why this is worth keeping
+
+Even before FS-UAE is patched, the trace + diff is useful for:
+
+1. **Regression detection**: re-run boing-chipset-trace after any
+   chipset RTL change; compare against a saved baseline log.
+2. **Cross-build comparisons**: ours-with-fix vs ours-without-fix
+   to confirm the fix touches the writes you expect to touch.
+3. **Per-address histograms**: spot "we write register R way too
+   many / too few times" anomalies at a glance.
+
+Engineering preserved for future cumulative-state mysteries.

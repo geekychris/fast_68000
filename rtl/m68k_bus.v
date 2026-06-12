@@ -2756,6 +2756,36 @@ module m68k_bus #(
         .hit_o   ()
     );
 
+    // [CHIPSET-WR]: every write to the custom-chipset window
+    // ($DFF000-$DFFFFF), any master (CPU/Copper/Blitter/DMA — src_id
+    // disambiguates).  Used by tools/intuition_diff/chipset_trace_diff.py
+    // to compare our boing-disk register stream to FS-UAE position-by-
+    // position; the first divergent write is the smoking gun for
+    // cumulative-state bugs that no single-library-call test catches.
+    // OFF by default (the stream is large — boing-disk produces ~2M
+    // lines).  Enable with +define+CHIPSET_TRACE_ALL.
+`ifdef CHIPSET_TRACE_ALL
+    hw_watch #(
+        .LABEL      ("CHIPSET-WR"),
+        .ADDR_LO    (32'h00DF_F000),
+        .ADDR_HI    (32'h00DF_FFFF),
+        .MATCH_WE   (1),
+        .MATCH_RE   (0)
+    ) u_w_chipset (
+        .clk     (clk),
+        .rst_n   (rst_n),
+        .valid   (bus_we_now),
+        .we      (1'b1),
+        .addr    (addr[winner]),
+        .wdata   (wdata[winner]),
+        .be      (be[winner]),
+        .src_id  (bus_src),
+        .pc      (32'd0),
+        .retired (32'd0),
+        .hit_o   ()
+    );
+`endif
+
     // [BPLCON0-WR]: every write to BPLCON0 ($DFF100), CPU or Copper.
     // If Workbench renders, Intuition's Copper list MOVEs $A302 to
     // BPLCON0 once per frame (after BPU-up transition).  If we see
