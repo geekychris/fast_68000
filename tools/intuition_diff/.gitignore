@@ -1,0 +1,5 @@
+# Build outputs — rebuild with build.sh
+screen_open_test
+screen_open_test.o
+open_window_test
+open_window_test.o

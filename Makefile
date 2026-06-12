@@ -1409,6 +1409,34 @@ kickstart/boing_disk.adf: $(BOING_SRC) $(BOING_SAMPLES) kickstart/wb13.adf
 	@echo "Built $@"
 	@ls -la $@
 
+# ---------------------------------------------------------------------------
+# screen-open-test: minimal-program differential.  Builds a ~100-instruction
+# 68k stub that calls intuition.library/OpenScreen and records the result
+# in a chip-RAM marker block, then boots it on top of K1.3+WB1.3.  The
+# dump can then be compared to a same-ADF FS-UAE run via:
+#     python3 tools/intuition_diff/diff_dumps.py /tmp/screen_open_chip.bin /tmp/<fsuae>.bin
+# Reusable harness — see tools/intuition_diff/README.md to add follow-on
+# stubs (open_window_test, refresh_test, etc).
+# ---------------------------------------------------------------------------
+INTUITION_DIFF_STEM ?= screen_open_test
+kickstart/$(INTUITION_DIFF_STEM).adf: \
+        tools/intuition_diff/$(INTUITION_DIFF_STEM).s \
+        tools/intuition_diff/build.sh \
+        tools/intuition_diff/make_adf.sh \
+        kickstart/wb13.adf
+	tools/intuition_diff/build.sh $(INTUITION_DIFF_STEM)
+	tools/intuition_diff/make_adf.sh $(INTUITION_DIFF_STEM)
+
+screen-open-test: kickstart/$(INTUITION_DIFF_STEM).adf
+	@rm -rf build_kick_boot
+	BOOT_TRACE=0 CHIPRAM_DUMP=/tmp/$(INTUITION_DIFF_STEM)_chip.bin \
+	    SLOWRAM_DUMP=/tmp/$(INTUITION_DIFF_STEM)_slow.bin \
+	    ROMCYCLES=$${ROMCYCLES:-400000000} \
+	    $(MAKE) --no-print-directory test-kickstart-boot \
+	    ADFFILE=kickstart/$(INTUITION_DIFF_STEM).adf 2>&1 | tail -5 || true
+	$(PYTHON) tools/intuition_diff/diff_dumps.py \
+	    /tmp/$(INTUITION_DIFF_STEM)_chip.bin
+
 # demo-real-boing: boot the boing-disk ADF, render the final frame.
 demo-real-boing: kickstart/boing_disk.adf
 	@rm -rf build_kick_boot

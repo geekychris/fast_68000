@@ -5471,3 +5471,141 @@ through many layers but the precise instigator of the failing extra
 blit hasn't been identified.  Likely candidates: a boing-specific
 graphics call during audio init, or a K1.3 ROM helper that runs only
 when boing.samples Read enters a specific state.
+
+## §61. Strategy pivot — minimal-program differential (2026-06-12)
+
+After many sessions trying to find the boing failure by chasing one
+symptom to the next walking the OS stack, the cost-benefit on the
+"per-symptom hunt" stopped making sense.  Even with the AUTO-REQ wall
+removed (commit 90e326b — Phase 1c bus adapter fixes that side-cleared
+the `mem[$C00ED8]==3` divergence), boing's `OpenScreen/OpenWindow`
+path still fails to populate boing's Window struct at chip $494A0.
+We were treating each wall as a fresh investigation.  We needed a
+better axis.
+
+**Pivot:** instead of running 100M instructions of boing+DOS+BCPL and
+chasing a downstream symptom, write a 100-instruction stub that calls
+just `OpenScreen()`, record the result in a known marker block, and
+diff our chip-RAM dump byte-for-byte against the same ADF run on
+FS-UAE.  Whatever differs is the bug, and it's local.
+
+### §61a. The harness
+
+Files under `tools/intuition_diff/`:
+
+- `screen_open_test.s` — 100-line GNU-as 68k source: `AllocMem(64,
+  MEMF_CHIP|MEMF_CLEAR)`, `OpenLibrary("intuition.library")`, build a
+  NewScreen on the stack (320x200x5, CUSTOMSCREEN, ViewModes=0),
+  `OpenScreen()`, fingerprint the Screen + BitMap + chipset into the
+  marker block, spin forever.
+- `build.sh STEM` — assemble + link via `/opt/amiga/bin/m68k-amigaos-as`
+  + `m68k-amigaos-ld` (bebbo amiga-gcc toolchain) to a real AmigaOS
+  hunkexe.
+- `make_adf.sh STEM` — copy `kickstart/wb13.adf` to
+  `kickstart/<STEM>.adf` via `xdftool`, inject the binary, replace
+  S/Startup-Sequence with a one-liner that just runs the test.
+- `diff_dumps.py ours.bin [other.bin]` — read the marker pointer
+  at chip $00000C00, locate the marker block, decode the 12 fields,
+  print a field-by-field diff.
+
+Makefile target:
+
+```sh
+make screen-open-test     # builds ADF + boots + decodes marker
+```
+
+Marker block layout (kept in sync with `screen_open_test.s` and
+`diff_dumps.py`):
+
+| offset | field                          |
+|--------|--------------------------------|
+| +0     | sentinel $54455354 'TEST'       |
+| +4     | IntuitionBase                   |
+| +8     | Screen pointer                  |
+| +12    | status (1/2/3/255 codes)        |
+| +16    | Screen.LeftEdge.W \| TopEdge.W |
+| +20    | Screen.Width.W \| Height.W      |
+| +24    | first long of Screen.ViewPort  |
+| +28    | DMACONR \| BPLCON0 readback     |
+| +32    | BitMap.BytesPerRow \| Rows      |
+| +36    | BitMap.Flags \| Depth \| pad    |
+| +40    | BitMap.Planes[0]                |
+| +44    | BitMap.Planes[1]                |
+
+The harness is intentionally generic — any 100-instruction stub
+that follows the same marker convention (sentinel at +0, status
+at +12) plugs in.  Likely follow-ons: `open_window_test.s`,
+`refresh_test.s`, `task_create_test.s`.  Same `build.sh STEM`,
+same `make_adf.sh STEM`, same diff script (only the field table
+in `diff_dumps.py` needs new entries).
+
+### §61b. First result — OpenScreen works on our sim
+
+Running `make screen-open-test` on the current sim (commit 90e326b)
+produces a clean marker:
+
+```
+status         3 (OpenScreen OK)
+IntuitionBase  $00C03D24
+Screen ptr     $00C08530
+LeftEdge|Top   $00000000           (matches NewScreen 0,0)
+Width|Height   $014000C8           (320, 200)
+ViewPort[0]    $02040402
+DMACONR|...    $23E0|$0000         (BLTPRI+DMAEN+BPLEN+COPEN+BLTEN+SPREN)
+BitMap rows    $002800C8           (BPR=40, Rows=200)
+BitMap depth   $0005               (matches NewScreen Depth=5)
+BitMap Plane0  $00010270           (chip-RAM bitplane, valid)
+BitMap Plane1  $000121B0
+```
+
+This is a substantive finding even before any FS-UAE diff:
+
+1. **OpenScreen completes successfully** on our sim.  Width / Height /
+   Depth match the NewScreen we passed in.  BitMap.Planes are allocated
+   in chip RAM at sensible addresses.  Intuition is functional.
+2. **The boing failure cannot be in OpenScreen itself.**  The mode of
+   the failure has to be either (a) OpenWindow, (b) some interaction
+   between OpenScreen and earlier state that the simple test doesn't
+   replicate, or (c) state setup before OpenScreen in boing's specific
+   call pattern.
+3. The harness is reusable: extending to OpenWindow is a 30-line edit
+   to add one library JSR + a few more marker fields.
+
+### §61c. What to do next
+
+Order of operations from here:
+
+1. **Compare against FS-UAE.**  Run the same `screen_open_test.adf` on
+   FS-UAE through claude_rpc, snapshot chip RAM at the marker (look
+   for sentinel 'TEST'), then `diff_dumps.py ours.bin fsuae.bin`.
+   If any field differs, that's a real Intuition / graphics divergence
+   to chase.
+2. **Extend to OpenWindow.**  Build `open_window_test.s` that does
+   OpenScreen → OpenWindow → snapshot Window struct fields (Title,
+   Width/Height, Flags, RPort.BitMap, mp_LN, UserPort, etc).  If
+   THIS marker shows divergence on our sim while the OpenScreen one
+   doesn't, the bug lives in OpenWindow.
+3. **Mirror boing's exact NewScreen.**  If both tests pass cleanly,
+   the bug is in some pre-OpenScreen state.  Copy boing's actual
+   NewScreen (it's published in its binary) into `screen_open_test.s`
+   and re-run; that should reproduce the failure if it's an
+   Intuition-internal divergence triggered by specific parameters.
+4. **Full register-trace fallback (option 3).**  If 1–3 all pass but
+   real boing still fails, the bug isn't in any single library call —
+   it's in the cumulative chipset register state over millions of
+   instructions.  Then extend FS-UAE's claude_rpc patch to log every
+   chipset write with PC+retired and diff the streams.
+
+### §61d. Why this is worth keeping
+
+The point of the harness is that every dollar of engineering spent
+here pays off again the next time we hit a "boing-style" stall —
+some boot that goes through a long OS stack and dies mysteriously.
+The pattern:
+
+1. Write a 100-instruction stub for whichever OS call is suspected.
+2. Inject into ADF, boot, diff.
+3. Either the stub fails (bug isolated to that call) or it passes
+   (bug is upstream, narrow down by extending the stub).
+
+This sidesteps the "100M instructions of context" problem completely.
