@@ -19,6 +19,7 @@ int main(int argc, char** argv) {
 
     // Reset for 32 cycles (minimig needs longer reset than our bare CPU).
     dut->clk = 0; dut->rst_n = 0;
+    dut->dump_strobe = 0;
     for (int i = 0; i < 32; i++) tick(dut);
     dut->rst_n = 1;
 
@@ -84,6 +85,13 @@ int main(int argc, char** argv) {
     uint32_t final_retired = (uint32_t)dut->retired;
     printf("[phase1] FINAL pc=$%08X retired=%u reached_rom=%d\n",
            final_pc, final_retired, (int)reached_rom);
+
+    // Pulse dump_strobe for one cycle so the testbench writes
+    // phase1_sram.hex.  Skip if the env var explicitly disables it.
+    if (!std::getenv("PHASE1_NO_DUMP")) {
+        dut->dump_strobe = 1; tick(dut);
+        dut->dump_strobe = 0; tick(dut);
+    }
 
     delete dut;
     // Phase 1a pass criterion: build + run-without-crash.  CPU not

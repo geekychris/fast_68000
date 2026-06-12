@@ -18,7 +18,8 @@ module minimig_phase1_top (
     output wire [31:0] retired,
     output wire        halted,
     output wire [15:0] halt_code,
-    output wire        cpu_in_stop
+    output wire        cpu_in_stop,
+    input  wire        dump_strobe  // 0→1 edge: write sram to phase1_sram.hex
 );
 
     parameter MEM_HEXFILE_ROM = "rom.hex";
@@ -364,6 +365,21 @@ module minimig_phase1_top (
 `endif
 
     wire _unused = &{ic_we, ic_lock, ic_wdata, dc_lock, 1'b0};
+
+    // On rising edge of dump_strobe write the SRAM contents (in
+    // 16-bit-per-line $writememh format) to phase1_sram.hex.  Driven
+    // from the C++ harness at end-of-run for chip-RAM diff vs our
+    // m68k_top stack.  sram[0..262143] covers the 512 KiB chip RAM
+    // range (word offsets 0..$3FFFF).  Slow RAM at SRAM offset $80000
+    // covers the next 512 KiB.
+    reg dump_strobe_d;
+    always @(posedge clk) begin
+        dump_strobe_d <= dump_strobe;
+        if (dump_strobe && !dump_strobe_d) begin
+            $writememh("phase1_sram.hex", sram, 21'h00000, 21'h17FFFF);
+            $display("[phase1] dumped sram to phase1_sram.hex (1.5 MiB / 768K words)");
+        end
+    end
 
     // Phase 1b unblocker: minimig's user_io keeps cpuhlt=1 and
     // cpurst=1 by default until the OSD/host SPI bus releases them.
