@@ -84,13 +84,30 @@ module m68k_to_amiga_bus (
     reg [31:0] xact_wdata;
     reg [3:0]  xact_be;
     reg [15:0] hi_rdata;          // latched high half for .L reads
+    reg [15:0] lo_rdata;          // latched low  half (or single-word .W)
     // Counter that runs while AS is asserted (S_HI_W, S_LO_W).  Bus
     // cycle completes when DTACK is low AND counter >= MIN_AS_CYCLES.
     reg [7:0]  as_hold_cnt;
 
+    // Track the just-completed transaction so we don't restart the
+    // same fetch when the CPU hasn't yet advanced its request.  The
+    // CPU's IF stage holds ic_req high for at least one extra cycle
+    // after seeing ic_ack (until if_fetch_addr advances) — without
+    // this guard the adapter sees ic_req=1 in S_IDLE and re-runs the
+    // same xact_addr, producing a duplicate ic_ack with the old data
+    // *for the new ic_addr*, which the CPU then latches into its IF
+    // pipeline as garbage.
+    reg [31:0] last_xact_addr;
+    reg        last_xact_was_dc;
+    reg        last_xact_valid;
+    wire ic_addr_fresh = !last_xact_valid || last_xact_was_dc ||
+                         (ic_addr != last_xact_addr);
+    wire dc_addr_fresh = !last_xact_valid || !last_xact_was_dc ||
+                         (dc_addr != last_xact_addr);
+
     // ---------------- Arbitration: pick next requester ----------------
-    wire pick_dc = dc_req;
-    wire pick_ic = ic_req && !dc_req;
+    wire pick_dc = dc_req && dc_addr_fresh;
+    wire pick_ic = ic_req && !dc_req && ic_addr_fresh;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -109,6 +126,10 @@ module m68k_to_amiga_bus (
             lds_n    <= 1'b1;
             rw       <= 1'b1;
             hi_rdata <= 16'd0;
+            lo_rdata <= 16'd0;
+            last_xact_addr   <= 32'd0;
+            last_xact_was_dc <= 1'b0;
+            last_xact_valid  <= 1'b0;
         end else begin
             ic_ack <= 1'b0;
             dc_ack <= 1'b0;
@@ -137,8 +158,18 @@ module m68k_to_amiga_bus (
                 end
 
                 // -------- HI: drive high-half word --------
+                // CONVENTION: m68k_bus.v returns the 4-byte-aligned
+                // longword `mem[(addr & ~3) >> 2]` for all non-special
+                // reads.  The CPU's IF stage extracts a half-word using
+                // `if_fetch_addr[1] ? rdata[15:0] : rdata[31:16]`, which
+                // assumes the high half of rdata = word at (addr & ~3)
+                // and the low half = word at (addr & ~3) + 2.  So we
+                // MUST drive the bus address aligned to 4 bytes, not at
+                // the CPU's raw (only word-aligned) request address —
+                // otherwise the CPU pulls the wrong half and decodes the
+                // wrong opcode (e.g. $FF1C looks like a Line-F trap).
                 S_HI: begin
-                    addr_o <= xact_addr[23:1];
+                    addr_o <= {xact_addr[23:2], 1'b0};
                     rw     <= ~is_write;
                     uds_n  <= ~xact_be[3];
                     lds_n  <= ~xact_be[2];
@@ -149,6 +180,10 @@ module m68k_to_amiga_bus (
                 end
 
                 // -------- HI_W: wait for DTACK on high half --------
+                // CRITICAL: we MUST sample data_i *before* releasing AS.
+                // The minimig bridge re-arms its data path on _as=1 and
+                // the held-data buffer (ldata_in) may drift between this
+                // cycle and S_ACK.  Latch into hi_rdata here.
                 S_HI_W: begin
                     if (as_hold_cnt < MIN_AS_CYCLES) as_hold_cnt <= as_hold_cnt + 8'd1;
                     if (!dtack_n && as_hold_cnt >= MIN_AS_CYCLES) begin
@@ -161,8 +196,9 @@ module m68k_to_amiga_bus (
                 end
 
                 // -------- LO: drive low-half word --------
+                // Second word of the 4-byte aligned longword (base+2).
                 S_LO: begin
-                    addr_o <= (xact_addr[23:1] + 23'd1);  // next word
+                    addr_o <= {xact_addr[23:2], 1'b1};
                     rw     <= ~is_write;
                     uds_n  <= ~xact_be[1];
                     lds_n  <= ~xact_be[0];
@@ -173,12 +209,14 @@ module m68k_to_amiga_bus (
                 end
 
                 // -------- LO_W: wait for DTACK on low half --------
+                // Latch lo_rdata here, NOT in S_ACK — once we release
+                // _as the bridge's held data may not survive.
                 S_LO_W: begin
                     if (as_hold_cnt < MIN_AS_CYCLES) as_hold_cnt <= as_hold_cnt + 8'd1;
                     if (!dtack_n && as_hold_cnt >= MIN_AS_CYCLES) begin
+                        if (!is_write) lo_rdata <= data_i;
                         as_n <= 1'b1; uds_n <= 1'b1; lds_n <= 1'b1;
                         state <= S_ACK;
-                        // For .L reads we combine hi_rdata + data_i here.
                     end
                 end
 
@@ -186,13 +224,16 @@ module m68k_to_amiga_bus (
                 S_ACK: begin
                     if (owner_dc) begin
                         dc_ack <= 1'b1;
-                        if (is_long) dc_rdata <= {hi_rdata, data_i};
+                        if (is_long) dc_rdata <= {hi_rdata, lo_rdata};
                         else         dc_rdata <= {16'd0, hi_rdata};
                     end else begin
                         ic_ack <= 1'b1;
                         // I-fetch always .L
-                        ic_rdata <= {hi_rdata, data_i};
+                        ic_rdata <= {hi_rdata, lo_rdata};
                     end
+                    last_xact_addr   <= xact_addr;
+                    last_xact_was_dc <= owner_dc;
+                    last_xact_valid  <= 1'b1;
                     state <= S_IDLE;
                 end
 

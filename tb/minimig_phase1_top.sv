@@ -37,6 +37,13 @@ module minimig_phase1_top (
     wire        dc_is_long;
     wire        dc_ack;
     wire [31:0] dc_rdata;
+    wire [16*32-1:0] dbg_regs_flat;
+    // D0..D7 at offsets 0..7, A0..A7 at offsets 8..15
+    wire [31:0] dbg_A0 = dbg_regs_flat[32* 8 +: 32];
+    wire [31:0] dbg_A1 = dbg_regs_flat[32* 9 +: 32];
+    wire [31:0] dbg_A5 = dbg_regs_flat[32*13 +: 32];
+    wire [31:0] dbg_A7 = dbg_regs_flat[32*15 +: 32];
+    wire [31:0] dbg_D0 = dbg_regs_flat[32* 0 +: 32];
 
     // Convert minimig's [2:0]_cpu_ipl (active low) to our [2:0] ipl_i
     // (active high).
@@ -70,7 +77,7 @@ module minimig_phase1_top (
         .retired       (retired),
         .cpu_in_stop   (cpu_in_stop),
         .cur_pc        (cur_pc),
-        .dbg_regs_flat (),
+        .dbg_regs_flat (dbg_regs_flat),
         .dbg_sr        ()
     );
 
@@ -175,20 +182,27 @@ module minimig_phase1_top (
             // So the ROM region $FC0000..$FFFFFF maps to SRAM word
             // $1E0000..$1FFFFF (256 KiB / 2 = 128K words).
             $readmemh(MEM_HEXFILE_ROM, sram, 21'h1E0000);
+        $display("[phase1] post-load: sram[$1E0000]=%h sram[$1E0001]=%h sram[$1E0069]=%h sram[$1FFFFE]=%h sram[$1FFFFF]=%h",
+            sram[21'h1E0000], sram[21'h1E0001], sram[21'h1E0069],
+            sram[21'h1FFFFE], sram[21'h1FFFFF]);
     end
 
-    // SRAM read/write logic.
-    reg [15:0] sram_rdata_q;
+    // SRAM read/write logic.  Real SRAM has *asynchronous* reads: when
+    // _oe goes low, the data appears combinationally after tAA (which we
+    // model as 0).  minimig's sram_bridge passes `ramdata_in` straight
+    // through to `data_out`, and its bank mapper time-slices SRAM slots
+    // every couple of cycles between CPU and chipset DMA.  A *registered*
+    // read in this model causes the data presented at the bridge to be
+    // stale by one cycle — by the time the bridge would capture it, the
+    // bank mapper has moved on to a chipset slot and the bridge sees
+    // zeros, which the CPU then executes as $0000 ORI.B no-ops.
     always @(posedge clk) begin
-        if (!ram_oe_n && ram_we_n) begin
-            sram_rdata_q <= sram[ram_address];
-        end
         if (!ram_we_n) begin
             if (!ram_bhe_n) sram[ram_address][15:8] <= ram_data[15:8];
             if (!ram_ble_n) sram[ram_address][7:0]  <= ram_data[7:0];
         end
     end
-    assign ramdata_in = sram_rdata_q;
+    assign ramdata_in = sram[ram_address];
 
     // ---------------- minimig.v ----------------
     minimig u_minimig (
@@ -311,9 +325,10 @@ module minimig_phase1_top (
                     {cpu_address, 1'b0}, cpu_rw, ~cpu_uds_n, ~cpu_lds_n, cpudata_in);
                 probe_count <= probe_count + 1;
             end
-            if (cpu_dtack_n_d && !cpu_dtack_n && dtack_count < 20) begin
-                $display("[probe] DTACK falling at cycle (addr=%h rdata=%h)",
-                    {cpu_address, 1'b0}, cpu_data);
+            if (cpu_dtack_n_d && !cpu_dtack_n && dtack_count < 40) begin
+                $display("[probe] DTACK falling addr=%h rw=%b cpu_data(in)=%h cpudata_in(out)=%h sram[%h]=%h ramdata_in=%h",
+                    {cpu_address, 1'b0}, cpu_rw, cpu_data, cpudata_in,
+                    ram_address, sram[ram_address], ramdata_in);
                 dtack_count <= dtack_count + 1;
             end
             // Phase 1b: when CPU AS is low at $FC00D2 (or any addr in
@@ -349,26 +364,112 @@ module minimig_phase1_top (
     // the m68k_bridge instance (per minimig.v:770); BMAP1 is the
     // bank mapper.
     always @(posedge clk or negedge rst_n) begin
-        if (rst_n && sig_cnt < 10'd60) begin
-            $display("[deep %0d] cpuhlt=%b cpurst=%b dbr=%b dbs=%b nrdy=%b l_as=%b l_dtack=%b enable=%b _ta_n=%b cpu_rd=%b sel_kick=%b bank=%h",
+        if (rst_n && sig_cnt < 10'd200) begin
+            $display("[deep %0d] dbr=%b l_as=%b l_dtack=%b enable=%b _ta_n=%b cpu_rd=%b sel_kick=%b bank=%h c1=%b c3=%b cck=%b ldata_in=%h ram_addr=%h ramdata_in=%h sram_at_ramaddr=%h",
                 sig_cnt,
-                u_minimig.cpuhlt,
-                u_minimig.cpurst,
                 u_minimig.dbr,
-                u_minimig.dbs,
-                u_minimig.gayle_nrdy,
                 u_minimig.CPU1.l_as,
                 u_minimig.CPU1.l_dtack,
                 u_minimig.CPU1.enable,
                 u_minimig.CPU1._ta_n,
                 u_minimig.cpu_rd,
                 u_minimig.sel_kick,
-                u_minimig.bank);
+                u_minimig.bank,
+                c1, c3, cck,
+                u_minimig.CPU1.ldata_in,
+                ram_address,
+                ramdata_in,
+                sram[ram_address]);
         end
     end
 `endif
 
     wire _unused = &{ic_we, ic_lock, ic_wdata, dc_lock, 1'b0};
+
+`ifdef PHASE1_DERAIL
+    // Trace every IC and DC ack — what data the CPU actually receives.
+    reg [31:0] ack_cnt;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) ack_cnt <= 32'd0;
+        else if (ic_ack && ack_cnt < 32'd80) begin
+            $display("[ic-ack %0d] ic_addr=$%08X xact_addr=$%08X be=%b rdata=$%08X pc=$%08X A1=$%08X",
+                ack_cnt, ic_addr, u_bus_adapter.xact_addr, ic_be, ic_rdata, cur_pc, dbg_A1);
+            ack_cnt <= ack_cnt + 32'd1;
+        end else if (dc_ack && ack_cnt < 32'd80) begin
+            $display("[dc-ack %0d] dc_addr=$%08X xact_addr=$%08X be=%b we=%b is_long=%b wdata=$%08X rdata=$%08X pc=$%08X A0=$%08X A1=$%08X A5=$%08X A7=$%08X D0=$%08X",
+                ack_cnt, dc_addr, u_bus_adapter.xact_addr, dc_be, dc_we, dc_is_long, dc_wdata, dc_rdata,
+                cur_pc, dbg_A0, dbg_A1, dbg_A5, dbg_A7, dbg_D0);
+            ack_cnt <= ack_cnt + 32'd1;
+        end
+    end
+`endif
+
+    // ----- Phase 1c derail probe -----
+    // Latch PC on retired-edge (so we see one entry per retired instr,
+    // not per-cycle).  Catches the first retired PC outside ROM range.
+`ifdef PHASE1_DERAIL
+    reg [31:0] derail_pc_q [0:31];
+    reg [4:0]  derail_idx;
+    reg [31:0] last_retired;
+    reg        derailed;
+    integer    di;
+    reg [31:0] first30_pc [0:31];
+    reg [4:0]  first30_cnt;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            derail_idx   <= 5'd0;
+            last_retired <= 32'd0;
+            derailed     <= 1'b0;
+            first30_cnt  <= 5'd0;
+            for (di = 0; di < 32; di = di + 1) begin
+                derail_pc_q[di] <= 32'd0;
+                first30_pc[di]  <= 32'd0;
+            end
+        end else begin
+            if (retired != last_retired) begin
+                // A new instruction retired this cycle.  cur_pc is the
+                // PC of the *next* instruction to execute (post-retire);
+                // so the PC that just retired was the prior cur_pc.  But
+                // we want to see the trajectory, so log cur_pc.
+                derail_pc_q[derail_idx] <= cur_pc;
+                derail_idx   <= derail_idx + 5'd1;
+                last_retired <= retired;
+                if (first30_cnt < 5'd30) begin
+                    first30_pc[first30_cnt] <= cur_pc;
+                    first30_cnt <= first30_cnt + 5'd1;
+                end
+                if (!derailed && retired > 32'd5 &&
+                    (cur_pc < 32'hFC0000 || cur_pc > 32'hFFFFFF)) begin
+                    derailed <= 1'b1;
+                    $display("[derail] PC LEFT ROM at retired=%0d  destination=$%08X  ipl_n=%b",
+                        retired, cur_pc, cpu_ipl_n);
+                    $display("[derail] last 32 retired PCs (oldest->newest):");
+                    for (di = 0; di < 32; di = di + 1) begin
+                        $display("[derail]   slot[%0d] = $%08X",
+                            di, derail_pc_q[(derail_idx + di[4:0]) & 5'h1F]);
+                    end
+                end
+                // Track IPL activity in first 200 retired
+                if (retired < 32'd200 && cpu_ipl_n != 3'b111) begin
+                    $display("[ipl] retired=%0d pc=$%08X ipl_n=%b (active!)", retired, cur_pc, cpu_ipl_n);
+                end
+            end
+        end
+    end
+    // After N cycles, dump the first 30 retired PCs anyway (helps confirm
+    // boot trajectory even if no derail).
+    reg [31:0] phase1_dump_cnt;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) phase1_dump_cnt <= 32'd0;
+        else if (phase1_dump_cnt < 32'h10000) phase1_dump_cnt <= phase1_dump_cnt + 32'd1;
+        else if (phase1_dump_cnt == 32'h10000) begin
+            $display("[first30] First 30 retired PCs:");
+            for (di = 0; di < 30; di = di + 1)
+                $display("[first30]   [%0d] = $%08X", di, first30_pc[di]);
+            phase1_dump_cnt <= phase1_dump_cnt + 32'd1;
+        end
+    end
+`endif
 
     // On rising edge of dump_strobe write the SRAM contents (in
     // 16-bit-per-line $writememh format) to phase1_sram.hex.  Driven
