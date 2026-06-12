@@ -1464,22 +1464,39 @@ idcmp-window-test:
 # journal §63a).
 # ---------------------------------------------------------------------------
 boing-chipset-trace: kickstart/boing_disk.adf
+	$(MAKE) --no-print-directory _chipset-trace-one \
+	    ADF=kickstart/boing_disk.adf TAG=boing
+
+hello-chipset-trace: kickstart/hello_disk.adf
+	$(MAKE) --no-print-directory _chipset-trace-one \
+	    ADF=kickstart/hello_disk.adf TAG=hello
+
+# Internal helper — both -trace targets share this body.
+_chipset-trace-one:
 	@rm -rf build_kick_boot
 	BOOT_TRACE=0 ROMCYCLES=$${ROMCYCLES:-400000000} \
 	    EXTRA_VERI_DEFS="+define+CHIPSET_TRACE_ALL" \
 	    $(MAKE) --no-print-directory test-kickstart-boot \
-	    ADFFILE=kickstart/boing_disk.adf 2>&1 | tail -3 || true
+	    ADFFILE=$(ADF) 2>&1 | tail -3 || true
 	@grep -E '^\[CHIPSET-WR\]' build_kick_boot/run.log \
-	    > /tmp/boing_chipset.ours.log || true
-	@echo "Captured /tmp/boing_chipset.ours.log ($$(wc -l < /tmp/boing_chipset.ours.log) entries)"
-	@echo "Quick preview:"
+	    > /tmp/$(TAG)_chipset.ours.log || true
+	@echo "Captured /tmp/$(TAG)_chipset.ours.log ($$(wc -l < /tmp/$(TAG)_chipset.ours.log) entries)"
 	@$(PYTHON) tools/intuition_diff/chipset_trace_diff.py \
-	    /tmp/boing_chipset.ours.log --head 5 2>&1 | head -10
-	@echo "..."
-	@echo "For full comparison run:"
-	@echo "  python3 tools/intuition_diff/chipset_trace_diff.py \\"
-	@echo "      /tmp/boing_chipset.ours.log /tmp/boing_chipset.fsuae.log"
-	@echo "  or --by-addr for coarse address-count comparison"
+	    /tmp/$(TAG)_chipset.ours.log --head 5 2>&1 | head -10
+
+# Compare hello-disk (baseline boot, no boing) vs boing-disk (failing).
+# Both runs are on our sim — no FS-UAE needed.  The first divergent
+# chipset write tells us what boing's load+samples sequence does that
+# breaks the cumulative state.  Run both -trace targets first.
+chipset-trace-diff-hello-vs-boing:
+	@if [ ! -f /tmp/hello_chipset.ours.log ]; then \
+	    echo "Need /tmp/hello_chipset.ours.log; run: make hello-chipset-trace"; exit 1; fi
+	@if [ ! -f /tmp/boing_chipset.ours.log ]; then \
+	    echo "Need /tmp/boing_chipset.ours.log; run: make boing-chipset-trace"; exit 1; fi
+	@echo "== positional diff (first 200 entries) =="
+	@$(PYTHON) tools/intuition_diff/chipset_trace_diff.py \
+	    /tmp/hello_chipset.ours.log /tmp/boing_chipset.ours.log --context 10 \
+	    | head -60
 
 # demo-real-boing: boot the boing-disk ADF, render the final frame.
 demo-real-boing: kickstart/boing_disk.adf

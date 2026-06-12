@@ -5864,3 +5864,89 @@ Even before FS-UAE is patched, the trace + diff is useful for:
    many / too few times" anomalies at a glance.
 
 Engineering preserved for future cumulative-state mysteries.
+
+## §65. hello-vs-boing chipset-trace comparison — boing fires 23× more blits
+
+Before the FS-UAE companion lands, the chipset-trace infrastructure is
+already useful as an ours-vs-ours comparison.  Parameterized the
+targets so both `make hello-chipset-trace` and `make boing-chipset-trace`
+share the same body, then ran both and compared with `--by-addr`
+(positional diff is too sensitive to single-cycle bus reordering for
+this scale of trace).
+
+`make hello-chipset-trace`: 5,059,275 chipset writes over 47M retired
+instructions.  Plain CLI banner display + WB Copper running.
+
+`make boing-chipset-trace`: 4,242,504 chipset writes over 55M retired
+instructions.  WB CLI + "Launching Boing..." then boing! task running.
+
+### §65a. Per-address divergence (`--by-addr`)
+
+Hot-spot summary:
+
+| register | hello   | boing   | delta     |
+|----------|---------|---------|-----------|
+| BLTSIZE  |    306  |  6,976  | +6,670    |
+| BLTCON0  |    307  |  6,978  | +6,671    |
+| BLTAFWM  |    174  |  5,060  | +4,886    |
+| BLTBDAT  |    114  |  4,431  | +4,317    |
+| BLTADAT  |     34  |  3,753  | +3,719    |
+| INTENA   | 739,405 |1,098,853| +359,448  |
+| COP2LCH  |  91,127 | 65,238  | -25,889   |
+| POTGO    |  91,124 | 65,235  | -25,889   |
+| DIWSTOP  |  69,256 | 48,476  | -20,780   |
+
+Interpretation:
+
+1. **Boing fires 6,670 more blits than hello (BLTSIZE writes are the
+   ground truth for blit count).**  That's roughly one blit per
+   8,400 retired instructions of boing-period code.  Each blit
+   touches ~3-4 control registers — explains the matching deltas in
+   BLTCON0, BLTAFWM, BLTBDAT, BLTADAT, BLTxPTH/L, BLTxMOD.
+2. **+359K INTENA writes.**  INTENA is the per-Forbid()/Permit() write
+   exec uses to enter/exit critical sections.  +359K means boing's
+   call chain enters Forbid/Permit ~180K extra times during the
+   55M-instruction run — every ~300 instructions.  That's the OS
+   doing a lot of messaging.
+3. **Fewer Copper restarts on boing.**  COP2LCH / POTGO / DIWSTOP /
+   DDFSTRT all decrease by ~26K-21K on the boing side.  That's
+   because boing's task occupies CPU time that hello spent idling
+   in the CLI; the WB Copper still runs but accumulates fewer
+   restart writes in the same wall-clock window.  Not a bug — a
+   side-effect of CPU contention.
+
+No register is "boing-only" or "hello-only" — both runs touch the
+same set.  The bug therefore isn't "boing exercises a chipset region
+we don't handle"; it's accumulation across many writes to known
+registers.
+
+### §65b. Implication for the boing wall
+
+Given 23× more blits and our blitter has historically been a high-
+density source of subtle bugs (see §11, §12, §16, §17, §18, §22, §39,
+§42, §45–48, §51 in this journal), the boing wall is most likely a
+**blitter cumulative-state bug** — something that doesn't show up
+in single-blit minimig cross-checks but accumulates across thousands
+of consecutive blits.  Candidates:
+
+- D-pointer / source-pointer post-increment vs. modulo accumulation
+  drift after long runs
+- BLTAFWM/BLTALWM state leaking between blits if a fresh write was
+  dropped (we've seen this class before — task #92, #137, #149)
+- BLTxMOD state surviving a Forbid/Permit window where it shouldn't
+
+To pinpoint, the next move is either:
+
+1. **Compare blitter-internal state, not just register writes.**
+   Add a per-blit fingerprint probe (input regs at BLT_START +
+   output checksum) and diff against minimig running the same blit
+   sequence.  We already have `make crosscheck-minimig-blt` —
+   extend it to replay boing's actual sequence (extract from
+   the `[CHIPSET-WR]` log by filtering on BLT*).
+2. **Just run boing through minimig-cosim end-to-end.**  Phase 1c
+   showed K1.3 boots in minimig fullsys; with disk + ADF wired up,
+   we get a second source of truth for the boing blit sequence.
+
+Either way, the chipset-trace infra has done its first useful work:
+narrowed the boing search from "could be anywhere in 100M
+instructions" to "almost certainly cumulative blitter state".
