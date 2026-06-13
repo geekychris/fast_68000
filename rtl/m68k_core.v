@@ -3099,6 +3099,42 @@ module m68k_core #(
                 $display("[ADDTASK] r=%0d task=%h name_ptr=mem[A1+10] A0=%h A1=%h",
                     retired, u_rf.regs[9], u_rf.regs[8], u_rf.regs[9]);
 `endif
+
+            // ----- Generic K1.3 library-call tracer -----
+            // See rtl/k13_libcall_probes.v for the full table of LVOs.
+            // Enable with `+define+LIBCALL_<NAME>_TRACE` (or
+            // `+define+LIBCALL_ALL` for everything exec-related).
+            // Output decoded by tools/decode_libcall_trace.py.
+`include "k13_libcall_probes.v"
+`ifdef BOING_BOOTBLOCK_PROBE
+            // Probe boing! running via the custom bootblock loader
+            // (tools/build_boing_bootdisk.py).  Boing's flat image lives
+            // at chip $10000+.  Capture key library-call return values
+            // and chip-RAM exit points to find which call returns NULL.
+            //
+            // chip $1475C: just AFTER `JSR -204(A6)` [OpenWindow] returns;
+            //              D0 = Window* (0 if OpenWindow failed).
+            // chip $143BC: just AFTER `JSR -198(A6)` [OpenScreen] returns;
+            //              D0 = Screen* (0 if OpenScreen failed).
+            // chip $101BA: just AFTER `JSR -552(A6)` [OpenLibrary] returns;
+            //              D0 = library base (0 if OpenLibrary failed).
+            //
+            // We also dump when chip-RAM control returns to ROM ($FC...) —
+            // that's boing's final RTS landing back in K1.3 strap.
+            if (is_settled && ex_pc == 32'h0001_475C)
+                $display("[BOING_OW] r=%0d D0=%h (OpenWindow ret)  A6=%h A7=%h",
+                    retired, u_rf.regs[0], u_rf.regs[14], u_rf.regs[15]);
+            if (is_settled && ex_pc == 32'h0001_43BC)
+                $display("[BOING_OS] r=%0d D0=%h (OpenScreen ret)  A6=%h A7=%h",
+                    retired, u_rf.regs[0], u_rf.regs[14], u_rf.regs[15]);
+            if (is_settled && ex_pc == 32'h0001_01BA)
+                $display("[BOING_OL] r=%0d D0=%h (OpenLibrary ret)  A6=%h A7=%h",
+                    retired, u_rf.regs[0], u_rf.regs[14], u_rf.regs[15]);
+            // Capture program entry and likely exits
+            if (is_settled && ex_pc == 32'h0001_0000)
+                $display("[BOING_ENTRY] r=%0d  SP=%h A6=%h",
+                    retired, u_rf.regs[15], u_rf.regs[14]);
+`endif
 `ifdef PUTMSG_TRACE
             // Catch every PutMsg call (\$FC1B70 in K1.3 ROM).
             // ABI: A0 = MsgPort, A1 = Message.

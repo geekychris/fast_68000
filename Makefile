@@ -1498,6 +1498,43 @@ chipset-trace-diff-hello-vs-boing:
 	    /tmp/hello_chipset.ours.log /tmp/boing_chipset.ours.log --context 10 \
 	    | head -60
 
+# ---------------------------------------------------------------------------
+# K1.3 library-call tracing (see docs/LIBCALL_TRACING.md).
+#
+# `make boing-libcall-trace` boots the boing-disk ADF with every exec-library
+# probe enabled (`+define+LIBCALL_ALL`), captures `[LIBCALL]` lines to
+# build_kick_boot/run.log, and prints a per-function summary via the decoder.
+# Use `make boing-libcall-trace LIBCALL_FILTER=AllocMem` to dump every
+# AllocMem call instead of the summary.
+#
+# Defaults:
+#   LIBCALL_DEFS = +define+LIBCALL_ALL     (override to enable a subset)
+#   LIBCALL_FILTER unset                   (summary mode)
+# ---------------------------------------------------------------------------
+LIBCALL_DEFS ?= +define+LIBCALL_ALL
+
+boing-libcall-trace: kickstart/boing_disk.adf
+	$(MAKE) --no-print-directory _libcall-trace-one \
+	    ADF=kickstart/boing_disk.adf TAG=boing
+
+hello-libcall-trace: kickstart/hello_disk.adf
+	$(MAKE) --no-print-directory _libcall-trace-one \
+	    ADF=kickstart/hello_disk.adf TAG=hello
+
+_libcall-trace-one:
+	@rm -rf build_kick_boot
+	BOOT_TRACE=0 ROMCYCLES=$${ROMCYCLES:-400000000} \
+	    EXTRA_VERI_DEFS="$(LIBCALL_DEFS)" \
+	    $(MAKE) --no-print-directory test-kickstart-boot \
+	    ADFFILE=$(ADF) 2>&1 | tail -3 || true
+	@cp build_kick_boot/run.log /tmp/$(TAG)_libcall.log
+	@echo "Captured /tmp/$(TAG)_libcall.log ($$(grep -c '\[LIBCALL\]' /tmp/$(TAG)_libcall.log) probe hits)"
+	@if [ -n "$(LIBCALL_FILTER)" ]; then \
+	    $(PYTHON) tools/decode_libcall_trace.py /tmp/$(TAG)_libcall.log --filter $(LIBCALL_FILTER) | head -60; \
+	else \
+	    $(PYTHON) tools/decode_libcall_trace.py /tmp/$(TAG)_libcall.log; \
+	fi
+
 # demo-real-boing: boot the boing-disk ADF, render the final frame.
 demo-real-boing: kickstart/boing_disk.adf
 	@rm -rf build_kick_boot
