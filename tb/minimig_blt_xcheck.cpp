@@ -9,6 +9,7 @@
 
 #include "Vminimig_blt_xcheck_top.h"
 #include "verilated.h"
+#include <algorithm>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -20,9 +21,9 @@ static void tick(Vminimig_blt_xcheck_top* dut) {
     dut->clk = 1; dut->eval();
 }
 
-static void init_mem(Vminimig_blt_xcheck_top* dut, uint16_t word_addr, uint16_t value) {
+static void init_mem(Vminimig_blt_xcheck_top* dut, uint32_t word_addr, uint16_t value) {
     dut->init_we    = 1;
-    dut->init_addr  = word_addr;
+    dut->init_addr  = word_addr;       // 20-bit (1Mi word index)
     dut->init_wdata = value;
     tick(dut);
     dut->init_we    = 0;
@@ -36,13 +37,13 @@ static void reg_w(Vminimig_blt_xcheck_top* dut, uint8_t reg, uint16_t val) {
     dut->reg_we    = 0;
 }
 
-static uint16_t read_mm(Vminimig_blt_xcheck_top* dut, uint16_t word_addr) {
-    dut->read_addr = word_addr;
+static uint16_t read_mm(Vminimig_blt_xcheck_top* dut, uint32_t word_addr) {
+    dut->read_addr = word_addr;        // 20-bit
     dut->eval();
     return dut->mm_read_data;
 }
-static uint16_t read_our(Vminimig_blt_xcheck_top* dut, uint16_t word_addr) {
-    dut->read_addr = word_addr;
+static uint16_t read_our(Vminimig_blt_xcheck_top* dut, uint32_t word_addr) {
+    dut->read_addr = word_addr;        // 20-bit
     dut->eval();
     return dut->our_read_data;
 }
@@ -298,28 +299,30 @@ int main(int argc, char** argv) {
         dut->rst = 0; for (int i = 0; i < 8; i++) tick(dut);
 
         // Pre-fill memories with the same pattern.  word[i] = (i * 0x1357) ^ i.
-        // Deterministic, non-zero, easy to recompute mentally.
-        for (uint32_t w = 0; w < 32768; w++) {
-            init_mem(dut, (uint16_t)w,
-                     (uint16_t)((w * 0x1357u) ^ w));
+        // Deterministic, non-zero, easy to recompute mentally.  1Mi words.
+        // Verilator handles ~1M sequential ticks quickly; takes a few seconds.
+        constexpr uint32_t MEM_WORDS = 1u << 20;
+        for (uint32_t w = 0; w < MEM_WORDS; w++) {
+            init_mem(dut, w, (uint16_t)((w * 0x1357u) ^ w));
         }
 
         // Verify pre-fill consistency BEFORE any blit runs.  If mm_mem
         // and our_mem differ at this point, the harness is broken; the
-        // problem isn't the blitters.
+        // problem isn't the blitters.  Sample-check (every 64th word) —
+        // a full 1M-word scan after every blit would be slow; this is
+        // enough to catch a wholesale init bug.
         int pre_diffs = 0;
-        for (uint32_t w = 0; w < 32768; w++) {
-            uint16_t mm  = read_mm(dut, (uint16_t)w);
-            uint16_t our = read_our(dut, (uint16_t)w);
+        for (uint32_t w = 0; w < MEM_WORDS; w += 64) {
+            uint16_t mm  = read_mm(dut, w);
+            uint16_t our = read_our(dut, w);
             if (mm != our) {
                 if (pre_diffs < 5)
-                    printf("  PRE-FILL DIFF $%04X: mm=$%04X our=$%04X\n",
+                    printf("  PRE-FILL DIFF $%06X: mm=$%04X our=$%04X\n",
                            w * 2, mm, our);
                 pre_diffs++;
             }
         }
-        printf("Pre-fill check: %d divergent words across both memories\n",
-               pre_diffs);
+        printf("Pre-fill check (sampled): %d divergent words\n", pre_diffs);
 
         char line[512];
         int blit_no = 0;
@@ -338,11 +341,15 @@ int main(int argc, char** argv) {
                 &bltsize) != 13) {
                 continue;
             }
-            // Mask pointers into the 64KB test memory window.
-            uint16_t apt16 = (uint16_t)(apt & 0xFFFE);
-            uint16_t bpt16 = (uint16_t)(bpt & 0xFFFE);
-            uint16_t cpt16 = (uint16_t)(cpt & 0xFFFE);
-            uint16_t dpt16 = (uint16_t)(dpt & 0xFFFE);
+            // Mask pointers to the 2 MiB test memory window (21-bit
+            // byte address, even).  Preserves the chip-RAM range
+            // ($000000-$1FFFFE) at full resolution — boing's real
+            // pointers mostly land in chip RAM and now survive without
+            // collision.
+            uint32_t apt21 = apt & 0x1FFFFEu;
+            uint32_t bpt21 = bpt & 0x1FFFFEu;
+            uint32_t cpt21 = cpt & 0x1FFFFEu;
+            uint32_t dpt21 = dpt & 0x1FFFFEu;
 
             // Reset BLT[ABC]DAT presets to 0 so cross-blit state cannot
             // leak through them.  When boing's actual workload runs,
@@ -362,14 +369,15 @@ int main(int argc, char** argv) {
             reg_w(dut, 0x42, (uint16_t)con1);
             reg_w(dut, 0x44, (uint16_t)afwm);
             reg_w(dut, 0x46, (uint16_t)alwm);
-            reg_w(dut, 0x48, 0x0000);                // CPTH (upper 16 = 0)
-            reg_w(dut, 0x4A, cpt16);                 // CPTL
-            reg_w(dut, 0x4C, 0x0000);                // BPTH
-            reg_w(dut, 0x4E, bpt16);                 // BPTL
-            reg_w(dut, 0x50, 0x0000);                // APTH
-            reg_w(dut, 0x52, apt16);                 // APTL
-            reg_w(dut, 0x54, 0x0000);                // DPTH
-            reg_w(dut, 0x56, dpt16);                 // DPTL
+            // 21-bit pointer split: H = bits [23:16], L = bits [15:0].
+            reg_w(dut, 0x48, (uint16_t)(cpt21 >> 16));        // CPTH
+            reg_w(dut, 0x4A, (uint16_t)(cpt21 & 0xFFFE));     // CPTL
+            reg_w(dut, 0x4C, (uint16_t)(bpt21 >> 16));        // BPTH
+            reg_w(dut, 0x4E, (uint16_t)(bpt21 & 0xFFFE));     // BPTL
+            reg_w(dut, 0x50, (uint16_t)(apt21 >> 16));        // APTH
+            reg_w(dut, 0x52, (uint16_t)(apt21 & 0xFFFE));     // APTL
+            reg_w(dut, 0x54, (uint16_t)(dpt21 >> 16));        // DPTH
+            reg_w(dut, 0x56, (uint16_t)(dpt21 & 0xFFFE));     // DPTL
             reg_w(dut, 0x64, (uint16_t)amod);
             reg_w(dut, 0x62, (uint16_t)bmod);
             reg_w(dut, 0x60, (uint16_t)cmod);
@@ -390,18 +398,48 @@ int main(int argc, char** argv) {
                 break;
             }
 
-            // Compare full 32K-word memory.
+            // Compare memory.  Focus on the blit's write region (around
+            // dpt21) plus a stride-32 sweep of the full memory for any
+            // unexpected writes elsewhere.  A blit at most touches
+            // ~64KB (worst case big blit) so scanning a 256KB window
+            // around the dest pointer is comprehensive for the writes
+            // we care about; the wider sweep catches stray writes.
             int blit_diffs = 0;
-            for (uint32_t w = 0; w < 32768; w++) {
-                uint16_t mm  = read_mm(dut, (uint16_t)w);
-                uint16_t our = read_our(dut, (uint16_t)w);
+            auto check = [&](uint32_t w) {
+                uint16_t mm  = read_mm(dut, w);
+                uint16_t our = read_our(dut, w);
                 if (mm != our) {
                     if (blit_diffs < 6) {
-                        printf("  blit#%d DIFF $%04X: mm=$%04X ours=$%04X\n",
+                        printf("  blit#%d DIFF $%06X: mm=$%04X ours=$%04X\n",
                                blit_no, w * 2, mm, our);
                     }
                     blit_diffs++;
                 }
+            };
+            // Dense scan around dest pointer (±128KB = ±64K words)
+            uint32_t dpt_w = dpt21 >> 1;
+            uint32_t lo = dpt_w >= 65536 ? dpt_w - 65536 : 0;
+            uint32_t hi = std::min(dpt_w + 65536, MEM_WORDS);
+            int dpt_diffs_in_window = 0;
+            for (uint32_t w = lo; w < hi; w++) {
+                uint16_t mm  = read_mm(dut, w);
+                uint16_t our = read_our(dut, w);
+                if (mm != our) dpt_diffs_in_window++;
+                check(w);
+            }
+            // Sparse sweep of the full 2 MiB for stray writes elsewhere.
+            int stray_diffs = 0;
+            for (uint32_t w = 0; w < MEM_WORDS; w += 32) {
+                if (w >= lo && w < hi) continue;     // already covered
+                uint16_t mm  = read_mm(dut, w);
+                uint16_t our = read_our(dut, w);
+                if (mm != our) stray_diffs++;
+                check(w);
+            }
+            if (blit_diffs) {
+                printf("    [in-window=%d  out-of-window-sample=%d  apt=$%06X "
+                       "cpt=$%06X dpt=$%06X]\n",
+                       dpt_diffs_in_window, stray_diffs, apt21, cpt21, dpt21);
             }
             if (blit_diffs) {
                 if (first_diff_blit < 0) first_diff_blit = blit_no;

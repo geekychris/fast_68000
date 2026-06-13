@@ -1,11 +1,18 @@
 // Cross-validation top for MiniMig blitter vs our blitter.
 //
-// Hosts both blitters side-by-side with separate 64 KiB memory buffers
+// Hosts both blitters side-by-side with separate 2 MiB memory buffers
 // (mm_mem, our_mem).  The C++ harness drives identical register-write
 // sequences into both, ticks the clock until both signal !busy, then
 // reads back the memories and diffs.
 //
-// Memory layout: 32K words (= 64 KiB) addressed by 15-bit word index.
+// Memory layout: 1Mi words (= 2 MiB) addressed by 20-bit word index.
+// 2 MiB covers the whole Amiga A500 chip-RAM range ($000000-$07FFFF)
+// at full resolution, so replays of real boing-disk traces don't lose
+// pointer precision to masking.  (Original 32K-word memory collapsed
+// distinct chip-RAM addresses to colliding indices — see WB13 journal
+// §67b — making real-trace replays test pointer-collision artifacts
+// instead of blitter logic.)
+//
 // Both buffers are pre-loaded with the SAME initial pattern by the
 // harness via init_we/init_addr/init_wdata before the blit starts.
 
@@ -26,11 +33,11 @@ module minimig_blt_xcheck_top (
 
     // Memory pre-load interface.
     input  wire        init_we,
-    input  wire [14:0] init_addr,        // word address (15 bits => 32K words)
+    input  wire [19:0] init_addr,        // word address (20 bits => 1Mi words)
     input  wire [15:0] init_wdata,
 
     // Memory readback after blit.
-    input  wire [14:0] read_addr,
+    input  wire [19:0] read_addr,
     output wire [15:0] mm_read_data,
     output wire [15:0] our_read_data,
 
@@ -40,8 +47,10 @@ module minimig_blt_xcheck_top (
 );
 
     // ---------------- Memories (one per DUT) ----------------
-    reg [15:0] mm_mem  [0:32767];
-    reg [15:0] our_mem [0:32767];
+    // 1Mi words = 2 MiB each.  Big enough to cover the Amiga A500
+    // chip-RAM range without pointer-collision artifacts on replays.
+    reg [15:0] mm_mem  [0:1048575];
+    reg [15:0] our_mem [0:1048575];
 
     // ---------------- MiniMig blitter ----------------
     wire        mm_reqdma;
@@ -57,7 +66,7 @@ module minimig_blt_xcheck_top (
         if (reg_we)
             mm_data_in_mux = reg_wdata;
         else
-            mm_data_in_mux = mm_mem[mm_addr_out[15:1]];
+            mm_data_in_mux = mm_mem[mm_addr_out[20:1]];
     end
 
     agnus_blitter mm_blt (
@@ -84,7 +93,7 @@ module minimig_blt_xcheck_top (
     always @(posedge clk) begin
         if (init_we) mm_mem[init_addr] <= init_wdata;
         else if (mm_reqdma && mm_we_o)
-            mm_mem[mm_addr_out[15:1]] <= mm_data_out;
+            mm_mem[mm_addr_out[20:1]] <= mm_data_out;
     end
 
     // ---------------- Our blitter ----------------
@@ -174,9 +183,9 @@ module minimig_blt_xcheck_top (
     reg [31:0] our_mst_rdata;
     always @* begin
         if (our_mst_addr[1])
-            our_mst_rdata = {16'd0, our_mem[our_mst_addr[15:1]]};
+            our_mst_rdata = {16'd0, our_mem[our_mst_addr[20:1]]};
         else
-            our_mst_rdata = {our_mem[our_mst_addr[15:1]], 16'd0};
+            our_mst_rdata = {our_mem[our_mst_addr[20:1]], 16'd0};
     end
 
     // 1-cycle-latency ack to avoid the combinational loop that arises
@@ -221,9 +230,9 @@ module minimig_blt_xcheck_top (
                     our_write_count, our_mst_addr, our_mst_be, our_mst_wdata);
             our_write_count <= our_write_count + 1;
             if (our_mst_be == 4'b1100)
-                our_mem[our_mst_addr[15:1]] <= our_mst_wdata[31:16];
+                our_mem[our_mst_addr[20:1]] <= our_mst_wdata[31:16];
             else if (our_mst_be == 4'b0011)
-                our_mem[our_mst_addr[15:1]] <= our_mst_wdata[15:0];
+                our_mem[our_mst_addr[20:1]] <= our_mst_wdata[15:0];
         end
     end
     reg [31:0] mm_write_count;

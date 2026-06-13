@@ -6116,3 +6116,99 @@ useful as-is for:
 The `--filter-con0` mechanism makes it easy to slice the trace by
 operation class for targeted testing of any future blitter fix.
 
+
+## §68. xcheck memory grown to 2 MiB; replay reveals real blitter divergence
+
+§67c laid out the obvious fix: grow `mm_mem` / `our_mem` so 24-bit
+boing pointers fit without collision-masking artifacts.  Landed here.
+
+### §68a. The changes
+
+- `tb/minimig_blt_xcheck_top.sv`: both memories now 1 Mi words
+  (= 2 MiB) — covers the entire Amiga A500 chip-RAM range
+  ($000000-$07FFFF) at full resolution.  `init_addr` /
+  `read_addr` widened to 20 bits; minimig-side memory indexing uses
+  `mm_addr_out[20:1]`, our-side uses `our_mst_addr[20:1]`.
+- `tb/minimig_blt_xcheck.cpp`:
+  - `init_mem` / `read_mm` / `read_our` take `uint32_t` word addresses.
+  - Replay pointer mask is `& 0x1FFFFEu` (21-bit byte address) instead
+    of `& 0xFFFEu` — preserves boing's real pointer relationships.
+  - Pre-fill loop covers all 1 Mi words.
+  - Pre-fill consistency uses a stride-64 sample (full scan would be
+    needlessly slow); per-blit comparison does a ±128KB window around
+    `dpt21` plus a stride-32 sweep for stray writes.
+
+### §68b. Canned tests still pass
+
+```
+=== Test 1 ===  21 match, 0 mismatch
+=== Test 2 (K1.3 big blit) ===  6205 match, 0 mismatch
+=== Test 3 (K1.3 cyl-53 cc000005) ===  5985 match, 0 mismatch
+=== Test 4 (odd BLTBPT/DPT masking) ===  21 match, 0 mismatch
+Total: 12232 match, 0 mismatch
+```
+
+So growing the memory did not regress any known-good test.
+
+### §68c. Real divergence on boing's cookie-cut sequence
+
+Replay of `make boing-chipset-trace` first 200 blits filtered to
+`BLTCON0=$0BCA` (cookie-cut $CA + USE=ACD — boing's dominant class
+per §66):
+
+```
+blit#0  con0=$0BCA size=$0C85  -> 278 diverging words
+    [in-window=271  out-of-window-sample=7
+     apt=$04FFF6 cpt=$010000 dpt=$010000]
+```
+
+The window covers ±64K words around `dpt`.  271 diffs there means
+~0.4% of in-window samples differ — most positions match, but ~270
+don't.  Out-of-window stray diffs are only 7 from a sampled stride-32
+sweep — so our blitter is NOT scribbling all over memory, it's
+producing wrong output in the *intended* region.
+
+This is the first time the cross-check has shown a real blitter
+divergence against minimig on a real boing workload.  Previously
+(§67) the divergence was dominated by 16-bit pointer collision; now
+it's genuine algorithm divergence.
+
+### §68d. Likely class
+
+Boing's blits use parameters the canned tests do not:
+
+| param   | boing      | canned tests |
+|---------|-----------|--------------|
+| BLTAFWM | $FFFF      | $FFFF        |
+| **BLTALWM** | **$8000**  | $FFFF        |
+| BLTAMOD | $0020-$0028 | 0            |
+| BLTDMOD | $FFEC (-20) | 0            |
+| BLTCON1 | $0000      | $0000        |
+| BLTSIZE | 50 rows × 5 W | various   |
+
+The standout is `BLTALWM=$8000` — only the highest bit set,
+meaning only one pixel column gets through in the rightmost word of
+each row.  Canned tests use `$FFFF` (no edge masking) so the
+last-word-mask path isn't exercised.  Combined with negative
+BLTDMOD (-20 bytes = -10 words per row), the blit walks dest
+pointer in a tight spiral pattern.
+
+Most likely the bug is in our blitter's interaction between
+BLTALWM and BLTADAT preset shifting, OR in how the masked A
+value flows into the minterm logic.  Tracking it down is
+substantive but well-scoped work — write a tiny standalone test
+with these exact params and step into the blitter.
+
+### §68e. Engineering preserved
+
+- The `make minimig-blt` build is now the real cumulative-state
+  test.  `REPLAY_FILE=...` runs any chipset-trace-derived sequence.
+- `blit_classify.py --filter-con0 HEX` lets you slice the trace
+  by operation class so the test focuses on the suspicious one.
+- Window-around-dpt + stride sample provides per-blit
+  in-window/out-of-window decomposition, making it easy to tell
+  "real divergence" from "stray writes".
+
+Half-a-day estimate at §67c held: the changes are local and the
+test is now diagnostic.
+
