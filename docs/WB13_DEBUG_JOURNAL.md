@@ -6212,3 +6212,81 @@ with these exact params and step into the blitter.
 Half-a-day estimate at §67c held: the changes are local and the
 test is now diagnostic.
 
+
+## §69. Test 5 isolates the bug — "first row OK, rows 1+ all zeros"
+
+Following §68d, added Test 5 to `tb/minimig_blt_xcheck.cpp` with the
+exact problematic parameters extracted from boing's chipset trace:
+cookie-cut $CA + USE=ACD, BLTAFWM=$FFFF, **BLTALWM=$8000**,
+BLTDMOD=$FFEC (-10 words/row), 3 rows × 2 words = 6 D writes.
+
+### §69a. Result
+
+```
+=== Test 5: BOING-CLASS cookie-cut ($0BCA, BLTALWM=$8000) ===
+  MISMATCH @ $005FE0: mm=$AAAA our=$0000
+  MISMATCH @ $005FE2: mm=$AAAA our=$0000
+  MISMATCH @ $005FF0: mm=$E002 our=$0000
+  MISMATCH @ $005FF2: mm=$C013 our=$0000
+Test 5: 44 match, 4 mismatch (cookie-cut $CA + BLTALWM=$8000 + neg DMOD)
+```
+
+The 4 mismatching bytes are at byte addresses $5FE0, $5FE2, $5FF0,
+$5FF2 — that is word indices $2FF0, $2FF1, $2FF8, $2FF9.
+
+### §69b. Decoding which writes failed
+
+With BLTDPT byte $6000 (word $3000) + BLTDMOD = -20 bytes (-10 words)
+per row + 2 words written per row:
+
+| row | writes word indices | mismatch? |
+|-----|--------------------|-----------|
+| 0   | $3000, $3001       | no — both blitters produce same output |
+| 1   | $2FF8, $2FF9       | **YES** — minimig=$AAAA, $AAAA; ours=$0000, $0000 |
+| 2   | $2FF0, $2FF1       | **YES** — minimig=$E002, $C013; ours=$0000, $0000 |
+
+So **row 0 is correct, rows 1 and 2 are all zeros on our side**.
+
+### §69c. Hypothesis
+
+Cookie-cut $CA computes `D = A AND C` (with maskword applied to A
+first).  With BLTAFWM=$FFFF, A passes through at word 0 of each row;
+with BLTALWM=$8000, only A's MSB survives at the last word.
+
+Row 0 producing correct output means the *blit setup* (loading A
+from BLTAPT, applying minterm logic to A AND C) is correct.
+
+Rows 1 and 2 producing zeros means *something specific to the
+row-transition state* is broken in our blitter.  Two suspects:
+
+1. **BLTAFWM is not re-applied at the start of subsequent rows.**
+   If after row 0 our blitter clears the "is-first-word-of-row"
+   latch and never re-arms it, then ALWM applies to every word from
+   row 1 onward.  With ALWM=$8000, A's source data has only bit 15
+   survive, and `A AND C` becomes nearly all zeros (with our $A0xx
+   / $C0xx source data, bit 15 is 1 in C but 0 in A, so AND = 0).
+2. **BLTADAT preset isn't carried forward.**  Our blitter has the
+   USE-B preset fix landed (§project_blitter_minimig_validated.md);
+   maybe USE-A has the analogous bug that surfaces only on row 2+.
+
+Suspect (1) fits the symptom exactly: row 0 row-start sets AFWM,
+rows 1+ inherit ALWM and zero out A.  Minimig must re-arm AFWM at
+each row start; our blitter doesn't.
+
+### §69d. Next move
+
+Now the bug is well-scoped:
+
+1. Compile our `rtl/chipset/blitter.v` with the t156-style trace
+   probes around the row-start logic and AFWM/ALWM gating.
+2. Trace the AFWM application signal across all 3 rows.  If it's
+   high only on row 0, that's the bug.
+3. Fix the row-start re-arm; verify Test 5 passes; then run the
+   full boing replay and confirm in-window divergence drops to 0.
+4. Once the fix is in, run boing-disk end-to-end and see if the
+   Window struct at $494A0 finally populates.
+
+This is a substantial fix but well-scoped: ~half a day of blitter
+RTL work + regression run.  Test 5 is now a permanent regression
+test for this class.
+

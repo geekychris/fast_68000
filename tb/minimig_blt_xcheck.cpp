@@ -261,9 +261,68 @@ int main(int argc, char** argv) {
     printf("Test 4: %d match, %d mismatch (odd BLTBPT/DPT must mask to even)\n",
         t4_match, t4_mis);
 
-    int mismatches = t1_mis + t2_mis + t3_mis + t4_mis;
+    // ====================================================================
+    // Test 5: BOING-CLASS COOKIE-CUT — isolates the §68 wall.
+    //   BLTCON0=$0BCA  (USE=ACD, minterm $CA = cookie-cut)
+    //   BLTAFWM=$FFFF  BLTALWM=$8000  (only the rightmost-pixel bit
+    //                                   gets through the last column)
+    //   BLTAMOD=$0020  BLTCMOD=$0020  BLTDMOD=$FFEC  (-10 words/row)
+    //   3 rows x 2 words = 6 D writes total, easy to step through.
+    //
+    // Source A at word $1000..$100A, source C at word $2000..$200A.
+    // Dest at word $3000..$300A (initially $DEAD).
+    //
+    // BLTALWM=$8000 + non-zero BLTDMOD is the canned-test gap that
+    // boing exercises and our blitter currently gets wrong.
+    // ====================================================================
+    printf("=== Test 5: BOING-CLASS cookie-cut ($0BCA, BLTALWM=$8000) ===\n");
+    // Source A and C: distinguishable patterns.
+    for (uint32_t w = 0; w < 32; w++) {
+        init_mem(dut, 0x1000 + w, 0xA000 + w);
+        init_mem(dut, 0x2000 + w, 0xC000 + w);
+        init_mem(dut, 0x3000 + w, 0xDEAD);
+    }
+    reg_w(dut, 0x40, 0x0BCA);   // BLTCON0 = ACD + minterm $CA
+    reg_w(dut, 0x42, 0x0000);   // BLTCON1 = ascending, no fill, no line
+    reg_w(dut, 0x44, 0xFFFF);   // BLTAFWM
+    reg_w(dut, 0x46, 0x8000);   // BLTALWM <-- the key edge
+    // 24-bit pointers — high half zero, low half is byte address.
+    reg_w(dut, 0x48, 0x0000);   // BLTCPTH
+    reg_w(dut, 0x4A, 0x4000);   // BLTCPTL = byte $4000 (word $2000)
+    reg_w(dut, 0x50, 0x0000);   // BLTAPTH
+    reg_w(dut, 0x52, 0x2000);   // BLTAPTL = byte $2000 (word $1000)
+    reg_w(dut, 0x54, 0x0000);   // BLTDPTH
+    reg_w(dut, 0x56, 0x6000);   // BLTDPTL = byte $6000 (word $3000)
+    reg_w(dut, 0x60, 0x0020);   // BLTCMOD
+    reg_w(dut, 0x64, 0x0020);   // BLTAMOD
+    reg_w(dut, 0x66, 0xFFEC);   // BLTDMOD = -20 bytes = -10 words
+    reg_w(dut, 0x62, 0x0000);   // BLTBMOD (USE_B=0, irrelevant)
+    // BLTSIZE: 3 rows (bits 15:6) x 2 words/row (bits 5:0) = ($003 << 6) | $02 = $00C2
+    reg_w(dut, 0x58, 0x00C2);
+
+    for (int i = 0; i < 2000; i++) {
+        tick(dut);
+        if (!dut->mm_busy && !dut->our_busy && i > 8) break;
+    }
+    int t5_mis = 0, t5_match = 0;
+    // Check a wider window than just BLTDPT because negative DMOD
+    // walks the dest backward in memory.
+    for (uint32_t w = 0x2FF0; w <= 0x301F; w++) {
+        uint16_t mm = read_mm(dut, w);
+        uint16_t our = read_our(dut, w);
+        if (mm != our) {
+            if (t5_mis < 8)
+                printf("  MISMATCH @ $%06X: mm=$%04X our=$%04X\n",
+                       w * 2, mm, our);
+            t5_mis++;
+        } else t5_match++;
+    }
+    printf("Test 5: %d match, %d mismatch (cookie-cut $CA + BLTALWM=$8000 + neg DMOD)\n",
+        t5_match, t5_mis);
+
+    int mismatches = t1_mis + t2_mis + t3_mis + t4_mis + t5_mis;
     printf("\nTotal: %d match, %d mismatch\n",
-        t1_match + t2_match + t3_match + t4_match, mismatches);
+        t1_match + t2_match + t3_match + t4_match + t5_match, mismatches);
 
     // ====================================================================
     // Optional: replay a real boing-disk blit sequence captured via
