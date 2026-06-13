@@ -1535,6 +1535,48 @@ _libcall-trace-one:
 	    $(PYTHON) tools/decode_libcall_trace.py /tmp/$(TAG)_libcall.log; \
 	fi
 
+# ---------------------------------------------------------------------------
+# vAmiga cross-reference (see docs/LIBCALL_TRACING.md for libcall sister).
+#
+# vAmiga is a completely independent Amiga emulator (different codebase,
+# different team).  Running our ADFs through vAmiga's headless mode is a
+# cheap second-opinion check: if vAmiga renders the same broken state as
+# our Verilator sim, the bug is in the ADF / boot disk, not our RTL.
+#
+# Build vAmiga (one-time) — uses macOS Xcode CMake/Clang:
+#   git clone --depth=1 https://github.com/dirkwhoffmann/vAmiga.git /tmp/vamiga_build/vAmiga
+#   cd /tmp/vamiga_build/vAmiga/Core && cmake -B build -DCMAKE_BUILD_TYPE=Release \
+#       && cmake --build build --target VAHeadless -j 8
+#
+# After the build VAHeadless lands at /tmp/vamiga_build/vAmiga/Core/build/VAHeadless.
+#
+# Then run the target.  ADF and config are tunable via the env vars below.
+# Output PNG: /tmp/vamiga_<TAG>.png.
+# ---------------------------------------------------------------------------
+VAMIGA_BIN     ?= /tmp/vamiga_build/vAmiga/Core/build/VAHeadless
+VAMIGA_ROM     ?= $(abspath kickstart/kick_13.bin)
+VAMIGA_CONFIG  ?= A500_OCS_1MB
+VAMIGA_WAIT    ?= 60
+
+# Internal target: render <ADF> through vAmiga and dump <TAG>.png.
+_vamiga-render-one:
+	@if [ ! -x "$(VAMIGA_BIN)" ]; then \
+	    echo "vAmiga not built — see $(MAKEFILE_LIST) header"; exit 1; fi
+	@printf 'amiga set WARP_MODE ALWAYS\nregression setup $(VAMIGA_CONFIG) $(VAMIGA_ROM)\nscreenshot set filename vamiga_$(TAG)\ndf0 insert $(ADF)\namiga power on\nwait $(VAMIGA_WAIT)\nscreenshot save vamiga_$(TAG)\nshutdown\n' > /tmp/vamiga_$(TAG).script
+	@$(VAMIGA_BIN) /tmp/vamiga_$(TAG).script 2>&1 | tail -3
+	@$(PYTHON) -c "from PIL import Image; \
+	    Image.frombytes('RGB',(716,285),open('/tmp/vamiga_$(TAG).raw','rb').read()).save('/tmp/vamiga_$(TAG).png')"
+	@echo "Wrote /tmp/vamiga_$(TAG).png"
+	@if command -v open >/dev/null 2>&1; then open /tmp/vamiga_$(TAG).png; fi
+
+vamiga-boing: kickstart/boing_disk.adf
+	$(MAKE) --no-print-directory _vamiga-render-one \
+	    ADF=$(abspath kickstart/boing_disk.adf) TAG=boing
+
+vamiga-hello: kickstart/hello_disk.adf
+	$(MAKE) --no-print-directory _vamiga-render-one \
+	    ADF=$(abspath kickstart/hello_disk.adf) TAG=hello
+
 # demo-real-boing: boot the boing-disk ADF, render the final frame.
 demo-real-boing: kickstart/boing_disk.adf
 	@rm -rf build_kick_boot
