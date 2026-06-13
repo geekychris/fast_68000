@@ -115,6 +115,20 @@ module blitter (
     end
 `endif
 
+`ifdef BLT_T5_STATE_TRACE
+    // Trace state-machine transitions for the Test 5 boing-class blit.
+    // Gated by BLTALWM=$8000 (the Test 5 signature) so we only emit
+    // during that specific blit; otherwise the trace would be noisy.
+    reg [7:0] t5_prev_state;
+    always @(posedge clk) begin
+        t5_prev_state <= state;
+        if (bltalwm[15:0] == 16'h8000 && t5_prev_state != state)
+            $display("[BLT_T5_ST] state %0d -> %0d  cur_word=%0d cur_row=%0d bltdpt=%h bltapt=%h bltcpt=%h d_pipe_v=%b d_pipe_a=%h busy=%b",
+                t5_prev_state, state, cur_word, cur_row,
+                bltdpt, bltapt, bltcpt, d_pipe_valid, d_pipe_addr, blt_busy);
+    end
+`endif
+
 `ifdef BLT_CLI_TITLE_TRACE
     // Trace every blitter master write whose destination lands in the
     // CLI window's title bar region in BPL1 ($60C8..$63E8 inclusive).
@@ -481,10 +495,16 @@ module blitter (
                                 {{16{slv_wdata[15]}}, slv_wdata[15:0]});
 `endif
                         end else begin
-                            bltamod <= slv_wdata;
+                            // WORD write of BLTAMOD: sign-extend low 16
+                            // bits.  Real Amiga BLTxMOD is a signed 16-bit
+                            // delta added to the pointer at row-end; storing
+                            // as zero-ext makes negative modulos walk the
+                            // pointer FORWARD by 65520+ bytes.  Caught via
+                            // xcheck Test 5 (BLTDMOD=$FFEC, neg DMOD).
+                            bltamod <= {{16{slv_wdata[15]}}, slv_wdata[15:0]};
 `ifdef BLTAMOD_WR_TRACE
                             $display("[BLTAMOD-WR] cycle=%0t WORD amod<=%h",
-                                $time, slv_wdata);
+                                $time, {{16{slv_wdata[15]}}, slv_wdata[15:0]});
 `endif
                         end
                     end
@@ -498,7 +518,7 @@ module blitter (
                             bltbmod <= {{16{slv_wdata[31]}}, slv_wdata[31:16]};
                             bltamod <= {{16{slv_wdata[15]}}, slv_wdata[15:0]};
                         end else begin
-                            bltbmod <= slv_wdata;
+                            bltbmod <= {{16{slv_wdata[15]}}, slv_wdata[15:0]};
                         end
                     end
                     // BLTCMOD .L from CPU (MOVE.L to $DFF060) commits both
@@ -509,10 +529,10 @@ module blitter (
                             bltcmod <= {{16{slv_wdata[31]}}, slv_wdata[31:16]};
                             bltbmod <= {{16{slv_wdata[15]}}, slv_wdata[15:0]};
                         end else begin
-                            bltcmod <= slv_wdata;
+                            bltcmod <= {{16{slv_wdata[15]}}, slv_wdata[15:0]};
                         end
                     end
-                    4'hA: bltdmod      <= slv_wdata;
+                    4'hA: bltdmod      <= {{16{slv_wdata[15]}}, slv_wdata[15:0]};
                     4'hB: bltadat_pre  <= slv_wdata;
                     4'hC: bltbdat_pre  <= slv_wdata;
                     4'hD: bltcdat_pre  <= slv_wdata;
@@ -694,6 +714,18 @@ module blitter (
                                 pick_half(mst_rdata, bltapt[1]),
                                 cur_word == 16'd0,
                                 cur_word == (blt_width - 16'd1));
+`ifdef BLT_TEST5_TRACE
+                            if (bltcon[31:24] == 8'hCA)
+                                $display("[BLT_T5_A] row=%0d word=%0d bltapt=%h raw=%h picked=%h is_first=%b is_last=%b -> a_cur=%h",
+                                    cur_row, cur_word, bltapt,
+                                    mst_rdata, pick_half(mst_rdata, bltapt[1]),
+                                    cur_word == 16'd0,
+                                    cur_word == (blt_width - 16'd1),
+                                    apply_a_masks(
+                                        pick_half(mst_rdata, bltapt[1]),
+                                        cur_word == 16'd0,
+                                        cur_word == (blt_width - 16'd1)));
+`endif
                             bltapt <= bltapt + (desc ? -32'sd2 : 32'sd2);
                             state  <= use_b ? S_RDB : (use_c ? S_RDC : S_WRD);
                         end
@@ -819,6 +851,14 @@ module blitter (
                                          use_c ? c_cur_word_q : bltcdat_pre[15:0]);
                     filled  = apply_fill(combined_w, fill_carry, ife, efe, desc);
                     final_w = filled[15:0];
+`ifdef BLT_TEST5_TRACE
+                    if (bltcon[31:24] == 8'hCA)
+                        $display("[BLT_T5_WR] row=%0d word=%0d a_cur=%h c_cur=%h b_pre=%h combined=%h final=%h",
+                            cur_row, cur_word, a_cur_word_q,
+                            use_c ? c_cur_word_q : bltcdat_pre[15:0],
+                            use_b ? b_cur_word_q : bltbdat_pre[15:0],
+                            combined_w[15:0], final_w);
+`endif
 
                     if (use_d) begin : use_d_block
                         // D-write pipeline: write the PREVIOUSLY-latched

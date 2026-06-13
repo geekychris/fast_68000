@@ -231,6 +231,12 @@ module minimig_blt_xcheck_top (
 
     // Our blitter memory write: take the half-word from mst_wdata
     // selected by mst_be (high or low half).
+    //
+    // Per-test write windows are bounded by a global write_count budget
+    // (first 6 writes), AND by a "Test 5 zone" range filter so every write
+    // landing in $005FE0..$006010 (Test 5's negative-DMOD walk) is logged
+    // even after the global budget is exhausted.  This pinpoints whether
+    // row 1/2 writes actually fire or get dropped silently.
     reg [31:0] our_write_count;
     always @(posedge clk) begin
         if (our_write_count == 32'hFFFFFFFF) our_write_count <= 0;
@@ -239,6 +245,10 @@ module minimig_blt_xcheck_top (
             if (our_write_count < 6)
                 $display("[OUR_WR_%0d] addr=%h be=%b wdata=%h",
                     our_write_count, our_mst_addr, our_mst_be, our_mst_wdata);
+            // Test 5 zone trace — logs EVERY write in the negative-DMOD walk.
+            if (our_mst_addr >= 32'h0000_5FE0 && our_mst_addr <= 32'h0000_6010)
+                $display("[OUR_T5WR] addr=%h be=%b wdata=%h ack=%b",
+                    our_mst_addr, our_mst_be, our_mst_wdata, our_mst_ack_q);
             our_write_count <= our_write_count + 1;
             if (our_mst_be == 4'b1100)
                 our_mem[our_mst_addr[20:1]] <= our_mst_wdata[31:16];
@@ -253,9 +263,14 @@ module minimig_blt_xcheck_top (
             if (mm_write_count < 6)
                 $display("[MM_WR_%0d]  addr=%h data=%h",
                     mm_write_count, {mm_addr_out, 1'b0}, mm_data_out);
+            // Test 5 zone trace — see comment above for our blitter.
+            if ({mm_addr_out, 1'b0} >= 21'h00_5FE0 && {mm_addr_out, 1'b0} <= 21'h00_6010)
+                $display("[MM_T5WR]  addr=%h data=%h",
+                    {mm_addr_out, 1'b0}, mm_data_out);
             mm_write_count <= mm_write_count + 1;
         end
     end
+
 
     assign mm_read_data  = mm_mem[read_addr];
     assign our_read_data = our_mem[read_addr];
