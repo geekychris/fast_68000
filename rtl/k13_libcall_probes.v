@@ -236,3 +236,44 @@
         $display("[LIBCALL] r=%0d Lock(name_bptr=%h, mode=%h)",
             retired, u_rf.regs[1], u_rf.regs[2]);
 `endif
+
+// =====================================================================
+// Exec Signal-call-site probes — fires at each `JSR _LVOSignal(A6)` site
+// in K1.3 ROM (opcode `4EAE FEBC`), showing the calling PC + A1 (target
+// task) + D0 (mask).  Use this to find which ROM function is the
+// dominant Signal()er when summary mode says "Signal fires 50K times
+// and we don't know who's calling".
+//
+// Sites are the 11 distinct `JSR _LVOSignal(A6)` instructions in
+// kick_13.bin — see static-scan in WB13_DEBUG_JOURNAL / boing notes.
+// =====================================================================
+`ifdef LIBCALL_SIGNAL_CALLER_TRACE
+    if (is_settled && (
+            ex_pc == 32'h00fc_1bd6 || ex_pc == 32'h00fc_2e78 ||
+            ex_pc == 32'h00fc_60e2 || ex_pc == 32'h00fc_6116 ||
+            ex_pc == 32'h00fc_6da6 || ex_pc == 32'h00fd_3cf4 ||
+            ex_pc == 32'h00fe_0266 || ex_pc == 32'h00fe_4896 ||
+            ex_pc == 32'h00fe_5d4e || ex_pc == 32'h00fe_9e62 ||
+            ex_pc == 32'h00ff_46b6))
+        $display("[LIBCALL] r=%0d SignalCaller(at=%h, A1=%h, D0=%h)",
+            retired, ex_pc, u_rf.regs[9], u_rf.regs[0]);
+`endif
+
+// =====================================================================
+// Exec Wait-call-site probes — same idea for `JSR _LVOWait(A6)` (opcode
+// `4EAE FEC2`).  Each Wait site shows where in the OS a task blocks.
+// 16 sites in K1.3 ROM.
+// =====================================================================
+`ifdef LIBCALL_WAIT_CALLER_TRACE
+    if (is_settled && (
+            ex_pc == 32'h00fc_075a || ex_pc == 32'h00fc_1c4a ||
+            ex_pc == 32'h00fc_2e2a || ex_pc == 32'h00fc_2f3a ||
+            ex_pc == 32'h00fd_3cdc || ex_pc == 32'h00fe_024e ||
+            ex_pc == 32'h00fe_4854 || ex_pc == 32'h00fe_5e6a ||
+            ex_pc == 32'h00fe_5f30 || ex_pc == 32'h00fe_5f38 ||
+            ex_pc == 32'h00fe_a396 || ex_pc == 32'h00fe_aa7e ||
+            ex_pc == 32'h00fe_aaf2 || ex_pc == 32'h00ff_36da ||
+            ex_pc == 32'h00ff_396c || ex_pc == 32'h00ff_4698))
+        $display("[LIBCALL] r=%0d WaitCaller(at=%h, D0=%h)",
+            retired, ex_pc, u_rf.regs[0]);
+`endif
