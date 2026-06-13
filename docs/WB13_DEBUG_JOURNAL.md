@@ -5950,3 +5950,83 @@ To pinpoint, the next move is either:
 Either way, the chipset-trace infra has done its first useful work:
 narrowed the boing search from "could be anywhere in 100M
 instructions" to "almost certainly cumulative blitter state".
+
+## §66. Boing blit-population classification — cookie-cut dominates
+
+After §65 narrowed the boing wall to a blitter cumulative-state bug,
+the next step is understanding what *kind* of blits boing actually
+fires so we can target the right class of replay test.
+`tools/intuition_diff/blit_classify.py` walks the chipset trace, keeps
+a shadow blitter register file, snapshots each BLTSIZE-fired blit, and
+reports aggregates.
+
+### §66a. Result
+
+`make boing-chipset-trace` log → 6,976 blits.  USE-flag distribution:
+
+| flags | count | pct  |
+|-------|-------|------|
+| ACD   | 4,851 | 69.5%|
+| CD    | 1,414 | 20.3%|
+| D     |   464 |  6.7%|
+| ABD   |   149 |  2.1%|
+| BD    |    50 |  0.7%|
+| BCD   |    46 |  0.7%|
+| (none)|     2 |  0.0%|
+
+Minterm (BLTCON0 low byte) distribution:
+
+| minterm | count | meaning |
+|---------|-------|---------|
+| $CA     | 1,876 | standard cookie-cut "A AND C → D, mask=C" |
+| $FA     | 1,661 | C-or-A → D (overlay) |
+| $6A     | 1,428 | A XOR C → D |
+| $0A     |   836 | A AND C → D (no mask) |
+| $00     |   466 | constant 0 fill |
+| $AA     |   441 | C identity |
+| $D8     |   149 | A XOR (B AND (A XOR C)) — line draw raster mode |
+| smaller |     – | various |
+
+Mode: **100% area, 0% line.**  Our recent line-mode AUL fix
+(`project_blitter_line_aul_fix.md`) is *not* exercised by boing.
+Pointer regions: BLTCPT and BLTDPT hit CHIP RAM 6,665 / 6,959 of the
+6,976 blits — boing is constantly reading and writing chip-RAM
+bitplanes.
+
+Size: 38% tiny (≤16 words), 56% small (≤256 words), 4.4% medium,
+1.2% large.  The large blits are dominated by `BLTCON0=$05CC USE=BD
+size=5,984` firing 50 times — a big B→D copy of ~12 KB, probably a
+screen-buffer move or the sample-data transfer.
+
+### §66b. So what
+
+The dominant blit class — **cookie-cut $CA + USE=ACD** — is fired
+~4,800 times in boing's 55M-instruction window.  That's a single
+class executed many many times in quick succession.  This is exactly
+the regime where cumulative state-leakage bugs accumulate:
+
+- BLTAFWM / BLTALWM accidentally surviving across blits (we've had
+  this class of bug before — see §44, §51).
+- BLTxMOD set once at sequence start and assumed to stay correct
+  across many blits (if our blitter has any post-blit register
+  side-effect, it surfaces here).
+- BLTADAT preset from previous USE=ABD blit if a USE=ACD blit
+  starts before BLTBDAT is reloaded (USE_B=0 → B=BLTBDAT preset is
+  a recent fix per `project_blitter_minimig_validated.md`; analogous
+  cases for A=preset?).
+
+`make crosscheck-minimig-blt` currently runs 4 canned blits in
+isolation.  None of them test back-to-back cookie-cut.  Adding a test
+that replays the first 100-200 cookie-cut blits from a real boing
+chipset trace would catch any cumulative-state bug in this class.
+
+### §66c. Engineering preserved
+
+`blit_classify.py` works on any chipset trace, not just boing-disk:
+
+    python3 tools/intuition_diff/blit_classify.py \
+        /tmp/<tag>_chipset.ours.log [--csv per_blit.csv]
+
+The `--csv` flag emits one row per blit with all register state — that
+output is exactly the format a future "replay this sequence on both
+blitters" test would consume.
