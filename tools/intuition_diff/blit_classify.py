@@ -105,6 +105,15 @@ def main(argv: list[str]) -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("trace", type=Path)
     ap.add_argument("--csv", type=Path, help="per-blit CSV output")
+    ap.add_argument("--replay-out", type=Path,
+                    help="emit a replay file consumable by tb/minimig_blt_xcheck.cpp "
+                         "(one line per blit, hex fields: con0 con1 afwm alwm "
+                         "apt bpt cpt dpt amod bmod cmod dmod size)")
+    ap.add_argument("--limit", type=int, default=0,
+                    help="--replay-out only: cap to first N blits")
+    ap.add_argument("--filter-con0", type=str, default=None,
+                    help="--replay-out only: keep only blits whose BLTCON0 matches "
+                         "(hex prefix like '0BCA' or '0x0BCA')")
     args = ap.parse_args(argv)
 
     shadow = {name: 0 for name in BLT_REGS.values()}
@@ -245,6 +254,36 @@ def main(argv: list[str]) -> int:
         print(f"  BLTCON0=${c0:04X} (USE={use_str:<4}, minterm=${c0 & 0xFF:02X})"
               f"  size={sz:<8}  count={n}")
     print()
+
+    # ---- Replay file output ----
+    if args.replay_out:
+        filter_con0 = None
+        if args.filter_con0:
+            f = args.filter_con0.lower()
+            if f.startswith("0x"):
+                f = f[2:]
+            if f.startswith("$"):
+                f = f[1:]
+            filter_con0 = int(f, 16)
+        kept = []
+        for b in blits:
+            if filter_con0 is not None and b["con0"] != filter_con0:
+                continue
+            kept.append(b)
+            if args.limit and len(kept) >= args.limit:
+                break
+        with args.replay_out.open("w") as f:
+            f.write("# Replay sequence for tb/minimig_blt_xcheck.cpp.\n")
+            f.write("# Format (hex, space-separated, one blit per line):\n")
+            f.write("#   con0 con1 afwm alwm  apt bpt cpt dpt  amod bmod cmod dmod  bltsize\n")
+            for b in kept:
+                f.write(f"{b['con0']:04X} {b['con1']:04X} {b['afwm']:04X} {b['alwm']:04X}"
+                        f" {b['apt']:06X} {b['bpt']:06X} {b['cpt']:06X} {b['dpt']:06X}"
+                        f" {b['amod']:04X} {b['bmod']:04X} {b['cmod']:04X} {b['dmod']:04X}"
+                        f" {b['words'] | (b['rows'] << 6):04X}\n")
+        print(f"Wrote {len(kept)} blits to {args.replay_out}"
+              + (f" (filtered to CON0=${filter_con0:04X})" if filter_con0 is not None else "")
+              + (f", limit {args.limit}" if args.limit else ""))
 
     if args.csv and csv_rows:
         fieldnames = list(csv_rows[0].keys())

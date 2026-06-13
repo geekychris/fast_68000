@@ -11,6 +11,7 @@
 #include "verilated.h"
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include "track80_mfm_data.h"
 
@@ -262,6 +263,166 @@ int main(int argc, char** argv) {
     int mismatches = t1_mis + t2_mis + t3_mis + t4_mis;
     printf("\nTotal: %d match, %d mismatch\n",
         t1_match + t2_match + t3_match + t4_match, mismatches);
+
+    // ====================================================================
+    // Optional: replay a real boing-disk blit sequence captured via
+    // tools/intuition_diff/blit_classify.py --replay-out.  Set
+    //   REPLAY_FILE=/path/to/blits.txt
+    // to run.  Each line: con0 con1 afwm alwm  apt bpt cpt dpt
+    //                     amod bmod cmod dmod  bltsize  (hex).
+    //
+    // Pre-fills both 32K-word memories with a deterministic pattern,
+    // then runs every blit BACK-TO-BACK (no re-init between blits) and
+    // compares the full memory after each.  The first divergent blit is
+    // printed with context.  This is the regime where cumulative-state
+    // bugs (BLTAFWM/ALWM leakage, BLTxMOD survival, BLTADAT preset
+    // state) surface — see WB13 journal §65 / §66.
+    //
+    // The pre-fill pattern is deterministic so the test is reproducible
+    // even though boing's real source data is not available here:
+    // identical inputs to both blitters MUST produce identical outputs,
+    // regardless of what the inputs actually are.
+    // ====================================================================
+    int replay_mis = 0;
+    if (const char* path = std::getenv("REPLAY_FILE")) {
+        printf("\n=== Replay: %s ===\n", path);
+        FILE* fp = std::fopen(path, "r");
+        if (!fp) {
+            printf("REPLAY_FILE could not be opened\n");
+            delete dut;
+            return mismatches ? 1 : 2;
+        }
+
+        // Re-reset between the canned tests and the replay so state is clean.
+        dut->rst = 1; for (int i = 0; i < 8; i++) tick(dut);
+        dut->rst = 0; for (int i = 0; i < 8; i++) tick(dut);
+
+        // Pre-fill memories with the same pattern.  word[i] = (i * 0x1357) ^ i.
+        // Deterministic, non-zero, easy to recompute mentally.
+        for (uint32_t w = 0; w < 32768; w++) {
+            init_mem(dut, (uint16_t)w,
+                     (uint16_t)((w * 0x1357u) ^ w));
+        }
+
+        // Verify pre-fill consistency BEFORE any blit runs.  If mm_mem
+        // and our_mem differ at this point, the harness is broken; the
+        // problem isn't the blitters.
+        int pre_diffs = 0;
+        for (uint32_t w = 0; w < 32768; w++) {
+            uint16_t mm  = read_mm(dut, (uint16_t)w);
+            uint16_t our = read_our(dut, (uint16_t)w);
+            if (mm != our) {
+                if (pre_diffs < 5)
+                    printf("  PRE-FILL DIFF $%04X: mm=$%04X our=$%04X\n",
+                           w * 2, mm, our);
+                pre_diffs++;
+            }
+        }
+        printf("Pre-fill check: %d divergent words across both memories\n",
+               pre_diffs);
+
+        char line[512];
+        int blit_no = 0;
+        int first_diff_blit = -1;
+        while (std::fgets(line, sizeof line, fp)) {
+            if (line[0] == '#' || line[0] == '\n') continue;
+            uint32_t con0, con1, afwm, alwm;
+            uint32_t apt, bpt, cpt, dpt;
+            uint32_t amod, bmod, cmod, dmod;
+            uint32_t bltsize;
+            if (std::sscanf(line,
+                "%x %x %x %x %x %x %x %x %x %x %x %x %x",
+                &con0, &con1, &afwm, &alwm,
+                &apt, &bpt, &cpt, &dpt,
+                &amod, &bmod, &cmod, &dmod,
+                &bltsize) != 13) {
+                continue;
+            }
+            // Mask pointers into the 64KB test memory window.
+            uint16_t apt16 = (uint16_t)(apt & 0xFFFE);
+            uint16_t bpt16 = (uint16_t)(bpt & 0xFFFE);
+            uint16_t cpt16 = (uint16_t)(cpt & 0xFFFE);
+            uint16_t dpt16 = (uint16_t)(dpt & 0xFFFE);
+
+            // Reset BLT[ABC]DAT presets to 0 so cross-blit state cannot
+            // leak through them.  When boing's actual workload runs,
+            // those registers get written each blit too (visible in the
+            // chipset trace as ~4,300 BLTBDAT writes, ~3,700 BLTADAT
+            // writes); the classifier just doesn't capture them yet.
+            // For this test we want to isolate "given identical
+            // pre-state, do the two blitters produce identical output
+            // across N back-to-back blits", which requires zeroing the
+            // presets between blits.
+            reg_w(dut, 0x74, 0x0000);                // BLTADAT
+            reg_w(dut, 0x72, 0x0000);                // BLTBDAT
+            reg_w(dut, 0x70, 0x0000);                // BLTCDAT
+
+            // Write the full register set in canonical order.
+            reg_w(dut, 0x40, (uint16_t)con0);
+            reg_w(dut, 0x42, (uint16_t)con1);
+            reg_w(dut, 0x44, (uint16_t)afwm);
+            reg_w(dut, 0x46, (uint16_t)alwm);
+            reg_w(dut, 0x48, 0x0000);                // CPTH (upper 16 = 0)
+            reg_w(dut, 0x4A, cpt16);                 // CPTL
+            reg_w(dut, 0x4C, 0x0000);                // BPTH
+            reg_w(dut, 0x4E, bpt16);                 // BPTL
+            reg_w(dut, 0x50, 0x0000);                // APTH
+            reg_w(dut, 0x52, apt16);                 // APTL
+            reg_w(dut, 0x54, 0x0000);                // DPTH
+            reg_w(dut, 0x56, dpt16);                 // DPTL
+            reg_w(dut, 0x64, (uint16_t)amod);
+            reg_w(dut, 0x62, (uint16_t)bmod);
+            reg_w(dut, 0x60, (uint16_t)cmod);
+            reg_w(dut, 0x66, (uint16_t)dmod);
+            reg_w(dut, 0x58, (uint16_t)bltsize);     // BLTSIZE — triggers
+
+            // Spin until both blitters drop !busy.  Bound the wait so a
+            // hung blit reports failure instead of looping forever.
+            int spin = 0;
+            while ((dut->mm_busy || dut->our_busy) && spin < 200000) {
+                tick(dut);
+                spin++;
+            }
+            if (spin >= 200000) {
+                printf("BLIT #%d hung (mm_busy=%d our_busy=%d)\n",
+                       blit_no, dut->mm_busy, dut->our_busy);
+                replay_mis++;
+                break;
+            }
+
+            // Compare full 32K-word memory.
+            int blit_diffs = 0;
+            for (uint32_t w = 0; w < 32768; w++) {
+                uint16_t mm  = read_mm(dut, (uint16_t)w);
+                uint16_t our = read_our(dut, (uint16_t)w);
+                if (mm != our) {
+                    if (blit_diffs < 6) {
+                        printf("  blit#%d DIFF $%04X: mm=$%04X ours=$%04X\n",
+                               blit_no, w * 2, mm, our);
+                    }
+                    blit_diffs++;
+                }
+            }
+            if (blit_diffs) {
+                if (first_diff_blit < 0) first_diff_blit = blit_no;
+                printf("blit#%d  con0=$%04X size=$%04X  -> %d diverging words\n",
+                       blit_no, con0, bltsize, blit_diffs);
+                replay_mis++;
+                if (replay_mis >= 5) {
+                    printf("Stopping after 5 divergent blits.\n");
+                    break;
+                }
+            }
+            blit_no++;
+        }
+        std::fclose(fp);
+        printf("\nReplay summary: %d blits processed, %d divergent",
+               blit_no, replay_mis);
+        if (first_diff_blit >= 0)
+            printf(" (first at blit #%d)", first_diff_blit);
+        printf("\n");
+    }
+
     delete dut;
-    return mismatches ? 1 : 0;
+    return (mismatches + replay_mis) ? 1 : 0;
 }

@@ -6030,3 +6030,89 @@ chipset trace would catch any cumulative-state bug in this class.
 The `--csv` flag emits one row per blit with all register state — that
 output is exactly the format a future "replay this sequence on both
 blitters" test would consume.
+
+## §67. Boing-replay infrastructure for `crosscheck-minimig-blt` — landed but address-collision-limited
+
+§66 narrowed boing's blit load to ~4,800 cookie-cut $CA + USE=ACD
+blits.  This commit extends `make crosscheck-minimig-blt` with a
+replay path that consumes a chipset-trace-derived blit sequence and
+runs the blits back-to-back through both blitters.
+
+### §67a. What landed
+
+- `tools/intuition_diff/blit_classify.py` gains `--replay-out FILE
+  --limit N --filter-con0 HEX` so you can emit a per-blit text file
+  with all register state: con0 con1 afwm alwm  apt bpt cpt dpt
+  amod bmod cmod dmod  bltsize.
+- `tb/minimig_blt_xcheck.cpp` learns a REPLAY_FILE=path env-var path
+  that:
+  1. Re-resets both blitters after the canned tests
+  2. Pre-fills both 32 KiB memories with `word[w] = (w*0x1357) ^ w`
+  3. Verifies pre-fill consistency
+  4. For each replay line: zeroes BLT[ABC]DAT presets, writes the
+     full register set, triggers BLTSIZE, spins until !busy, and
+     diffs full memory
+  5. Reports the first divergent blit with up to 5 context entries
+
+### §67b. First-run result — pointer masking dominates
+
+```
+make minimig-blt
+python3 tools/intuition_diff/blit_classify.py \
+    /tmp/boing_chipset.ours.log \
+    --replay-out /tmp/boing_blits_first200.txt \
+    --limit 200 --filter-con0 0BCA
+REPLAY_FILE=/tmp/boing_blits_first200.txt build_minimig_blt/Vminimig_blt_xcheck_top
+```
+
+Result:
+
+- Canned tests: 12,232 match, 0 mismatch (baseline still holds).
+- Pre-fill check: 0 divergent words.
+- Replay blit#0: 225 divergent words; 5/5 divergent blits, stopped.
+
+But: the divergence is dominated by pointer masking artifacts, NOT a
+real blitter bug.  Boing's real pointers are 24-bit chip-RAM
+addresses (e.g. $010000, $050000, $0B0000); the xcheck testbench has
+only 32 KiB of test memory per side, so the harness masks pointers
+to 16 bits.  That collapse maps distinct boing addresses to the same
+location, with negative modulos (BLTDMOD = $FFEC) causing the blit
+to wrap backward and overlap its own dest writes with new C reads.
+Both blitters see the same collapsed inputs, but the collision-heavy
+interaction amplifies any tiny arithmetic difference into a hundred-
+word divergence — even when neither blitter has a real bug for these
+parameters.
+
+### §67c. Open work for a meaningful replay
+
+Two clean fixes the harness would need to be a real cumulative-state
+test:
+
+1. **Expand the test memory.**  Grow `mm_mem` and `our_mem` to at
+   least 1 MiB (524,288 words) — covers all of boing's chip-RAM
+   pointer range without masking.  Indexes become 19-bit.
+2. **Or: remap pointers consistently.**  Walk the replay, find the
+   minimum pointer in each blit's set, subtract that base from
+   APT/BPT/CPT/DPT, so the blit fits in low memory without
+   colliding with siblings.  Requires careful base selection so
+   relative pointer differences between blits (BLTAPT vs. BLTCPT
+   in the same blit) survive.
+
+Option 1 is simpler and stays semantically identical to the canned
+tests.  ~half a day to grow the memory and re-run.
+
+### §67d. Engineering preserved
+
+Even with the address-collision limitation, the replay infra is
+useful as-is for:
+
+- Smoke-testing that our blitter doesn't crash / hang / drift on
+  back-to-back diverse register patterns drawn from real workloads.
+- Regression detection: re-run after any blitter RTL change and
+  confirm the canned-test 12,232/0 pass holds.
+- Spotting cases where the diff suddenly explodes (one of the
+  blitters truly broke) vs. stays at the same baseline noise level.
+
+The `--filter-con0` mechanism makes it easy to slice the trace by
+operation class for targeted testing of any future blitter fix.
+
