@@ -6290,3 +6290,84 @@ This is a substantial fix but well-scoped: ~half a day of blitter
 RTL work + regression run.  Test 5 is now a permanent regression
 test for this class.
 
+
+## §70. xcheck testbench had silent BLT[ABC]DAT register-drop bug
+
+Investigating Test 5's row-0 vs row-1+ divergence revealed a real bug
+in the xcheck testbench itself.  Two findings:
+
+### §70a. BLT[ABC]DAT writes silently dropped on our side
+
+`tb/minimig_blt_xcheck_top.sv`'s register-write translation table
+(case statement on the canonical chipset reg_addr) mapped
+BLTCON0/BLTCON1/BLTAFWM/BLTALWM/BLTxPT/BLTxMOD/BLTSIZE — but NOT
+BLTADAT ($74), BLTBDAT ($72), BLTCDAT ($70).  Writes to those
+addresses hit minimig directly but fell into the `default:
+our_slv_req = 1'b0` arm on our side, silently dropping.
+
+Result: any test that wrote BLT[ABC]DAT via the canonical $7x offset
+left minimig with the written value and ours with whatever reset
+default our blitter had.  Reset defaults differ:
+
+```
+rtl/chipset/blitter.v line 393-395:
+    bltadat_pre  <= 32'd0;
+    bltbdat_pre  <= 32'hFFFF;     <-- non-zero default
+    bltcdat_pre  <= 32'd0;
+```
+
+For USE_B=0 blits, B comes from bltbdat_pre.  If a test wrote
+BLTBDAT=0 expecting both blitters to use B=0, minimig used 0 but
+ours used $FFFF — producing a false "divergence" that wasn't a
+blitter bug at all.
+
+Fixed by extending the case statement with three more entries
+mapping $74/$72/$70 to internal slv_addr 6'h2C/$30/$34.
+
+### §70b. Test 5 row 0 now matches; rows 1+ still fail
+
+After §70a's fix, Test 5 looks like:
+
+```
+=== Test 5: BOING-CLASS cookie-cut ($0BCA, BLTALWM=$8000) ===
+  MISMATCH @ $005FE0: mm=$AAAA our=$0000
+  MISMATCH @ $005FE2: mm=$AAAA our=$0000
+  MISMATCH @ $005FF0: mm=$4000 our=$0000
+  MISMATCH @ $005FF2: mm=$4013 our=$0000
+Test 5: 44 match, 4 mismatch
+```
+
+Row 0 ($6000, $6002 — byte addresses) matches both sides now.  Rows
+1 & 2 still produce $0000 on our side vs. valid cookie-cut values on
+minimig.  That's still a real blitter divergence — confirmed not an
+artifact — and the §69d investigation continues from here.
+
+### §70c. What the row 1/2 results would be on a correct blitter
+
+For row 1 word 0 (= byte $5FF0): A read from BLTAPT after AMOD
+advance = byte $2024 = word $1012 = $A012 (from Test 5's init
+pattern `init_mem($1000+w, $A000+w)` for w=0..31).  C read from
+BLTCPT after CMOD = byte $4024 = word $2012 = $C012.
+
+Cookie-cut $CA with B=0: D = (A AND B) | (NOT A AND C) = NOT A AND C
+= $5FED AND $C012 = $4000.  Which matches minimig's $4000.
+
+Ours gives 0.  So either A is read as 0, C is read as 0, or the
+minterm logic mis-computes for this case.  Could be a state-machine
+issue specific to row transitions when ASH=BSH=0 and USE_B=0.
+
+### §70d. Lessons
+
+- "Silent drop" bugs in cross-check testbenches are particularly
+  pernicious: the test runs without error, both sides produce
+  output, but the stimulus on the two sides differs.  Future
+  cross-check additions should verify reg-translation coverage
+  matches the chipset register surface area.
+- Two blitter regs (BLTADAT, BLTBDAT, BLTCDAT) had different reset
+  defaults than minimig (bltbdat_pre=$FFFF vs likely 0).  Whether
+  that's a real Amiga-fidelity issue depends on what real hardware
+  does at power-on; canonical implementations zero everything but
+  some retain $FFFF for line-mode default.  Not changing the reset
+  default in this commit — too easy to break other tests — but
+  worth a follow-up audit.
+

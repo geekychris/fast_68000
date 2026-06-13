@@ -164,6 +164,17 @@ module minimig_blt_xcheck_top (
             8'h60: begin our_slv_addr = 6'h24; our_slv_wdata = {16'd0, reg_wdata}; end // BLTCMOD
             8'h66: begin our_slv_addr = 6'h28; our_slv_wdata = {16'd0, reg_wdata}; end // BLTDMOD
             8'h58: begin our_slv_addr = 6'h38; our_slv_wdata = {16'd0, reg_wdata}; end // BLTSIZE
+            // BLT[ABC]DAT presets — chipset offsets $70/$72/$74 map to our
+            // blitter's internal slv addresses 6'h2C/$30/$34 (4-bit upper
+            // index $B/$C/$D per the case statement in blitter.v ~line 516).
+            // These were missing from the pre-2026-06-12 table, causing
+            // any test that wrote BLT[ABC]DAT via the canonical chipset
+            // offset to silently drop the write on our blitter side
+            // while it landed correctly on minimig — surfacing as a
+            // false "blitter divergence" with the same regs sent both ways.
+            8'h74: begin our_slv_addr = 6'h2C; our_slv_wdata = {16'd0, reg_wdata}; end // BLTADAT
+            8'h72: begin our_slv_addr = 6'h30; our_slv_wdata = {16'd0, reg_wdata}; end // BLTBDAT
+            8'h70: begin our_slv_addr = 6'h34; our_slv_wdata = {16'd0, reg_wdata}; end // BLTCDAT
             default: our_slv_req = 1'b0;
         endcase
     end

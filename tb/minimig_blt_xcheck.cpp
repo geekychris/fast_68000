@@ -282,6 +282,13 @@ int main(int argc, char** argv) {
         init_mem(dut, 0x2000 + w, 0xC000 + w);
         init_mem(dut, 0x3000 + w, 0xDEAD);
     }
+    // Explicitly write all three BLT*DAT presets BEFORE Test 5 so neither
+    // blitter inherits a reset-default difference from Test 4 residue.
+    // (Our blitter resets bltbdat_pre to $FFFF; minimig may differ.)
+    reg_w(dut, 0x74, 0x0000);   // BLTADAT
+    reg_w(dut, 0x72, 0x0000);   // BLTBDAT — USE_B=0 means this preset feeds B
+    reg_w(dut, 0x70, 0x0000);   // BLTCDAT
+
     reg_w(dut, 0x40, 0x0BCA);   // BLTCON0 = ACD + minterm $CA
     reg_w(dut, 0x42, 0x0000);   // BLTCON1 = ascending, no fill, no line
     reg_w(dut, 0x44, 0xFFFF);   // BLTAFWM
