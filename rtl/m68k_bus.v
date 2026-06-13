@@ -2810,6 +2810,31 @@ module m68k_bus #(
         .hit_o   ()
     );
 
+    // [INTREQ-WR]: every write to INTREQ ($DFF09C) regardless of source.
+    // Copper-driven INT4_COPER demos (e.g. Turrican intro) raise via
+    // MOVE $8010 -> $DFF09C from the Copper.  If we see no src=3 hits,
+    // the Copper never reaches the INTREQ-raise segment of its list.
+    // See project_turrican_int4_never_fires.md.
+    hw_watch #(
+        .LABEL      ("INTREQ-WR"),
+        .ADDR_LO    (32'h00DF_F09C),
+        .ADDR_HI    (32'h00DF_F09D),
+        .MATCH_WE   (1),
+        .MATCH_RE   (0)
+    ) u_w_intreq (
+        .clk     (clk),
+        .rst_n   (rst_n),
+        .valid   (bus_we_now),
+        .we      (1'b1),
+        .addr    (addr[winner]),
+        .wdata   (wdata[winner]),
+        .be      (be[winner]),
+        .src_id  (bus_src),
+        .pc      (32'd0),
+        .retired (32'd0),
+        .hit_o   ()
+    );
+
     // [YFLD-BUS-WR]: ANY bus write (CPU or DMA) to slow $C04784..$C04789
     // (the Y-coord field that gets zeroed by an unidentified writer).
     // The Y-FIELD-WR probe in m68k_core only catches CPU writes via
