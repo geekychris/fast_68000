@@ -977,6 +977,39 @@ sim-screenshot:
 	@if command -v open >/dev/null 2>&1; then open $(OUT); fi
 
 # ---------------------------------------------------------------------------
+# sim-screenshot-sweep: capture a series of screenshots at different
+# retired-instruction counts.  Useful for seeing demo intros / boot
+# evolution / state transitions that a single end-of-run dump misses.
+#
+# RETIRED= is a comma-separated list of retired-instruction counts.
+# Each run produces /tmp/sweep_<STEM>_R<N>.png.
+#
+# Usage:
+#   make sim-screenshot-sweep ADF=kickstart/turrican.adf \
+#       RETIRED=5000000,15000000,30000000,60000000,100000000
+#
+#   make sim-screenshot-sweep ADF=kickstart/wb13.adf \
+#       RETIRED=2000000,4000000,8000000,16000000,24000000
+# ---------------------------------------------------------------------------
+sim-screenshot-sweep: ADF       ?= kickstart/wb13.adf
+sim-screenshot-sweep: STEM      ?= sweep_$(notdir $(basename $(ADF)))
+sim-screenshot-sweep: ROMCYCLES ?= 400000000
+sim-screenshot-sweep: DIM       ?= 320x256
+sim-screenshot-sweep: RETIRED   ?= 5000000,15000000,30000000,60000000,100000000
+sim-screenshot-sweep:
+	@for r in $$(echo $(RETIRED) | tr ',' ' '); do \
+	    out=/tmp/$(STEM)_R$$r.png; \
+	    echo "--- $$r retired -> $$out ---"; \
+	    $(MAKE) --no-print-directory sim-screenshot \
+	        ADF=$(ADF) ROMCYCLES=$(ROMCYCLES) DIM=$(DIM) \
+	        $(if $(MOUSE_CLICK),MOUSE_CLICK=$(MOUSE_CLICK),) \
+	        $(if $(COP1LC),COP1LC=$(COP1LC),) \
+	        AT_RETIRED=$$r OUT=$$out 2>&1 | tail -2 || true; \
+	done
+	@echo "Done.  Frames at /tmp/$(STEM)_R*.png"
+	@ls -la /tmp/$(STEM)_R*.png 2>/dev/null | head
+
+# ---------------------------------------------------------------------------
 # wb-desktop: boot WB1.3 through to the Workbench DESKTOP state (not
 # just the CLI banner that `wb-screenshot` shows).  Runs ~210M retired
 # instructions, then renders the chipram + slowram via render_k13_screen.
