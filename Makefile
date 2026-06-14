@@ -927,6 +927,41 @@ wb-screenshot-final:
 	@$(MAKE) --no-print-directory wb-screenshot STOP=0
 
 # ---------------------------------------------------------------------------
+# sim-screenshot: headless screenshot via in-sim Denise renderer.
+#
+# Honors the new DENISE_DUMP_PPM env var (tb/sim_main.cpp) which dumps the
+# rendered framebuffer at end of run.  Unlike `wb-screenshot` (which feeds
+# a chip-RAM dump through tools/render_k13_screen.py), this path uses the
+# same C++ Copper-walker that the SDL display path uses — so it works
+# without an SDL build and renders any Copper-list state, not just K1.3+WB.
+#
+# Usage:
+#   make sim-screenshot ADF=<path> [ROMCYCLES=N] [MOUSE_CLICK=x,y,c]
+#                                  [COP1LC=0xNNNN] [DIM=WxH] [OUT=...png]
+#
+# Examples:
+#   make sim-screenshot ADF=kickstart/wb13.adf            # auto-detect
+#   make sim-screenshot ADF=kickstart/turrican.adf \
+#       MOUSE_CLICK=1,1,300000000 COP1LC=0x30DA0          # Turrican w/ fire
+# ---------------------------------------------------------------------------
+sim-screenshot: ADF        ?= kickstart/wb13.adf
+sim-screenshot: ROMCYCLES  ?= 400000000
+sim-screenshot: DIM        ?= 320x200
+sim-screenshot: OUT        ?= /tmp/sim_screenshot.png
+sim-screenshot:
+	@rm -rf build_kick_boot
+	@echo "Booting + dumping Denise via DENISE_DUMP_PPM..."
+	BOOT_TRACE=0 ROMCYCLES=$(ROMCYCLES) \
+	    $(if $(MOUSE_CLICK),MOUSE_AUTO_CLICK=$(MOUSE_CLICK),) \
+	    $(if $(COP1LC),DENISE_DUMP_COP1LC=$(COP1LC),) \
+	    DENISE_DUMP_PPM=$(OUT:.png=.ppm) DENISE_DUMP_DIM=$(DIM) \
+	    $(MAKE) --no-print-directory test-kickstart-boot \
+	    ADFFILE=$(ADF) 2>&1 | tail -3 || true
+	@$(PYTHON) -c "from PIL import Image; Image.open('$(OUT:.png=.ppm)').save('$(OUT)')"
+	@echo "Saved $(OUT)"
+	@if command -v open >/dev/null 2>&1; then open $(OUT); fi
+
+# ---------------------------------------------------------------------------
 # wb-desktop: boot WB1.3 through to the Workbench DESKTOP state (not
 # just the CLI banner that `wb-screenshot` shows).  Runs ~210M retired
 # instructions, then renders the chipram + slowram via render_k13_screen.

@@ -185,7 +185,6 @@ uint32_t mem_peek_word(Vm68k_top* top, uint32_t byte_addr) {
     return top->fb_peek_data;
 }
 
-#ifdef HAVE_SDL2
 // ---------------------------------------------------------------------------
 // K1.3 chipram → pixel-buffer renderer.
 //
@@ -193,11 +192,11 @@ uint32_t mem_peek_word(Vm68k_top* top, uint32_t byte_addr) {
 // K1.3 doesn't enable until Intuition.OpenScreen runs (post-Workbench-load).
 // Until we get that far, the only way to "see" K1.3's screen is to walk the
 // Copper list it staged in chip RAM, extract the palette + sprite pointers +
-// bitplane config, and render directly into the SDL pixel buffer.
+// bitplane config, and render directly into a pixel buffer.
 //
 // Mirrors tools/render_k13_screen.py (Python implementation; that one runs as
-// a one-shot post-mortem on a chipram dump.  This one updates the SDL window
-// every frame).
+// a one-shot post-mortem on a chipram dump.  This one is used both by the
+// SDL live-display path and the headless DENISE_DUMP_PPM at end-of-run.
 // ---------------------------------------------------------------------------
 static uint16_t chip_word(Vm68k_top* top, uint32_t addr) {
     if (addr & 1) {
@@ -454,7 +453,55 @@ static void render_k13_chipram(Vm68k_top* top, uint32_t cop1lc,
     sprpt &= 0xFFFFFu;
     if (sprpt) k13_render_sprite(top, sprpt, regs, buf, w, h, 0);
 }
-#endif  // HAVE_SDL2
+
+// Headless screenshot dump: render Denise output via the same Copper-list
+// walker as the SDL path, then write a PPM (P6) to disk.  Triggered by
+// DENISE_DUMP_PPM=path at end of run.  Optional companion env vars:
+//   DENISE_DUMP_COP1LC=<hex>   Override the Copper-list head address.
+//                              Default: K1.3 autodetect via
+//                              k13_autodetect_cop1lc().  For Turrican
+//                              use $00030E6C (the game Copper list).
+//   DENISE_DUMP_DIM=<W>x<H>    Render dimensions.  Default 320x200
+//                              (standard Amiga lores PAL visible region).
+static void denise_dump_ppm(Vm68k_top* top, const char* path) {
+    uint32_t cop1lc = 0;
+    if (const char* s = std::getenv("DENISE_DUMP_COP1LC")) {
+        cop1lc = (uint32_t)std::strtoul(s, nullptr, 0);
+    }
+    if (!cop1lc) cop1lc = k13_autodetect_cop1lc(top);
+    if (!cop1lc) {
+        std::fprintf(stderr,
+            "[sim] DENISE_DUMP_PPM: no Copper list found "
+            "(set DENISE_DUMP_COP1LC=<hex>)\n");
+        return;
+    }
+    int w = 320, h = 200;
+    if (const char* s = std::getenv("DENISE_DUMP_DIM")) {
+        int xw = 0, xh = 0;
+        if (std::sscanf(s, "%dx%d", &xw, &xh) == 2 && xw > 0 && xh > 0) {
+            w = xw; h = xh;
+        }
+    }
+    std::vector<uint32_t> buf(size_t(w) * size_t(h), 0);
+    render_k13_chipram(top, cop1lc, buf.data(), w, h);
+    std::FILE* f = std::fopen(path, "wb");
+    if (!f) {
+        std::fprintf(stderr, "[sim] DENISE_DUMP_PPM=%s open failed\n", path);
+        return;
+    }
+    std::fprintf(f, "P6\n%d %d\n255\n", w, h);
+    for (int i = 0; i < w * h; i++) {
+        uint32_t p = buf[i];
+        uint8_t out[3] = {
+            (uint8_t)((p >> 16) & 0xFF),
+            (uint8_t)((p >>  8) & 0xFF),
+            (uint8_t)( p        & 0xFF)};
+        std::fwrite(out, 1, 3, f);
+    }
+    std::fclose(f);
+    std::printf("[sim] DENISE_DUMP_PPM wrote %s (%dx%d, cop1lc=$%X)\n",
+        path, w, h, cop1lc);
+}
 
 static void drain_console(Vm68k_top* top, uint32_t& host_tail) {
     uint32_t head = mem_peek_word(top, CONSOLE_HEAD_ADDR);
@@ -1094,6 +1141,14 @@ static int run_regression(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
         } else {
             std::fprintf(stderr, "[sim] FB_DUMP_PPM=%s open failed\n", path);
         }
+    }
+
+    // Headless Denise screenshot: walks the live Copper list (auto-detected
+    // or DENISE_DUMP_COP1LC=<hex>-overridden) and writes a PPM.  Renders the
+    // 4-bit-per-channel Amiga palette through the same Copper-list walker
+    // used by the SDL display path.
+    if (const char* path = std::getenv("DENISE_DUMP_PPM")) {
+        denise_dump_ppm(top, path);
     }
 
     return rc;
