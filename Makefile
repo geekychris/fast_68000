@@ -941,14 +941,19 @@ wb-screenshot-final:
 #                                  [AT_RETIRED=N] [OUT=...png]
 #
 # Examples:
-#   make sim-screenshot ADF=kickstart/wb13.adf                # auto-detect
+#   make sim-screenshot ADF=kickstart/wb13.adf                # autodetect
 #
 #   make sim-screenshot ADF=kickstart/turrican.adf \          # Turrican w/ fire
-#       MOUSE_CLICK=1,1,300000000 COP1LC=0x30E6C
+#       MOUSE_CLICK=1,1,300000000                             # — autodetected
 #
 #   make sim-screenshot ADF=kickstart/turrican.adf \          # catch a frame
-#       MOUSE_CLICK=1,1,300000000 COP1LC=0x30E6C \            # at retired=200M
+#       MOUSE_CLICK=1,1,300000000 \                           # at retired=200M
 #       AT_RETIRED=200000000                                  # (mid-run snap)
+#
+# Autodetect reads the live chipset canon_cop1lc / canon_cop2lc shadows
+# via the fb_peek window at $00FFFE80/84 (m68k_bus.v).  Set COP1LC=
+# explicitly only if you want to render a specific staged-but-not-yet-
+# active Copper list (e.g. a demo's intro list before it becomes live).
 #
 # Set DENISE_DUMP_DEBUG=1 to print per-WAIT snapshot state when the
 # rendered image is unexpectedly blank.

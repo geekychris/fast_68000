@@ -300,8 +300,29 @@ module m68k_bus #(
     // sim-side chipram dumps and tools can also see slow-RAM contents
     // (Exec structures live there once K1.3 prefers slow RAM for non-
     // chip allocations).
+    // Chipset-register peek window at $00FF_FE00..$00FF_FEFF.  Reserved
+    // for the sim harness to read live shadow values that aren't backed
+    // by real memory.  Currently exposed:
+    //   $00FF_FE80  canon_cop1lc  (Copper list 1 head address)
+    //   $00FF_FE84  canon_cop2lc  (Copper list 2 head address)
+    //   $00FF_FE96  dmacon (16-bit, low half; high half = 0)
+    // Used by tb/sim_main.cpp's DENISE_DUMP_PPM autodetect to find the
+    // live Copper list without depending on a chip-RAM signature scan.
+    wire chipset_peek = (fb_peek_addr & 32'hFFFF_FF00) == 32'h00FF_FE00;
+    wire [7:0] chipset_peek_off = fb_peek_addr[7:0];
+    reg  [31:0] chipset_peek_data;
+    always @* begin
+        case (chipset_peek_off)
+            8'h80: chipset_peek_data = canon_cop1lc;
+            8'h84: chipset_peek_data = canon_cop2lc;
+            8'h96: chipset_peek_data = {16'd0, dmacon};
+            default: chipset_peek_data = 32'd0;
+        endcase
+    end
     assign fb_peek_data =
-        (fb_peek_addr >= 32'h00C0_0000 && fb_peek_addr < 32'h00C8_0000)
+        chipset_peek
+            ? chipset_peek_data
+        : (fb_peek_addr >= 32'h00C0_0000 && fb_peek_addr < 32'h00C8_0000)
             ? slowmem[(fb_peek_addr - 32'h00C0_0000) >> 2]
             : mem[fb_peek_addr[AIDX_BITS+1:2]];
 

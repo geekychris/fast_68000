@@ -231,10 +231,56 @@ static uint32_t amiga4_to_argb(uint16_t c12) {
 // preceding WAIT (low bit of word 1 = 1, low bit of word 2 = 0) and
 // use that as the list head.  Returns 0 if no match.
 //
+// Quick BPU-probe: walk a Copper list briefly and return the max BPU
+// value any BPLCON0 MOVE reaches.  Used to choose between candidate
+// list heads — a list that drives BPLCON0 to >0 is "rendering".
+static int k13_quick_max_bpu(Vm68k_top* top, uint32_t cop_pc) {
+    if (cop_pc == 0) return 0;
+    uint32_t pc = cop_pc & 0xFFFFFu;
+    int max_bpu = 0;
+    for (int n = 0; n < 512; n++) {
+        uint16_t ir1 = chip_word(top, pc);
+        uint16_t ir2 = chip_word(top, pc + 2);
+        if (ir1 == 0 && ir2 == 0) break;
+        pc += 4;
+        if (ir1 & 1) {
+            uint8_t vp = (ir1 >> 8) & 0xFF;
+            uint8_t hp = (ir1 >> 1) & 0x7F;
+            if (vp == 0xFF && hp == 0x7F && !(ir2 & 1)) break;
+            if (ir2 & 1) pc += 4;  // SKIP next
+        } else {
+            uint16_t reg = ir1 & 0x1FE;
+            if (reg == 0x100) {
+                int bpu = (ir2 >> 12) & 0x7;
+                if (bpu > max_bpu) max_bpu = bpu;
+            }
+        }
+    }
+    return max_bpu;
+}
+
 // Mirrors tools/render_k13_screen.py::autodetect_intuition_copper().
+//
+// Three-tier strategy:
+//   1. Read the live chipset canon_cop1lc / canon_cop2lc shadows via
+//      the fb_peek window at $00FF_FE80/84.  Probe BOTH — K1.3's per-
+//      VBL handler keeps COP1LC at its empty default ($420) and chains
+//      to COP2LC (WB Intuition list at $100C8), so COP2LC is often the
+//      "real" displayed list.  Use whichever produces a non-zero BPU.
+//   2. Only if (1) yields no rendering list, fall back to the WB1.3
+//      palette-intro signature scan (preserved for early-boot states
+//      before any COP1LC/COP2LC write).
 static uint32_t k13_autodetect_cop1lc(Vm68k_top* top) {
-    // Sweep chip RAM in word-aligned strides.  Chip RAM is 512 KB =
-    // 262144 16-bit words.  Cost: ~1M word reads per scan ≈ negligible.
+    // Tier 1: live chipset peek.  Both COP1LC and COP2LC are candidates.
+    uint32_t cop1 = mem_peek_word(top, 0x00FFFE80u) & 0x000FFFFFu;
+    uint32_t cop2 = mem_peek_word(top, 0x00FFFE84u) & 0x000FFFFFu;
+    int bpu1 = k13_quick_max_bpu(top, cop1);
+    int bpu2 = k13_quick_max_bpu(top, cop2);
+    if (bpu1 > 0 && bpu1 >= bpu2) return cop1;
+    if (bpu2 > 0) return cop2;
+    if (cop1 != 0) return cop1;  // both BPU=0; prefer COP1
+    // Tier 2: WB1.3 palette signature.  Sweep chip RAM in word-aligned
+    // strides.  Chip RAM is 512 KB = 262144 16-bit words.
     for (uint32_t a = 0; a + 8 <= 0x80000u; a += 2) {
         if (chip_word(top, a)       == 0x0180 &&
             chip_word(top, a + 2)   == 0x005A &&
@@ -552,11 +598,19 @@ static void render_k13_chipram(Vm68k_top* top, uint32_t cop1lc,
         uint16_t bplcon0 = regs[0x100 >> 1];
         int  bpu   = (bplcon0 >> 12) & 0x7;
         bool hires = (bplcon0 >> 15) & 1;
+        bool lace  = (bplcon0 >> 2)  & 1;
         if (bpu == 0) continue;
         if (bpu > 6) bpu = 6;
         int row_bytes = hires ? 80 : 40;
         int16_t bpl1mod = (int16_t)regs[0x108 >> 1];
         int16_t bpl2mod = (int16_t)regs[0x10A >> 1];
+        // Per-row Agnus auto-advance is (row_bytes + BPLnMOD).  But for
+        // non-LACE displays many demos leave BPLnMOD junk in chip RAM
+        // (or set BPL1MOD non-zero for stride padding) without LACE
+        // ever being enabled — using mod there would corrupt the
+        // address calculation.  Only honor mod when LACE is active.
+        int mod1_eff = lace ? bpl1mod : 0;
+        int mod2_eff = lace ? bpl2mod : 0;
         // Palette for this row.
         int npal = 1 << bpu;
         if (npal > 32) npal = 32;
@@ -567,19 +621,18 @@ static void render_k13_chipram(Vm68k_top* top, uint32_t cop1lc,
             pal[i] = amiga4_to_argb(c);
         }
         // Effective BPL pointers at this row: snapshot BPL + delta rows
-        // of Agnus auto-advance.  We currently ignore BPLnMOD (defaults
-        // to 0) because LACE displays (WB1.3 Workbench title bar at
-        // BPLnMOD=80 to skip alternate fields) would otherwise halve
-        // vertical resolution.  For per-scanline-updating demos this
-        // doesn't matter because delta stays at 0 each row anyway —
-        // the next snapshot rewrites BPL1PT before auto-advance bites.
-        (void)bpl1mod; (void)bpl2mod;
+        // of Agnus auto-advance.  Even planes use BPL1MOD, odd planes
+        // use BPL2MOD.  For LACE displays we render only the LOF=1
+        // (long-frame) field, so a single output row maps to one
+        // Amiga scanline of that field — the captured snapshot lacks
+        // the alternate-field BPL state needed to interleave both.
         uint32_t bplpt[6];
         for (int p = 0; p < bpu; p++) {
             uint16_t hi = regs[(0x0E0 + p * 4) >> 1];
             uint16_t lo = regs[(0x0E2 + p * 4) >> 1];
             uint32_t base = ((uint32_t(hi) << 16) | uint32_t(lo)) & 0xFFFFFu;
-            bplpt[p] = base + uint32_t(delta) * uint32_t(row_bytes);
+            int mod_p = ((p & 1) == 0) ? mod1_eff : mod2_eff;
+            bplpt[p] = base + uint32_t(delta) * uint32_t(row_bytes + mod_p);
         }
         // Render row.
         for (int bx = 0; bx < row_bytes; bx++) {
