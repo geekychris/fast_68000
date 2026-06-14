@@ -392,44 +392,172 @@ static void k13_render_sprite(Vm68k_top* top, uint32_t sprpt,
     }
 }
 
+// Per-WAIT snapshot of the Copper-shadow chipset state.  v_at = vertical
+// position at which the snapshot's MOVEs have all taken effect (i.e. the
+// V coordinate of the preceding WAIT, or 0 for the initial-state snap).
+struct CopperSnap {
+    int      v_at;
+    uint16_t regs[256];
+};
+
+// Per-WAIT walker — like k13_walk_copper but records (V, regs[]) at every
+// WAIT.  Used by the per-scanline renderer so demos that rewrite BPL1PT /
+// BPLCON0 / palette PER scanline (Turrican cracker intro, copper-bars,
+// raster-split games) reproduce correctly.
+//
+// snaps[] must hold up to max_snaps entries; PAL has 313 scanlines so 320
+// is comfortable.  Returns count via n_snaps.
+static void k13_walk_copper_snapshots(Vm68k_top* top, uint32_t cop1lc,
+                                       CopperSnap* snaps, int& n_snaps,
+                                       int max_snaps) {
+    n_snaps = 0;
+    uint16_t regs_now[256] = {0};
+    int redirects_remaining = 4;
+    uint32_t pc = cop1lc & 0xFFFFFu;
+    uint32_t initial_pc = pc;
+    // Don't pre-push an empty v_at=0 snapshot — the renderer's
+    // "no snap before this V" fallback picks snaps[0] in that case,
+    // and that's the right semantic (MOVEs before the first WAIT all
+    // execute by the time the beam reaches V=0).
+    for (int n = 0; n < 8192; n++) {
+        uint16_t ir1 = chip_word(top, pc);
+        uint16_t ir2 = chip_word(top, pc + 2);
+        if (ir1 == 0 && ir2 == 0) break;
+        pc += 4;
+        if (ir1 & 1) {
+            uint8_t vp = (ir1 >> 8) & 0xFF;
+            uint8_t hp = (ir1 >> 1) & 0x7F;
+            if (vp == 0xFF && hp == 0x7F && !(ir2 & 1)) {
+                // End-of-list — follow MOVE-to-COP1LC redirect or stop.
+                uint32_t cop1 = (uint32_t(regs_now[0x080 >> 1]) << 16) |
+                                uint32_t(regs_now[0x082 >> 1]);
+                cop1 &= 0xFFFFFu;
+                if (redirects_remaining > 0 &&
+                    cop1 != 0 && cop1 != initial_pc && cop1 != pc - 4) {
+                    pc = cop1;
+                    initial_pc = pc;
+                    redirects_remaining--;
+                    continue;
+                }
+                break;
+            }
+            if (ir2 & 1) pc += 4;  // SKIP next instr
+            // Snapshot state at this V.
+            if (n_snaps < max_snaps) {
+                snaps[n_snaps].v_at = vp;
+                std::memcpy(snaps[n_snaps].regs, regs_now, sizeof(regs_now));
+                n_snaps++;
+            }
+        } else {
+            uint16_t reg = ir1 & 0x1FE;
+            regs_now[reg >> 1] = ir2;
+            if (reg == 0x08A) {
+                uint32_t cop2lc = (uint32_t(regs_now[0x084 >> 1]) << 16) |
+                                  uint32_t(regs_now[0x086 >> 1]);
+                pc = cop2lc & 0xFFFFFu;
+            }
+            if (reg == 0x088) {
+                uint32_t cop1 = (uint32_t(regs_now[0x080 >> 1]) << 16) |
+                                uint32_t(regs_now[0x082 >> 1]);
+                pc = cop1 & 0xFFFFFu;
+            }
+        }
+    }
+    // Final tail snapshot at V=255 captures whatever was set after the
+    // last WAIT (rare but happens for Copper lists that end with MOVEs).
+    if (n_snaps < max_snaps) {
+        snaps[n_snaps].v_at = 255;
+        std::memcpy(snaps[n_snaps].regs, regs_now, sizeof(regs_now));
+        n_snaps++;
+    }
+}
+
 // Render K1.3's current chipram state into the pixel buffer.  Pixel layout
 // is ARGB8888.  buf must have w*h pixels.
 //
-// Three layers (back to front):
-//   1. Background = COLOR00 (palette index 0)
-//   2. Bitplanes — BPU planes from BPL1PT..BPLnPT, one byte per 8 pixels
-//                  per plane per row.  Pixel index = sum of plane bits.
-//   3. Sprite 0 — mouse cursor / pointer.
+// Per-scanline accurate: walks the Copper list as a time-ordered program,
+// records (V, regs[]) at every WAIT, then for each output row picks the
+// active snapshot at that scanline.  Between snapshots, BPL pointers
+// auto-advance by (display_bytes + BPLnMOD) as real Agnus would.
 //
-// Width handling: BPLCON0 bit 15 (HIRES) doubles the effective pixel
-// rate.  For the SDL window we treat HIRES as one Amiga pixel per SDL
-// pixel (so a 640-wide WB display is displayed truncated to FB_W=320
-// — gives the user something visible without forcing the renderer to
-// downscale).  LORES stays one-to-one.
+// Width handling: BPLCON0 bit 15 (HIRES) selects 640-wide rasterization
+// (80 bytes/row/plane).  LORES = 320-wide (40 bytes/row).
 static void render_k13_chipram(Vm68k_top* top, uint32_t cop1lc,
                                uint32_t* buf, int w, int h) {
-    uint16_t regs[256] = {0};
-    k13_walk_copper(top, cop1lc, regs);
-    uint16_t bplcon0 = regs[0x100 >> 1];
-    int  bpu   = (bplcon0 >> 12) & 0x7;
-    bool hires = (bplcon0 >> 15) & 1;
-    // Background COLOR00 fill.  K1.3's boot prompt list doesn't set
-    // COLOR00; fall back to the canonical WB light blue.
-    uint16_t c00 = regs[0x180 >> 1];
+    static CopperSnap snaps[320];
+    int n_snaps = 0;
+    k13_walk_copper_snapshots(top, cop1lc, snaps, n_snaps, 320);
+    // DENISE_DUMP_DEBUG=1 dumps per-WAIT snapshot state to stdout — useful
+    // when the rendered image is unexpectedly blank.  Shows the first 8
+    // snapshots' v_at + key chipset regs.
+    if (std::getenv("DENISE_DUMP_DEBUG")) {
+        std::printf("[render] cop1lc=$%X n_snaps=%d, first 8 of %d:\n",
+            cop1lc, n_snaps, n_snaps);
+        for (int i = 0; i < n_snaps && i < 8; i++) {
+            uint16_t bplcon0 = snaps[i].regs[0x100 >> 1];
+            uint16_t diwstrt = snaps[i].regs[0x092 >> 1];
+            uint16_t c00 = snaps[i].regs[0x180 >> 1];
+            uint16_t bpl1l = snaps[i].regs[0x0E2 >> 1];
+            uint16_t bpl1h = snaps[i].regs[0x0E0 >> 1];
+            std::printf("  snap[%d] v_at=%d bplcon0=%04x diwstrt=%04x "
+                "color00=%04x bpl1pt=%04x%04x\n",
+                i, snaps[i].v_at, bplcon0, diwstrt, c00, bpl1h, bpl1l);
+        }
+    }
+    if (n_snaps == 0) {
+        uint32_t blue = amiga4_to_argb(0x0AAF);
+        for (int i = 0; i < w * h; i++) buf[i] = blue;
+        return;
+    }
+    // Pick a "primary" snapshot for background COLOR00 + DIWSTRT (chooses
+    // the snapshot with the highest BPU, which is typically the main
+    // display region of the frame).  If all snapshots have BPU=0,
+    // primary = the last snap so we at least show its COLOR00 / DIWSTRT.
+    int primary = n_snaps - 1;
+    int max_bpu = -1;
+    for (int i = 0; i < n_snaps; i++) {
+        int bpu_i = (snaps[i].regs[0x100 >> 1] >> 12) & 0x7;
+        if (bpu_i > max_bpu) {
+            max_bpu = bpu_i;
+            primary = i;
+        }
+    }
+    uint16_t c00 = snaps[primary].regs[0x180 >> 1];
     if (c00 == 0) c00 = 0x0AAF;
     uint32_t bg = amiga4_to_argb(c00);
     for (int i = 0; i < w * h; i++) buf[i] = bg;
-    // Bitplane render.  HIRES: 80 bytes/row/plane.  LORES: 40 bytes/row.
-    if (bpu > 0 && bpu <= 6) {
-        const int amiga_w = hires ? 640 : 320;
-        const int bpr     = amiga_w / 8;  // bytes per row per plane
-        uint32_t bplpt[6];
-        for (int p = 0; p < bpu; p++) {
-            uint16_t hi = regs[(0x0E0 + p * 4) >> 1];
-            uint16_t lo = regs[(0x0E2 + p * 4) >> 1];
-            bplpt[p] = ((uint32_t(hi) << 16) | uint32_t(lo)) & 0xFFFFFu;
+    // V_START — first visible scanline.  DIWSTRT high byte gives vstart
+    // if non-zero; otherwise default to PAL $2C.
+    uint16_t diwstrt = snaps[primary].regs[0x092 >> 1];
+    int v_start = diwstrt ? ((diwstrt >> 8) & 0xFF) : 0x2C;
+    // Per-scanline render.
+    for (int y = 0; y < h; y++) {
+        int v = v_start + y;
+        // Find latest snapshot with v_at <= v.  We can't `break` on
+        // first miss because chained Copper lists (via MOVE→COP1LC
+        // redirect) produce non-monotonic v_at sequences — the second
+        // pass typically has the fully-built BPLCON0/palette/BPLpt
+        // state, so we want to land on the LATEST snapshot.  If no
+        // snap is "before" V (Copper list has only an end-WAIT, all
+        // MOVEs at top of frame), fall back to snap[0] — its MOVEs
+        // have all executed by the time the beam reaches V.
+        int snap_idx = -1;
+        for (int i = 0; i < n_snaps; i++) {
+            if (snaps[i].v_at <= v) snap_idx = i;
         }
-        // Build a 4-/16-/64-entry palette from COLOR00..n.
+        if (snap_idx < 0) snap_idx = 0;
+        const uint16_t* regs = snaps[snap_idx].regs;
+        int v_snap = snaps[snap_idx].v_at;
+        int delta  = v - v_snap;
+        uint16_t bplcon0 = regs[0x100 >> 1];
+        int  bpu   = (bplcon0 >> 12) & 0x7;
+        bool hires = (bplcon0 >> 15) & 1;
+        if (bpu == 0) continue;
+        if (bpu > 6) bpu = 6;
+        int row_bytes = hires ? 80 : 40;
+        int16_t bpl1mod = (int16_t)regs[0x108 >> 1];
+        int16_t bpl2mod = (int16_t)regs[0x10A >> 1];
+        // Palette for this row.
         int npal = 1 << bpu;
         if (npal > 32) npal = 32;
         uint32_t pal[32];
@@ -438,44 +566,52 @@ static void render_k13_chipram(Vm68k_top* top, uint32_t cop1lc,
             if (i == 0) c = c00;
             pal[i] = amiga4_to_argb(c);
         }
-        // Render scanlines.  Display rows are typically vstart..vstop
-        // around lines $2C..$F2 for NTSC; for the SDL window we just
-        // start at y=0 and walk until we hit FB_H.  Plane data is
-        // packed: byte_idx 0 covers pixels 0..7, MSB = leftmost.
-        for (int y = 0; y < h; y++) {
-            uint32_t row_off = uint32_t(y) * bpr;
-            for (int bx = 0; bx < bpr; bx++) {
-                uint8_t plane_byte[6] = {0};
-                for (int p = 0; p < bpu; p++) {
-                    uint32_t addr = bplpt[p] + row_off + bx;
-                    if (addr + 1 < 0x80000) {
-                        // Read chip RAM byte at addr.
-                        uint32_t w32 = mem_peek_word(top, addr & ~3u);
-                        plane_byte[p] = uint8_t((w32 >> ((3 - (addr & 3)) * 8)) & 0xFF);
-                    }
+        // Effective BPL pointers at this row: snapshot BPL + delta rows
+        // of Agnus auto-advance.  We currently ignore BPLnMOD (defaults
+        // to 0) because LACE displays (WB1.3 Workbench title bar at
+        // BPLnMOD=80 to skip alternate fields) would otherwise halve
+        // vertical resolution.  For per-scanline-updating demos this
+        // doesn't matter because delta stays at 0 each row anyway —
+        // the next snapshot rewrites BPL1PT before auto-advance bites.
+        (void)bpl1mod; (void)bpl2mod;
+        uint32_t bplpt[6];
+        for (int p = 0; p < bpu; p++) {
+            uint16_t hi = regs[(0x0E0 + p * 4) >> 1];
+            uint16_t lo = regs[(0x0E2 + p * 4) >> 1];
+            uint32_t base = ((uint32_t(hi) << 16) | uint32_t(lo)) & 0xFFFFFu;
+            bplpt[p] = base + uint32_t(delta) * uint32_t(row_bytes);
+        }
+        // Render row.
+        for (int bx = 0; bx < row_bytes; bx++) {
+            uint8_t plane_byte[6] = {0};
+            for (int p = 0; p < bpu; p++) {
+                uint32_t addr = bplpt[p] + bx;
+                if (addr + 1 < 0x80000) {
+                    uint32_t w32 = mem_peek_word(top, addr & ~3u);
+                    plane_byte[p] = uint8_t((w32 >> ((3 - (addr & 3)) * 8)) & 0xFF);
                 }
-                for (int b = 0; b < 8; b++) {
-                    int x_amiga = bx * 8 + b;
-                    // Show one Amiga pixel per SDL pixel; HIRES gets
-                    // truncated past x=FB_W.
-                    int x = x_amiga;
-                    if (x >= w) break;
-                    int idx = 0;
-                    for (int p = 0; p < bpu; p++) {
-                        if (plane_byte[p] & (0x80 >> b)) idx |= (1 << p);
-                    }
-                    if (idx > 0 && idx < npal) {
-                        buf[y * w + x] = pal[idx];
-                    }
+            }
+            for (int b = 0; b < 8; b++) {
+                int x = bx * 8 + b;
+                if (x >= w) break;
+                int idx = 0;
+                for (int p = 0; p < bpu; p++) {
+                    if (plane_byte[p] & (0x80 >> b)) idx |= (1 << p);
+                }
+                if (idx > 0 && idx < npal) {
+                    buf[y * w + x] = pal[idx];
                 }
             }
         }
     }
-    // Sprite 0 last (overlays the bitmap layer).
-    uint32_t sprpt = (uint32_t(regs[0x120 >> 1]) << 16) |
-                     uint32_t(regs[0x122 >> 1]);
+    // Sprite 0 last (overlays the bitmap layer).  Uses the primary
+    // snapshot's SPR0PT — per-scanline sprite control would need a
+    // bigger rewrite (sprites get re-armed per VBL and have own DMA
+    // state).
+    uint32_t sprpt = (uint32_t(snaps[primary].regs[0x120 >> 1]) << 16) |
+                     uint32_t(snaps[primary].regs[0x122 >> 1]);
     sprpt &= 0xFFFFFu;
-    if (sprpt) k13_render_sprite(top, sprpt, regs, buf, w, h, 0);
+    if (sprpt) k13_render_sprite(top, sprpt, snaps[primary].regs, buf, w, h, 0);
 }
 
 // Headless screenshot dump: render Denise output via the same Copper-list
@@ -814,6 +950,17 @@ static int run_regression(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
         stop_at_retired = (uint32_t)std::strtoul(s, nullptr, 0);
     }
 
+    // DENISE_DUMP_AT_RETIRED: snapshot the Denise framebuffer (via
+    // DENISE_DUMP_PPM=<path>) at a specific retired-instruction count.
+    // Useful for capturing demo intros / loading screens / pre-stall
+    // states before they roll past.  When the trigger fires, the
+    // end-of-run dump is suppressed (we got the moment we wanted).
+    uint32_t denise_dump_at_retired = 0;
+    bool     denise_dumped_mid_run = false;
+    if (const char* s = std::getenv("DENISE_DUMP_AT_RETIRED")) {
+        denise_dump_at_retired = (uint32_t)std::strtoul(s, nullptr, 0);
+    }
+
     while (cycle < max_cycles && !all_halted()) {
         if (stop_at_retired) {
             const uint32_t* r_arr =
@@ -822,6 +969,20 @@ static int run_regression(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
                 printf("[sim] STOP_AT_RETIRED=%u reached (cycle=%llu)\n",
                        stop_at_retired, (unsigned long long)cycle);
                 break;
+            }
+        }
+        if (denise_dump_at_retired && !denise_dumped_mid_run) {
+            const uint32_t* r_arr =
+                reinterpret_cast<const uint32_t*>(&top->retired_flat);
+            if (r_arr[0] >= denise_dump_at_retired) {
+                if (const char* path = std::getenv("DENISE_DUMP_PPM")) {
+                    printf("[sim] DENISE_DUMP_AT_RETIRED=%u reached "
+                           "(cycle=%llu) — dumping %s\n",
+                           denise_dump_at_retired,
+                           (unsigned long long)cycle, path);
+                    denise_dump_ppm(top, path);
+                }
+                denise_dumped_mid_run = true;
             }
         }
         // gdbserver tick.  If a debugger is attached and we're halted,
@@ -1174,9 +1335,12 @@ static int run_regression(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
     // Headless Denise screenshot: walks the live Copper list (auto-detected
     // or DENISE_DUMP_COP1LC=<hex>-overridden) and writes a PPM.  Renders the
     // 4-bit-per-channel Amiga palette through the same Copper-list walker
-    // used by the SDL display path.
-    if (const char* path = std::getenv("DENISE_DUMP_PPM")) {
-        denise_dump_ppm(top, path);
+    // used by the SDL display path.  Skipped if DENISE_DUMP_AT_RETIRED
+    // already fired the dump mid-run.
+    if (!denise_dumped_mid_run) {
+        if (const char* path = std::getenv("DENISE_DUMP_PPM")) {
+            denise_dump_ppm(top, path);
+        }
     }
 
     return rc;

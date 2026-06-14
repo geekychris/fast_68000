@@ -929,20 +929,29 @@ wb-screenshot-final:
 # ---------------------------------------------------------------------------
 # sim-screenshot: headless screenshot via in-sim Denise renderer.
 #
-# Honors the new DENISE_DUMP_PPM env var (tb/sim_main.cpp) which dumps the
-# rendered framebuffer at end of run.  Unlike `wb-screenshot` (which feeds
-# a chip-RAM dump through tools/render_k13_screen.py), this path uses the
-# same C++ Copper-walker that the SDL display path uses — so it works
-# without an SDL build and renders any Copper-list state, not just K1.3+WB.
+# Honors the DENISE_DUMP_PPM family of env vars (tb/sim_main.cpp) which
+# dump the rendered framebuffer.  The renderer walks the live Copper list
+# as a time-ordered program (per-WAIT snapshots), so demos that rewrite
+# BPL1PT / BPLCON0 / palette per scanline render correctly.  Follows
+# MOVE→COP1LC self-redirect chains (e.g. Turrican's $30E6C→$30DA0).
 #
 # Usage:
 #   make sim-screenshot ADF=<path> [ROMCYCLES=N] [MOUSE_CLICK=x,y,c]
-#                                  [COP1LC=0xNNNN] [DIM=WxH] [OUT=...png]
+#                                  [COP1LC=0xNNNN] [DIM=WxH]
+#                                  [AT_RETIRED=N] [OUT=...png]
 #
 # Examples:
-#   make sim-screenshot ADF=kickstart/wb13.adf            # auto-detect
-#   make sim-screenshot ADF=kickstart/turrican.adf \
-#       MOUSE_CLICK=1,1,300000000 COP1LC=0x30DA0          # Turrican w/ fire
+#   make sim-screenshot ADF=kickstart/wb13.adf                # auto-detect
+#
+#   make sim-screenshot ADF=kickstart/turrican.adf \          # Turrican w/ fire
+#       MOUSE_CLICK=1,1,300000000 COP1LC=0x30E6C
+#
+#   make sim-screenshot ADF=kickstart/turrican.adf \          # catch a frame
+#       MOUSE_CLICK=1,1,300000000 COP1LC=0x30E6C \            # at retired=200M
+#       AT_RETIRED=200000000                                  # (mid-run snap)
+#
+# Set DENISE_DUMP_DEBUG=1 to print per-WAIT snapshot state when the
+# rendered image is unexpectedly blank.
 # ---------------------------------------------------------------------------
 sim-screenshot: ADF        ?= kickstart/wb13.adf
 sim-screenshot: ROMCYCLES  ?= 400000000
@@ -954,6 +963,7 @@ sim-screenshot:
 	BOOT_TRACE=0 ROMCYCLES=$(ROMCYCLES) \
 	    $(if $(MOUSE_CLICK),MOUSE_AUTO_CLICK=$(MOUSE_CLICK),) \
 	    $(if $(COP1LC),DENISE_DUMP_COP1LC=$(COP1LC),) \
+	    $(if $(AT_RETIRED),DENISE_DUMP_AT_RETIRED=$(AT_RETIRED),) \
 	    DENISE_DUMP_PPM=$(OUT:.png=.ppm) DENISE_DUMP_DIM=$(DIM) \
 	    $(MAKE) --no-print-directory test-kickstart-boot \
 	    ADFFILE=$(ADF) 2>&1 | tail -3 || true
