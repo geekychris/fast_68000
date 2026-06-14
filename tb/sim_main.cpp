@@ -271,6 +271,14 @@ static void k13_walk_copper(Vm68k_top* top, uint32_t cop1lc,
     int      max_bpu = 0;
     bool     have_display = false;
     uint32_t pc = cop1lc & 0xFFFFFu;
+    // Some demos (Turrican etc.) chain Copper lists by writing the
+    // NEXT frame's address to COP1LC during the current list, then
+    // ending.  Real chipset would halt at end-of-list and restart from
+    // the new COP1LC at next VBL.  To stay useful for an end-of-run
+    // snapshot, follow that redirect — but bound it so a malformed
+    // list can't infinite-loop us.
+    int redirects_remaining = 4;
+    uint32_t initial_pc = pc;
     for (int n = 0; n < 4096; n++) {
         uint16_t ir1 = chip_word(top, pc);
         uint16_t ir2 = chip_word(top, pc + 2);
@@ -280,7 +288,23 @@ static void k13_walk_copper(Vm68k_top* top, uint32_t cop1lc,
             // WAIT / SKIP.  End-of-list sentinel = WAIT vp=$FF hp=$7F, ir2&1=0.
             uint8_t vp = (ir1 >> 8) & 0xFF;
             uint8_t hp = (ir1 >> 1) & 0x7F;
-            if (vp == 0xFF && hp == 0x7F && !(ir2 & 1)) break;
+            if (vp == 0xFF && hp == 0x7F && !(ir2 & 1)) {
+                // At end-of-list, check if a MOVE-to-COP1LC happened
+                // during the walk that points to a non-trivial new
+                // address.  If so, follow it (Turrican-style chained
+                // lists).  Otherwise stop.
+                uint32_t cop1 = (uint32_t(regs_now[0x080 >> 1]) << 16) |
+                                uint32_t(regs_now[0x082 >> 1]);
+                cop1 &= 0xFFFFFu;
+                if (redirects_remaining > 0 &&
+                    cop1 != 0 && cop1 != initial_pc && cop1 != pc - 4) {
+                    pc = cop1;
+                    initial_pc = pc;
+                    redirects_remaining--;
+                    continue;
+                }
+                break;
+            }
             // SKIP: at end-of-frame all vp/hp comparisons pass, skip next.
             if (ir2 & 1) pc += 4;
         } else {
@@ -471,8 +495,12 @@ static void denise_dump_ppm(Vm68k_top* top, const char* path) {
     if (!cop1lc) cop1lc = k13_autodetect_cop1lc(top);
     if (!cop1lc) {
         std::fprintf(stderr,
-            "[sim] DENISE_DUMP_PPM: no Copper list found "
-            "(set DENISE_DUMP_COP1LC=<hex>)\n");
+            "[sim] DENISE_DUMP_PPM: auto-detect didn't find a K1.3/WB1.3-"
+            "style Copper list signature in chip RAM.\n"
+            "      Set DENISE_DUMP_COP1LC=<hex> to point at the active "
+            "list explicitly.\n"
+            "      Find the live value via:  grep '\\[COP-LC-WR\\] "
+            ".*addr=00dff080' build_kick_boot/run.log | tail -1\n");
         return;
     }
     int w = 320, h = 200;
