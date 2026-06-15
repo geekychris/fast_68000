@@ -424,6 +424,11 @@ module paula (
                     8'hD4: begin aud_len[3] <= slv_wdata[15:0]; aud_oneshot[3] <= slv_wdata[31]; end
                     8'hD6: aud_per[3] <= slv_wdata[15:0];
                     8'hD8: aud_vol[3] <= slv_wdata[6:0];
+                    // AUDxDAT ($DFF0AA/0BA/0CA/0DA) writes are detected
+                    // below as a separate combinational signal
+                    // `cpu_audxdat_fire[i]` so they survive the
+                    // `aud_int_pulse <= 4'd0` reset that comes later
+                    // in this always block (non-blocking last-write-wins).
                     default: ;
                 endcase
             end
@@ -466,6 +471,22 @@ module paula (
             // Default AUDx interrupt pulses to 0 each cycle; the wrap
             // block below pulses the relevant channel for one cycle.
             aud_int_pulse <= 4'd0;
+            // CPU-driven audio mode: when CPU writes AUDxDAT
+            // ($DFF0AA/0BA/0CA/0DA) and the channel's DMA is OFF
+            // (audena=0), real Paula transitions STATE_0 → STATE_3 and
+            // asserts AUDxIR on the same cycle.  Software uses this as
+            // a programmable interrupt timer (see Turrican post-fire
+            // wait at chip $30D98 — its INT4 audio handler waits on a
+            // counter that's decremented per CPU-driven AUDx IRQ).
+            // Mirrors minimig paula_audio_channel.v line 258-267.
+            // Done after the aud_int_pulse<=0 reset so the pulse
+            // survives non-blocking-assignment last-write-wins.
+            if (slv_req && slv_we) begin
+                if (slv_addr == 8'hAA && !audena[0]) aud_int_pulse[0] <= 1'b1;
+                if (slv_addr == 8'hBA && !audena[1]) aud_int_pulse[1] <= 1'b1;
+                if (slv_addr == 8'hCA && !audena[2]) aud_int_pulse[2] <= 1'b1;
+                if (slv_addr == 8'hDA && !audena[3]) aud_int_pulse[3] <= 1'b1;
+            end
             if (mst_req_r && mst_ack) begin
                 mst_req_r <= 1'b0;
                 // Pick the half-word for this fetch address.
