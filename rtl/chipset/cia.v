@@ -153,31 +153,25 @@ module cia (
     assign pb_out = prb;
     assign pb_oe  = ddrb;
 
-    // Interrupt line: any pending bit that the mask enables.
-    // Per-source rising-edge pulse on EITHER:
-    //   - a new pending bit becoming set while its mask is on, OR
-    //   - a new mask bit becoming set while its pending is already on
-    // This covers both ordering cases: keyboard byte arrives BEFORE
-    // exec enables SP mask (mask-rising-edge captures pending), or
-    // timer underflows AFTER mask is set (pending-rising-edge case).
-    // Without the second case, K1.3 boot stalls waiting for L2 IRQ
-    // that the keyboard self-test sequence already delivered.
-    // See WB13_DEBUG_JOURNAL §20.
-    reg [4:0] icr_pending_d;
-    reg [4:0] icr_mask_d;
-    wire [4:0] pending_new_rising = icr_pending & ~icr_pending_d;
-    wire [4:0] mask_new_rising    = icr_mask    & ~icr_mask_d;
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            icr_pending_d <= 5'd0;
-            icr_mask_d    <= 5'd0;
-            int_o         <= 1'b0;
-        end else begin
-            icr_pending_d <= icr_pending;
-            icr_mask_d    <= icr_mask;
-            int_o <= |((pending_new_rising & icr_mask) |
-                       (mask_new_rising    & icr_pending));
-        end
+    // Interrupt line — LEVEL-TRIGGERED (mirrors minimig cia_int.v line 65):
+    //
+    //   irq = |(icr_mask & icr_pending)
+    //
+    // Stays HIGH while any unmasked pending bit is set; goes LOW when
+    // the CPU clears icr_pending via ICR read (or when mask gets cleared).
+    //
+    // Replaces an earlier pulse-on-rising-edge implementation that fired
+    // int_o for ONE cycle on (pending|mask) rising edges.  That pulse
+    // could be missed by CPU's interrupt sampling if the CPU happened
+    // to be deep in a multi-cycle instruction at the moment of the pulse;
+    // the symptom in Turrican post-fire was the INT2 keyboard handler
+    // never reading icr_pending[3] as set even though kbd_wr asserted
+    // it.  Level-triggered behaviour matches both real CIA silicon and
+    // the minimig reference; the rising-edge cases (keyboard-byte-
+    // arrives-before-mask, timer-underflow-after-mask) are naturally
+    // covered because the AND product stays high until cleared.
+    always @* begin
+        int_o = |(icr_mask & icr_pending);
     end
 
     // ---------------- Slave reads -----------------------
