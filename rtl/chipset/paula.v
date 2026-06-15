@@ -144,6 +144,15 @@ module paula (
     // real Paula's "second sample period elapsed after last DMA fetch"
     // (~2 × AUDxPER host cycles later than our previous behaviour).
     reg [3:0] aud_int2_pending;
+    // Per-channel "this is the first DMA fetch since DMA enable" flag.
+    // Real Paula (minimig paula_audio_channel.v STATE_1 → STATE_2,
+    // line 293: `AUDxIR = 1'b1`) fires the audio interrupt as soon as
+    // the FIRST DMA word arrives after DMA-enable.  Programs that
+    // double-buffer audio (audio.device, demos like boing) rely on
+    // this initial AUDxIR pulse to know the channel is primed and they
+    // can write the next-buffer AUDxLC/AUDxLEN.  Without it, double-
+    // buffered loops never advance past the first buffer.
+    reg [3:0] aud_dma_first;
     wire [13:0] intreq_hw_set = {
         cia_b_edge,           // 13 EXTER
         dsksyn_edge,          // 12 DSKSYN (set unconditionally on edge)
@@ -326,6 +335,7 @@ module paula (
             audena <= 4'd0;
             aud_int_pulse <= 4'd0;
             aud_int2_pending <= 4'd0;
+            aud_dma_first    <= 4'd0;
             for (i = 0; i < 4; i = i + 1) begin
                 aud_lc[i]  <= 32'd0;
                 aud_len[i] <= 16'd0;
@@ -446,6 +456,10 @@ module paula (
                         ch_byte_idx[i]   <= 1'b0;
                         ch_per_cnt[i]    <= aud_per[i];
                         ch_sample[i]     <= 8'sd0;
+                        // Arm the "first DMA fetch" flag; it fires AUDxIR
+                        // once the initial DMA word arrives (minimig
+                        // STATE_1 → STATE_2 line 293 `AUDxIR = 1`).
+                        aud_dma_first[i] <= 1'b1;
                     end
                 end
             end
@@ -494,6 +508,12 @@ module paula (
                     ? mst_rdata[15:0]
                     : mst_rdata[31:16];
                 ch_word_valid[fetch_ch] <= 1'b1;
+                // First DMA word after DMA-enable → fire AUDxIR
+                // (minimig STATE_1 → STATE_2 line 293 `AUDxIR = 1`).
+                if (aud_dma_first[fetch_ch]) begin
+                    aud_int_pulse[fetch_ch] <= 1'b1;
+                    aud_dma_first[fetch_ch] <= 1'b0;
+                end
                 // Advance address; reload at end of buffer unless this
                 // channel is in one-shot mode.
                 if (ch_words_left[fetch_ch] == 16'd1) begin
