@@ -967,6 +967,7 @@ sim-screenshot:
 	@echo "Booting + dumping Denise via DENISE_DUMP_PPM..."
 	BOOT_TRACE=0 ROMCYCLES=$(ROMCYCLES) \
 	    $(if $(MOUSE_CLICK),MOUSE_AUTO_CLICK=$(MOUSE_CLICK),) \
+	    $(if $(CLICK_HOLD),MOUSE_CLICK_HOLD=$(CLICK_HOLD),) \
 	    $(if $(COP1LC),DENISE_DUMP_COP1LC=$(COP1LC),) \
 	    $(if $(AT_RETIRED),DENISE_DUMP_AT_RETIRED=$(AT_RETIRED),) \
 	    DENISE_DUMP_PPM=$(OUT:.png=.ppm) DENISE_DUMP_DIM=$(DIM) \
@@ -1003,6 +1004,7 @@ sim-screenshot-sweep:
 	    $(MAKE) --no-print-directory sim-screenshot \
 	        ADF=$(ADF) ROMCYCLES=$(ROMCYCLES) DIM=$(DIM) \
 	        $(if $(MOUSE_CLICK),MOUSE_CLICK=$(MOUSE_CLICK),) \
+	        $(if $(CLICK_HOLD),CLICK_HOLD=$(CLICK_HOLD),) \
 	        $(if $(COP1LC),COP1LC=$(COP1LC),) \
 	        AT_RETIRED=$$r OUT=$$out 2>&1 | tail -2 || true; \
 	done

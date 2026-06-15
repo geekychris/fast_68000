@@ -956,10 +956,19 @@ static int run_regression(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
     // click_cycle, then LMB pulses for ~500K cycles (about 7 VBL frames).
     // K1.3 mouse counters are 8-bit so x and y must be <= 127.  Used to
     // bring the AmigaDOS CLI window to front for the visual milestone.
+    //
+    // MOUSE_CLICK_HOLD=<cycles> overrides the default 500K-cycle hold
+    // duration.  Games like Turrican need continuous fire across the
+    // entire post-intro loading window (10s of M cycles); set this to
+    // e.g. 200000000 to hold fire for that long.
     int      mouse_target_x  = 0;
     int      mouse_target_y  = 0;
     uint64_t mouse_click_cyc = ~0ULL;
     bool     mouse_click_enabled = false;
+    uint64_t mouse_click_hold = 500000ULL;
+    if (const char* s = std::getenv("MOUSE_CLICK_HOLD")) {
+        mouse_click_hold = std::strtoull(s, nullptr, 0);
+    }
     // MOUSE_AUTO_DOUBLE_CLICK=1 turns the single click into a double-
     // click: two LMB-down pulses separated by a brief gap so Workbench's
     // double-click detector triggers an icon-open.
@@ -1086,7 +1095,7 @@ static int run_regression(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
                 top->mouse_btn_l = (first_pulse || second_pulse) ? 1 : 0;
             } else {
                 top->mouse_btn_l = (cycle >= mouse_click_cyc &&
-                                    cycle <  mouse_click_cyc + CLICK_DURATION)
+                                    cycle <  mouse_click_cyc + mouse_click_hold)
                                    ? 1 : 0;
             }
         }
