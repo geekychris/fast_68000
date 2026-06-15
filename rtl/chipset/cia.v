@@ -282,20 +282,23 @@ module cia (
                     4'h4: ta_lo_reload <= slv_wdata;
                     4'h5: begin
                         ta_hi_reload <= slv_wdata;
-                        // Writing TAHI in one-shot mode also reloads the counter
-                        // and starts the timer (real CIA quirk).
-                        if (ta_runmode) begin
+                        // Real 8520: THI write reloads the counter when the
+                        // timer is stopped OR in one-shot mode (matches minimig
+                        // cia_timera.v `thi_load <= thi & wr & (~start |
+                        // oneshot)`).  Previously we only reloaded in one-shot
+                        // mode, so continuous-mode code that wrote TALO/TAHI
+                        // *before* asserting START missed the reload.
+                        if (!ta_start || ta_runmode)
                             ta_cnt <= {slv_wdata, ta_lo_reload};
-                            cra[0] <= 1'b1;
-                        end
+                        // In one-shot, THI write also starts the timer.
+                        if (ta_runmode) cra[0] <= 1'b1;
                     end
                     4'h6: tb_lo_reload <= slv_wdata;
                     4'h7: begin
                         tb_hi_reload <= slv_wdata;
-                        if (tb_runmode) begin
+                        if (!tb_start || tb_runmode)
                             tb_cnt <= {slv_wdata, tb_lo_reload};
-                            crb[0] <= 1'b1;
-                        end
+                        if (tb_runmode) crb[0] <= 1'b1;
                     end
                     // TOD writes — real 8520 semantics:
                     //   * Write TODHI ($A) stops the counter, stages the hi byte.
@@ -328,13 +331,16 @@ module cia (
                             icr_mask <= icr_mask & ~slv_wdata[4:0];
                     end
                     4'hE: begin
-                        cra <= slv_wdata;
+                        // Bit 4 is a write-only strobe; readback always 0
+                        // (matches minimig cia_timera.v: `tmcr[6:0] <=
+                        // {data_in[6:5],1'b0,data_in[3:0]}`).
+                        cra <= {slv_wdata[7:5], 1'b0, slv_wdata[3:0]};
                         // LOAD strobe: copy reload -> counter.
                         if (slv_wdata[4])
                             ta_cnt <= {ta_hi_reload, ta_lo_reload};
                     end
                     4'hF: begin
-                        crb <= slv_wdata;
+                        crb <= {slv_wdata[7:5], 1'b0, slv_wdata[3:0]};
                         if (slv_wdata[4])
                             tb_cnt <= {tb_hi_reload, tb_lo_reload};
                     end
@@ -372,8 +378,13 @@ module cia (
                 icr_pending[0] <= 1'b1;
 
             // ---- Timer B countdown ----
-            // (Real CIA can chain TB to TA underflows; we keep it simple.)
-            if (tb_start && tick) begin
+            // CRB bit 6 = INMODE1: 0 → count `tick` (phi2-equivalent), 1 →
+            // count TA underflows (timer chaining).  K1.3 timer.device
+            // chains TA→TB for EClock long-period delays; without
+            // chaining, TB stays parked at its reload value and the
+            // EClock conversion never completes.  Matches minimig
+            // cia_timerb.v `count = tmcr[6] ? tmra_ovf : eclk`.
+            if (tb_start && (crb[6] ? ta_just_underflowed : tick)) begin
                 if (tb_cnt == 16'd0) begin
                     tb_cnt <= {tb_hi_reload, tb_lo_reload};
                     tb_just_underflowed <= 1'b1;
