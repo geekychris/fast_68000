@@ -836,6 +836,146 @@ static int run_regression(Vm68k_top* top, uint64_t max_cycles, int n_cores) {
                    poke_trigger_pc);
     }
 
+    // -----------------------------------------------------------------
+    // IDCMP_INJECT: inject an IDCMP MOUSEBUTTONS message directly into
+    // a Window's UserPort msglist at a target cycle, bypassing the
+    // input.device → intuition.library InputHandler chain.
+    //
+    // Format:
+    //   IDCMP_INJECT="userport=HEX,window=HEX,sigtask=HEX,
+    //                 msgbuf=HEX,class=HEX,code=HEX,
+    //                 cycle=N[,sigbit=N]"
+    //
+    // Where:
+    //   userport — MsgPort address (typically Window+$56)
+    //   window   — Window pointer (becomes IntuiMessage.IDCMPWindow)
+    //   sigtask  — Task to signal (typically userport->mp_SigTask)
+    //   msgbuf   — Address of a 64-byte scratch area for the message
+    //              (must be CHIP RAM, must not overlap anything live)
+    //   class    — IDCMP class (e.g. $0008 = MOUSEBUTTONS)
+    //   code     — IDCMP code (e.g. $0068 = SELECTDOWN, $0069 = SELECTUP)
+    //   cycle    — host cycle to fire injection at
+    //   sigbit   — signal bit number (0..31; default 31 = standard
+    //              IDCMP UserPort)
+    //
+    // For boing-disk: boing! parks in its main loop polling its
+    // UserPort for MOUSEBUTTONS to start the demo.  Injecting a
+    // MOUSEBUTTONS message via this hook simulates the user click that
+    // boing!'s init sequence needs.  See `project_boing_screen_state.md`
+    // in memory.
+    if (const char* s = std::getenv("IDCMP_INJECT")) {
+        uint32_t userport = 0, window = 0, sigtask = 0, msgbuf = 0;
+        uint32_t klass = 0x00000008;  // MOUSEBUTTONS
+        uint32_t code  = 0x00000068;  // SELECTDOWN (mouse button down)
+        uint32_t sigbit_v = 31;
+        uint32_t mouse_x = 160, mouse_y = 128;
+        uint64_t inject_cycle = 0;
+        const char* p = s;
+        auto parse_field = [&](const char* name, uint32_t* out) -> bool {
+            size_t n = strlen(name);
+            if (strncmp(p, name, n) == 0 && p[n] == '=') {
+                p += n + 1;
+                char* end = nullptr;
+                *out = (uint32_t)std::strtoul(p, &end, 0);
+                if (end == p) return false;
+                p = end;
+                if (*p == ',') p++;
+                return true;
+            }
+            return false;
+        };
+        while (*p) {
+            uint32_t v = 0;
+            uint64_t lv = 0;
+            if      (parse_field("userport", &v)) userport = v;
+            else if (parse_field("window",   &v)) window   = v;
+            else if (parse_field("sigtask",  &v)) sigtask  = v;
+            else if (parse_field("msgbuf",   &v)) msgbuf   = v;
+            else if (parse_field("class",    &v)) klass    = v;
+            else if (parse_field("code",     &v)) code     = v;
+            else if (parse_field("mousex",   &v)) mouse_x  = v;
+            else if (parse_field("mousey",   &v)) mouse_y  = v;
+            else if (parse_field("sigbit",   &v)) sigbit_v = v;
+            else if (strncmp(p, "cycle=", 6) == 0) {
+                p += 6;
+                char* end = nullptr;
+                inject_cycle = std::strtoull(p, &end, 0);
+                p = end;
+                if (*p == ',') p++;
+            } else {
+                p++;  // skip unknown char
+            }
+        }
+        if (userport && window && sigtask && msgbuf) {
+            // Layout an IntuiMessage at `msgbuf`.  All addresses are
+            // longword-aligned 32-bit pokes — the underlying
+            // mem_poke_strobe is a single longword overwrite.
+            //
+            // struct IntuiMessage (size = 52 bytes):
+            //   +$00 ln_Succ            (set to userport + $18 — &lh_Tail)
+            //   +$04 ln_Pred            (set to userport + $14 — &lh_Head)
+            //   +$08 ln_Type:ln_Pri:ln_Name(hi) = $05 $00 $0000
+            //   +$0C ln_Name(lo):mn_ReplyPort(hi)
+            //   +$10 mn_ReplyPort(lo):mn_Length = $0000:$001C
+            //   +$14 Class               = MOUSEBUTTONS (etc.)
+            //   +$18 Code(hi):Qualifier(lo)
+            //   +$1C IAddress            = 0
+            //   +$20 MouseX(hi):MouseY(lo)
+            //   +$24 Seconds             = 0
+            //   +$28 Micros              = 0
+            //   +$2C IDCMPWindow         = window
+            //   +$30 SpecialLink         = 0
+            uint32_t mn_reply = 0;  // no reply needed; boing calls ReplyMsg
+                                    // but with NULL ReplyPort that's
+                                    // tolerable — exec.library ReplyMsg
+                                    // checks for NULL and returns early.
+            uint32_t ln_type_pri_name_hi = 0x05000000;  // NT_MESSAGE
+            uint32_t ln_name_lo_reply_hi = (mn_reply >> 16);
+            uint32_t reply_lo_len = ((mn_reply & 0xFFFF) << 16) | 0x001C;
+            uint32_t code_qual = (code << 16);
+            uint32_t mxy = ((mouse_x & 0xFFFF) << 16) | (mouse_y & 0xFFFF);
+            // Build poke list — appended to `pokes` so the existing
+            // poke-driver loop fires them one per cycle starting at the
+            // target cycle.
+            pokes.push_back({msgbuf + 0x00, userport + 0x18});  // ln_Succ = &lh_Tail
+            pokes.push_back({msgbuf + 0x04, userport + 0x14});  // ln_Pred = &lh_Head
+            pokes.push_back({msgbuf + 0x08, ln_type_pri_name_hi});
+            pokes.push_back({msgbuf + 0x0C, ln_name_lo_reply_hi});
+            pokes.push_back({msgbuf + 0x10, reply_lo_len});
+            pokes.push_back({msgbuf + 0x14, klass});
+            pokes.push_back({msgbuf + 0x18, code_qual});
+            pokes.push_back({msgbuf + 0x1C, 0});
+            pokes.push_back({msgbuf + 0x20, mxy});
+            pokes.push_back({msgbuf + 0x24, 0});
+            pokes.push_back({msgbuf + 0x28, 0});
+            pokes.push_back({msgbuf + 0x2C, window});
+            pokes.push_back({msgbuf + 0x30, 0});
+            // UserPort.mp_MsgList update — link the message in.
+            pokes.push_back({userport + 0x14, msgbuf});           // lh_Head
+            pokes.push_back({userport + 0x18, 0});                // lh_Tail = NULL
+            pokes.push_back({userport + 0x1C, msgbuf});           // lh_TailPred
+            // Signal the task: write the signal mask into tc_SigRecvd.
+            // exec scheduler picks this up on next reschedule.
+            // tc_SigRecvd is at Task+$1A.
+            uint32_t sig_mask = (uint32_t)1 << sigbit_v;
+            pokes.push_back({sigtask + 0x1A, sig_mask});
+            if (inject_cycle > 0) poke_cycle = inject_cycle;
+            printf("[sim] IDCMP_INJECT armed: %zu pokes start at cycle %llu\n"
+                   "[sim]   userport=$%08X window=$%08X sigtask=$%08X "
+                   "msgbuf=$%08X\n"
+                   "[sim]   class=$%08X code=$%04X mousex=%u mousey=%u "
+                   "sigbit=%u (mask=$%08X)\n",
+                   pokes.size(),
+                   (unsigned long long)poke_cycle,
+                   userport, window, sigtask, msgbuf,
+                   klass, code, mouse_x, mouse_y,
+                   sigbit_v, sig_mask);
+        } else {
+            printf("[sim] IDCMP_INJECT='%s' — missing required fields "
+                   "(need userport, window, sigtask, msgbuf)\n", s);
+        }
+    }
+
     uint32_t host_tail = 0;
     uint64_t cycle = 0;
     size_t   poke_idx = 0;
