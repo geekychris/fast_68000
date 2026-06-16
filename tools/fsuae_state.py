@@ -21,7 +21,14 @@ from pathlib import Path
 
 
 def parse_chunks(data):
-    """Yield (chunk_id, offset, size_field, payload) for every chunk."""
+    """Yield (chunk_id, offset, size_field, payload) for every chunk.
+
+    UAE save-state chunks are 4-byte aligned, but the chunk size field
+    is byte-exact — so after consuming a chunk we round up to the next
+    4-byte boundary before reading the next chunk header.  Without
+    rounding, we'd stop at chunks that don't happen to end on a
+    longword boundary (e.g. KEYB which has size=27).
+    """
     i = 0
     while i < len(data) - 8:
         cid = data[i:i+4]
@@ -29,21 +36,26 @@ def parse_chunks(data):
             i += 1
             continue
         size = struct.unpack('>I', data[i+4:i+8])[0]
-        if size <= 0 or size > len(data) - i:
+        if size <= 8 or i + size > len(data):
             i += 1
             continue
         yield cid.decode('ascii'), i, size, data[i+8:i+size]
-        i += size
+        # Advance to next 4-byte aligned position past this chunk.
+        i = (i + size + 3) & ~3
 
 
 def inflate_mem_chunk(payload):
-    """UAE memory chunks: 4-byte flags, 4-byte uncompressed size, zlib payload."""
+    """UAE memory chunks: 4-byte flags, 4-byte uncompressed size, payload.
+
+    Flags bit 0 = zlib-compressed.  When uncompressed, the usize field
+    is unreliable (FS-UAE 3.2.35 CRAM sets it to 0, BRAM to garbage),
+    so we just return everything past the 8-byte header.
+    """
     flags = struct.unpack('>I', payload[0:4])[0]
-    usize = struct.unpack('>I', payload[4:8])[0]
     if flags & 1:
         return zlib.decompress(payload[8:])
-    # Uncompressed
-    return payload[8:8+usize]
+    # Uncompressed — usize is unreliable; return all remaining bytes.
+    return payload[8:]
 
 
 def find_chunk(chunks, cid):
