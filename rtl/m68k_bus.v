@@ -127,6 +127,10 @@ module m68k_bus #(
     output reg  [3:0]                     pau_slv_be,
     output reg  [31:0]                    pau_slv_wdata,
     input  wire [31:0]                    pau_slv_rdata,
+    // Bus winner ID of the current slave-write (0..N_PORTS-1).  Paula
+    // uses it to distinguish CPU writes from Copper-driven writes for
+    // the AUDxDAT → AUDxIR transition gating.
+    output wire [7:0]                     pau_slv_src,
 
     // CIA-A ($00FE_0400..$00FE_04FF) and CIA-B ($00FE_0500..$00FE_05FF).
     // 8-bit registers placed at 16 consecutive byte addresses (a, a+1, ...);
@@ -391,7 +395,17 @@ module m68k_bus #(
     // when sync is locked.  We don't model bit-stream PLLs, so we raise it
     // at the moment DMA starts: the trackdisk buffer's first MFM word is
     // already $4489.
-    assign dsksyn_pulse_o = !blk_busy_last && blk_busy && blk_byte_mode;
+    //
+    // **Gate on ADKCON WORDSYNC bit:** Real Paula generates DSKSYN-IRQ
+    // only when WORDSYNC mode is engaged.  K1.3's trackdisk sets
+    // WORDSYNC=1 during sync-search reads + clears it for raw-data
+    // reads.  Without gating, every DSKLEN-start fired dsksyn → INTREQ
+    // bit 12 got re-asserted forever even after K1.3's final
+    // sync-clear, leaving boing-disk-wedge INTREQ=$1020 instead of the
+    // FS-UAE-reference $0000.  See
+    // `project_fsuae_cosim_intreq_divergence.md`.
+    assign dsksyn_pulse_o = !blk_busy_last && blk_busy && blk_byte_mode
+                            && adkcon_wordsync;
 
     // OVL latch: set on reset, cleared the first time CIA-A drives /OVL low.
     reg ovl_active;
@@ -1377,6 +1391,7 @@ module m68k_bus #(
         pau_slv_be    = be[winner];
         pau_slv_wdata = wdata[winner];
     end
+    assign pau_slv_src = bus_src;
     always @* begin
         cia_a_slv_req   = winner_valid && is_ciaa_reg;
         cia_a_slv_we    = winner_valid && is_ciaa_reg && we[winner];

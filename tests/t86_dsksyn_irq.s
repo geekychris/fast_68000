@@ -28,6 +28,11 @@ core0:
         ; INTENA: SET (bit15) + INTEN (bit14) + DSKSYN (bit12).
         move.w  #$D000, $00DFF09A
 
+        ; ADKCON: SET (bit15) + WORDSYNC (bit10) — required for Paula
+        ; to fire DSKSYN-IRQ on sync match (or DMA start in our
+        ; simplified model).
+        move.w  #$8400, $00DFF09E
+
         ; DSKSYNC = $4489 (already the power-on default, but be explicit).
         move.w  #$4489, $00DFF07E
 

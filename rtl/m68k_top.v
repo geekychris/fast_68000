@@ -152,6 +152,7 @@ module m68k_top #(
     wire [3:0]  pau_slv_be;
     wire [31:0] pau_slv_wdata;
     wire [31:0] pau_slv_rdata;
+    wire [7:0]  pau_slv_src;
 
     // CIA-A / CIA-B slave wires (8-bit registers).
     wire        cia_a_slv_req;
@@ -274,6 +275,7 @@ module m68k_top #(
         .pau_slv_be  (pau_slv_be),
         .pau_slv_wdata(pau_slv_wdata),
         .pau_slv_rdata(pau_slv_rdata),
+        .pau_slv_src (pau_slv_src),
         .cia_a_slv_req  (cia_a_slv_req),
         .cia_a_slv_we   (cia_a_slv_we),
         .cia_a_slv_addr (cia_a_slv_addr),
@@ -650,6 +652,8 @@ module m68k_top #(
         .slv_be     (pau_slv_be),
         .slv_wdata  (pau_slv_wdata),
         .slv_rdata  (pau_slv_rdata),
+        .slv_src_i  (pau_slv_src),
+        .n_cpu_ports_i (8'(2 * N_CORES)),
         .mst_req    (pau_mst_req),
         .mst_we     (pau_mst_we),
         .mst_addr   (pau_mst_addr),

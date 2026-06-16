@@ -33,6 +33,14 @@ module paula (
     input  wire [3:0]  slv_be,
     input  wire [31:0] slv_wdata,
     output reg  [31:0] slv_rdata,
+    // Source ID of the slave-write winner.  0..(N_CPU_CORES*2)-1 = CPU
+    // IC/DC ports, BLT/COP/DEN/PAU ports for chipset masters.
+    // Used to distinguish CPU writes from Copper-driven writes for
+    // register-level semantic differences (see AUDxIR-fire gating).
+    input  wire [7:0]  slv_src_i,
+    // Number of CPU IC/DC ports = 2*N_CORES.  All slv_src values BELOW
+    // this threshold are CPU writes.
+    input  wire [7:0]  n_cpu_ports_i,
 
     // Master port (DMA fetch)
     output wire        mst_req,
@@ -70,6 +78,12 @@ module paula (
     // doesn't latch a stale bus_resp from an earlier transaction race.
     output wire        watchdog_kick_o
 );
+    // Source classifier — true when the current slave write came from
+    // a CPU IC/DC port (vs a chipset master like the Copper).  Used to
+    // gate the AUDxDAT-write → AUDxIR fire so only true CPU-driven
+    // audio mode triggers the STATE_0→STATE_3 transition.
+    wire slv_src_is_cpu_w = (slv_src_i < n_cpu_ports_i);
+
     // --------------- Registers ---------------
     reg [3:0]  audena;                 // channel enables
     reg [31:0] aud_lc   [0:3];
@@ -487,19 +501,62 @@ module paula (
             aud_int_pulse <= 4'd0;
             // CPU-driven audio mode: when CPU writes AUDxDAT
             // ($DFF0AA/0BA/0CA/0DA) and the channel's DMA is OFF
-            // (audena=0), real Paula transitions STATE_0 → STATE_3 and
-            // asserts AUDxIR on the same cycle.  Software uses this as
-            // a programmable interrupt timer (see Turrican post-fire
+            // (audena=0) AND no AUDxIR is already pending (!AUDxIP),
+            // real Paula transitions STATE_0 → STATE_3 and asserts
+            // AUDxIR on the same cycle.  Mirrors minimig
+            // paula_audio_channel.v line 258 (`else if (AUDxDAT &&
+            // !AUDxON && !AUDxIP)`).  Software uses this as a
+            // programmable interrupt timer (see Turrican post-fire
             // wait at chip $30D98 — its INT4 audio handler waits on a
             // counter that's decremented per CPU-driven AUDx IRQ).
-            // Mirrors minimig paula_audio_channel.v line 258-267.
+            //
+            // **AUDxIP gating is required for FS-UAE parity:** K1.3's
+            // chipset reset code zero-writes every Paula register,
+            // INCLUDING AUDxDAT.  Without the `!intreq[7+ch]` check,
+            // each zero-write fires AUDxIR and leaves the bit pending
+            // forever (INTENA[7..10] are 0 during boot so L4 never
+            // delivers + clears).  FS-UAE state at boing-disk wedge
+            // shows INTREQ=$0000; ours used to show $17A0 with all
+            // AUDx bits stuck.  See
+            // `project_fsuae_cosim_intreq_divergence.md`.
+            //
             // Done after the aud_int_pulse<=0 reset so the pulse
             // survives non-blocking-assignment last-write-wins.
-            if (slv_req && slv_we) begin
-                if (slv_addr == 8'hAA && !audena[0]) aud_int_pulse[0] <= 1'b1;
-                if (slv_addr == 8'hBA && !audena[1]) aud_int_pulse[1] <= 1'b1;
-                if (slv_addr == 8'hCA && !audena[2]) aud_int_pulse[2] <= 1'b1;
-                if (slv_addr == 8'hDA && !audena[3]) aud_int_pulse[3] <= 1'b1;
+            // CPU-driven AUDxDAT fire requires the write to come from
+            // the CPU port, NOT from the Copper (which performs its own
+            // AUDxDAT zero-writes as part of K1.3's chipset-init Copper
+            // list).  Real Paula doesn't distinguish source, but K1.3
+            // on real Amiga doesn't have the FAST CPU vs slow Copper
+            // race we hit — the Copper's chipset-clear pass completes
+            // before any audio-enable code runs, so the spurious
+            // STATE_0→STATE_3 fires don't accumulate.  Without this
+            // gate our INTREQ ends up with all 4 AUDx bits stuck and
+            // diverges from FS-UAE's clean INTREQ=$0000.
+            if (slv_req && slv_we && slv_src_is_cpu_w) begin
+                if (slv_addr == 8'hAA && !audena[0] && !intreq[7]) begin
+                    aud_int_pulse[0] <= 1'b1;
+`ifdef PAULA_AUDXIR_TRACE
+                    $display("[AUDxIR-FIRE] ch=0 src=%h wdata=%h", slv_src_i, slv_wdata);
+`endif
+                end
+                if (slv_addr == 8'hBA && !audena[1] && !intreq[8]) begin
+                    aud_int_pulse[1] <= 1'b1;
+`ifdef PAULA_AUDXIR_TRACE
+                    $display("[AUDxIR-FIRE] ch=1 src=%h wdata=%h", slv_src_i, slv_wdata);
+`endif
+                end
+                if (slv_addr == 8'hCA && !audena[2] && !intreq[9]) begin
+                    aud_int_pulse[2] <= 1'b1;
+`ifdef PAULA_AUDXIR_TRACE
+                    $display("[AUDxIR-FIRE] ch=2 src=%h wdata=%h", slv_src_i, slv_wdata);
+`endif
+                end
+                if (slv_addr == 8'hDA && !audena[3] && !intreq[10]) begin
+                    aud_int_pulse[3] <= 1'b1;
+`ifdef PAULA_AUDXIR_TRACE
+                    $display("[AUDxIR-FIRE] ch=3 src=%h wdata=%h", slv_src_i, slv_wdata);
+`endif
+                end
             end
             if (mst_req_r && mst_ack) begin
                 mst_req_r <= 1'b0;
