@@ -227,7 +227,16 @@ module m68k_bus #(
     // How many beam-cycles per host clock when fast-forward is active.
     // 64 = ~64x faster VBL firing.  Pure sim performance hack; observable
     // CPU behavior unchanged because the CPU is parked on STOP.
+    //
+    // +define+NO_FAST_FORWARD disables fast-forward entirely (stride=1
+    // always).  Use to test if a workload relies on real-Amiga VBL
+    // timing — boing!-disk's graphics.library VBL blit-queue is one
+    // suspect for FF-induced misbehavior.
+`ifdef NO_FAST_FORWARD
+    localparam [9:0] SIM_FF_STRIDE = 10'd1;
+`else
     localparam [9:0] SIM_FF_STRIDE = 10'd64;
+`endif
 `ifdef KICKSTART_BOOT
     // Under Kickstart the address-bus mask in `unflat` drops bits 24..31,
     // so $FFFF_FFFC (the test-bench IRQ register slot) folds to
