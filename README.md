@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="Fast 68000 logo" width="180">
+</p>
+
 # fast_68000
 
 A pipelined, cached, multi-core Motorola 68000 implementation in Verilog,
